@@ -81,8 +81,10 @@ describe("DecisionDetail", () => {
     render(<DecisionDetail detail={detail} onDispositionChange={onDispositionChange} />);
 
     const accepted = screen.getByRole("button", { name: "Accept" });
+    const controls = accepted.closest("fieldset");
     fireEvent.click(accepted);
     await waitFor(() => expect(onDispositionChange).toHaveBeenCalledWith("accepted"));
+    await waitFor(() => expect(controls?.hasAttribute("disabled")).toBe(false));
     expect(accepted.getAttribute("aria-pressed")).toBe("false");
     expect(screen.getByRole("button", { name: "Mark unreviewed" }).getAttribute("aria-pressed")).toBe("true");
   });
