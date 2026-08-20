@@ -133,19 +133,12 @@ export class GitReader {
   }
 
   private async discoverFilterOverrides(root: string): Promise<string[]> {
-    const listed = await this.execute(root, ["ls-files", "-z"]);
-    if (listed.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git file metadata exceeds the configured source limit");
-    const paths = listed.stdout.split("\0").filter((path) => path.length > 0);
+    const configured = await this.execute(root, ["config", "--local", "--get-regexp", "^filter\\..+\\.(clean|process|smudge|required)$"]);
+    if (configured.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git filter configuration exceeds the configured source limit");
     const filters = new Set<string>();
-    for (let offset = 0; offset < paths.length; offset += 256) {
-      const batch = paths.slice(offset, offset + 256);
-      const attributes = await this.execute(root, ["check-attr", "-z", "filter", "--", ...batch]);
-      if (attributes.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git attribute metadata exceeds the configured source limit");
-      const fields = attributes.stdout.split("\0");
-      for (let index = 2; index < fields.length; index += 3) {
-        const value = fields[index];
-        if (value !== undefined && /^[A-Za-z0-9._-]+$/.test(value) && value !== "unspecified" && value !== "unset") filters.add(value);
-      }
+    for (const line of configured.stdout.split("\n")) {
+      const match = /^filter\.(.+)\.(?:clean|process|smudge|required)(?:\s|$)/.exec(line);
+      if (match?.[1] !== undefined) filters.add(match[1]);
     }
     const configArgs: string[] = [];
     for (const filter of filters) {

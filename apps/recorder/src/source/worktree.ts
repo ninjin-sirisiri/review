@@ -8,12 +8,51 @@ function isContained(root: string, candidate: string): boolean {
   return childRelative !== ".." && !childRelative.startsWith(`..${sep}`) && !isAbsolute(childRelative);
 }
 
+export interface WorkingTreeFile {
+  stream(): ReadableStream<Uint8Array>;
+}
+
+export type WorkingTreeFileProvider = (path: string) => WorkingTreeFile;
+
+interface BoundedContent {
+  content: string;
+  oversized: boolean;
+}
+
+async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<BoundedContent> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let oversized = false;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      totalBytes += next.value.byteLength;
+      if (totalBytes <= maxBytes) chunks.push(next.value);
+      else oversized = true;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (oversized) return { content: "", oversized: true };
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { content: new TextDecoder().decode(bytes), oversized: false };
+}
+
 export class WorkingTreeReader {
   readonly maxBytes: number;
+  readonly fileProvider: WorkingTreeFileProvider;
 
-  constructor(maxBytes = 4 * 1024 * 1024) {
+  constructor(maxBytes = 4 * 1024 * 1024, fileProvider: WorkingTreeFileProvider = (path) => Bun.file(path)) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new RangeError("maxBytes must be a positive integer");
     this.maxBytes = maxBytes;
+    this.fileProvider = fileProvider;
   }
 
   async readFile(root: string, relativePath: string): Promise<{ content: string; contentHash: string }> {
@@ -53,8 +92,13 @@ export class WorkingTreeReader {
     }
     let content: string;
     try {
-      content = await Bun.file(canonicalTarget).text();
-    } catch {
+      const bounded = await readBounded(this.fileProvider(canonicalTarget).stream(), this.maxBytes);
+      if (bounded.oversized) {
+        throw new SourceResolutionError(ERROR_CODES.PAYLOAD_TOO_LARGE, "working-tree source exceeds the configured source limit");
+      }
+      content = bounded.content;
+    } catch (error) {
+      if (error instanceof SourceResolutionError) throw error;
       throw new SourceResolutionError(ERROR_CODES.SOURCE_UNAVAILABLE, "working-tree file cannot be read");
     }
     return { content, contentHash: createHash("sha256").update(content, "utf8").digest("hex") };

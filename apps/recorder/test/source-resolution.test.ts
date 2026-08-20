@@ -263,6 +263,41 @@ describe("source resolution", () => {
     expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
     context.store.close();
   });
+  test("neutralizes filter drivers with non-alphanumeric Git names and values", async () => {
+    const context = await createResolverFixture();
+    const marker = join(tmpdir(), `ai-review-filter-name-${crypto.randomUUID()}`);
+    const driver = "evil+driver";
+    await writeFile(join(context.fixture.root, ".gitattributes"), `*.ts filter=${driver}\n`, "utf8");
+    await runGit(context.fixture.root, ["add", "--", ".gitattributes"]);
+    await runGit(context.fixture.root, ["commit", "--quiet", "-m", "filter-name"]);
+    const attributesCommit = await runGit(context.fixture.root, ["rev-parse", "HEAD"]);
+    await runGit(context.fixture.root, ["config", `filter.${driver}.clean`, `touch ${marker}; cat`]);
+    await runGit(context.fixture.root, ["config", `filter.${driver}.smudge`, "cat"]);
+    await writeFile(join(context.fixture.root, context.fixture.path), "export const version = 4;\n", "utf8");
+
+    await new GitReader().readDiff(context.fixture.root, attributesCommit);
+
+    expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
+    context.store.close();
+  });
+
+  test("caps bytes emitted by a growing source stream", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ai-review-source-growth-"));
+    temporaryDirectories.push(root);
+    await writeFile(join(root, "growth.ts"), "small", "utf8");
+    const reader = new WorkingTreeReader(8, () => ({
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("12345678"));
+            controller.enqueue(new TextEncoder().encode("9"));
+            controller.close();
+          },
+        }),
+    }));
+
+    await expect(reader.readFile(root, "growth.ts")).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+  });
 
   test("rejects oversized live source output before buffering", async () => {
     const context = await createResolverFixture();
