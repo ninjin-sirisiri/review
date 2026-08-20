@@ -4,6 +4,7 @@ import {
   type ErrorCode,
 } from "../../../../packages/contracts/src/index";
 import { normalizeSourcePath, SourceResolutionError } from "../repositories/registry";
+import { WorkingTreeReader } from "./worktree";
 
 interface GitResult {
   stdout: string;
@@ -53,6 +54,23 @@ export class GitReaderError extends SourceResolutionError {
     this.name = "GitReaderError";
   }
 }
+function buildTextDiff(path: string, previous: string, current: string): string {
+  const previousLines = previous.split("\n");
+  const currentLines = current.split("\n");
+  let prefix = 0;
+  while (prefix < previousLines.length && prefix < currentLines.length && previousLines[prefix] === currentLines[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < previousLines.length - prefix &&
+    suffix < currentLines.length - prefix &&
+    previousLines[previousLines.length - suffix - 1] === currentLines[currentLines.length - suffix - 1]
+  ) suffix += 1;
+  const removed = previousLines.slice(prefix, previousLines.length - suffix);
+  const added = currentLines.slice(prefix, currentLines.length - suffix);
+  const hunk = [...removed.map((line) => `-${line}`), ...added.map((line) => `+${line}`)].join("\n");
+  return `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -${prefix + 1},${removed.length} +${prefix + 1},${added.length} @@\n${hunk}\n`;
+}
+
 
 export class GitReader {
   readonly maxBytes: number;
@@ -132,41 +150,59 @@ export class GitReader {
     }
   }
 
-  private async discoverFilterOverrides(root: string): Promise<string[]> {
-    const configured = await this.execute(root, ["config", "--local", "--get-regexp", "^filter\\..+\\.(clean|process|smudge|required)$"]);
-    if (configured.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git filter configuration exceeds the configured source limit");
-    const filters = new Set<string>();
-    for (const line of configured.stdout.split("\n")) {
-      const match = /^filter\.(.+)\.(?:clean|process|smudge|required)(?:\s|$)/.exec(line);
-      if (match?.[1] !== undefined) filters.add(match[1]);
-    }
-    const configArgs: string[] = [];
-    for (const filter of filters) {
-      configArgs.push("-c", `filter.${filter}.clean=`, "-c", `filter.${filter}.process=`, "-c", `filter.${filter}.smudge=`, "-c", `filter.${filter}.required=false`);
-    }
-    return configArgs;
+  private async listTreePaths(root: string, sha: string): Promise<string[]> {
+    const result = await this.execute(root, ["ls-tree", "-r", "--name-only", "-z", sha]);
+    if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git tree metadata exceeds the configured source limit");
+    if (result.exitCode !== 0) throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git tree cannot be read");
+    return result.stdout.split("\0").filter((path) => path.length > 0).map((path) => normalizeSourcePath(path));
+  }
+
+  private async listWorktreePaths(root: string): Promise<string[]> {
+    const result = await this.execute(root, ["ls-files", "-z"]);
+    if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git worktree metadata exceeds the configured source limit");
+    if (result.exitCode !== 0) throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git worktree files cannot be listed");
+    return result.stdout.split("\0").filter((path) => path.length > 0).map((path) => normalizeSourcePath(path));
+  }
+
+  private async readCommitBlob(root: string, sha: string, path: string): Promise<string | null> {
+    const result = await this.execute(root, ["show", "--no-ext-diff", "--no-textconv", "--format=", `${sha}:${path}`]);
+    if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git source exceeds the configured source limit");
+    if (result.exitCode !== 0) return null;
+    return result.stdout;
   }
 
   async readCommitFile(root: string, sha: string, relativePath: string): Promise<string> {
     const normalizedPath = normalizeSourcePath(relativePath);
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
-    const result = await this.execute(root, ["show", "--no-ext-diff", "--no-textconv", "--format=", `${sha}:${normalizedPath}`]);
-    if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git source exceeds the configured source limit");
-    if (result.exitCode !== 0) {
+    const content = await this.readCommitBlob(root, sha, normalizedPath);
+    if (content === null) {
       throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "file is not available at the requested revision");
     }
-    return result.stdout;
+    return content;
   }
+
   async readDiff(root: string, sha: string): Promise<string> {
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
-    const configArgs = await this.discoverFilterOverrides(root);
-    const result = await this.execute(root, ["diff", "--no-ext-diff", "--no-textconv", sha, "--"], configArgs);
-    if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git diff exceeds the configured source limit");
-    if (result.exitCode !== 0) {
-      throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "diff is not available for the requested revision");
+    const [treePaths, worktreePaths] = await Promise.all([this.listTreePaths(root, sha), this.listWorktreePaths(root)]);
+    const paths = new Set([...treePaths, ...worktreePaths]);
+    const worktree = new WorkingTreeReader(this.maxBytes);
+    let diff = "";
+    for (const path of paths) {
+      const previous = (await this.readCommitBlob(root, sha, path)) ?? "";
+      let current = "";
+      try {
+        current = (await worktree.readFile(root, path)).content;
+      } catch (error) {
+        if (!(error instanceof SourceResolutionError) || error.code !== ERROR_CODES.SOURCE_UNAVAILABLE) throw error;
+      }
+      if (previous === current) continue;
+      diff += buildTextDiff(path, previous, current);
+      if (new TextEncoder().encode(diff).byteLength > this.maxBytes) {
+        throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git diff exceeds the configured source limit");
+      }
     }
-    return result.stdout;
+    return diff;
   }
 }

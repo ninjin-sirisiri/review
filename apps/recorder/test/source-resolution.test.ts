@@ -298,6 +298,26 @@ describe("source resolution", () => {
 
     await expect(reader.readFile(root, "growth.ts")).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
   });
+  test("isolates worktree-local filters with equals in the driver name", async () => {
+    const context = await createResolverFixture();
+    const marker = join(tmpdir(), `ai-review-worktree-filter-${crypto.randomUUID()}`);
+    await writeFile(join(context.fixture.root, ".gitattributes"), "*.ts filter=evil=driver\n", "utf8");
+    await runGit(context.fixture.root, ["add", "--", ".gitattributes"]);
+    await runGit(context.fixture.root, ["commit", "--quiet", "-m", "worktree-filter"]);
+    const attributesCommit = await runGit(context.fixture.root, ["rev-parse", "HEAD"]);
+    await runGit(context.fixture.root, ["config", "extensions.worktreeConfig", "true"]);
+    await writeFile(
+      join(context.fixture.root, ".git", "config.worktree"),
+      `[filter "evil=driver"]\n\tclean = touch ${marker}; cat\n\tsmudge = cat\n`,
+      "utf8",
+    );
+    await writeFile(join(context.fixture.root, context.fixture.path), "export const version = 5;\n", "utf8");
+
+    await new GitReader().readDiff(context.fixture.root, attributesCommit);
+
+    expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
+    context.store.close();
+  });
 
   test("rejects oversized live source output before buffering", async () => {
     const context = await createResolverFixture();
