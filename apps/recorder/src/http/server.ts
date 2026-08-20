@@ -1,4 +1,4 @@
-import { access, realpath, stat } from "node:fs/promises";
+import { access, lstat, realpath, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
@@ -308,6 +308,14 @@ function overlapsPath(first: string, second: string): boolean {
 
 async function canonicalPathAndStorageRoot(path: string): Promise<{ path: string; storageRoot: string }> {
   const lexicalPath = resolve(path);
+  try {
+    if ((await lstat(lexicalPath)).isSymbolicLink()) {
+      throw new RangeError("databasePath must not be a symlink");
+    }
+  } catch (error) {
+    const errno = error as NodeJS.ErrnoException;
+    if (errno.code !== "ENOENT") throw error;
+  }
   let existingPath = lexicalPath;
   while (true) {
     try {

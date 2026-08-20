@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -337,6 +337,15 @@ describe("authenticated local Recorder HTTP API", () => {
       dataDir: externalDataDir,
       databasePath: join(externalDatabaseDir, "records.sqlite"),
     });
+    await expect(createRecorderServer({ config, uiRoot, port: 0 })).rejects.toThrow();
+  });
+  test("rejects a dangling database symlink whose target enters the public UI root", async () => {
+    const externalDataDir = await mkdtemp(join(tmpdir(), "ai-review-http-dangling-data-"));
+    temporaryDirectories.push(externalDataDir);
+    const databaseLink = join(externalDataDir, "dangling.sqlite");
+    await symlink(join(uiRoot, "missing.sqlite"), databaseLink, "file");
+    expect((await lstat(databaseLink)).isSymbolicLink()).toBe(true);
+    const config = createRecorderConfig({ dataDir: externalDataDir, databasePath: databaseLink });
     await expect(createRecorderServer({ config, uiRoot, port: 0 })).rejects.toThrow();
   });
 
