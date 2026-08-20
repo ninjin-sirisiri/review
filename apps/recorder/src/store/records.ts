@@ -1,3 +1,5 @@
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
 import {
   ContractValidationError,
@@ -85,12 +87,19 @@ function validationValue<T>(result: { success: true; data: T } | { success: fals
   if (!result.success) throw new ContractValidationError(result);
   return result.data;
 }
-
 function parseRevision(kind: RevisionRef["kind"], value: string): RevisionRef {
   if (kind === "commit") return { kind, sha: value };
   return { kind, contentHash: value };
 }
 
+function prepareDatabaseDirectory(config: RecorderConfig): void {
+  mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+  mkdirSync(dirname(config.databasePath), { recursive: true, mode: 0o700 });
+}
+
+function isMemoryDatabasePath(value: string | undefined): boolean {
+  return value === "" || value === ":memory:";
+}
 export class RecordStore {
   readonly db: Database;
   readonly config: RecorderConfig;
@@ -105,12 +114,27 @@ export class RecordStore {
       this.config = createRecorderConfig((configInput ?? {}) as RecorderConfigOverrides);
       this.ownsDatabase = false;
     } else if (typeof databaseOrConfig === "string") {
-      this.config = createRecorderConfig({ ...(configInput as RecorderConfigOverrides | undefined), databasePath: databaseOrConfig });
-      this.db = new Database(databaseOrConfig, { create: true, strict: true });
+      const databasePath = databaseOrConfig;
+      this.config = isMemoryDatabasePath(databasePath)
+        ? createRecorderConfig((configInput ?? {}) as RecorderConfigOverrides)
+        : createRecorderConfig({ ...(configInput as RecorderConfigOverrides | undefined), databasePath });
+      if (isMemoryDatabasePath(databasePath)) {
+        this.db = new Database(":memory:");
+      } else {
+        prepareDatabaseDirectory(this.config);
+        this.db = new Database(this.config.databasePath, { create: true });
+      }
       this.ownsDatabase = true;
     } else {
-      this.config = createRecorderConfig(databaseOrConfig as RecorderConfigOverrides);
-      this.db = new Database(this.config.databasePath, { create: true, strict: true });
+      const options = databaseOrConfig as RecorderConfigOverrides;
+      const requestedDatabasePath = options.databasePath ?? options.dbPath;
+      this.config = createRecorderConfig(options);
+      if (isMemoryDatabasePath(requestedDatabasePath)) {
+        this.db = new Database(":memory:");
+      } else {
+        prepareDatabaseDirectory(this.config);
+        this.db = new Database(this.config.databasePath, { create: true });
+      }
       this.ownsDatabase = true;
     }
     migrateSchema(this.db);

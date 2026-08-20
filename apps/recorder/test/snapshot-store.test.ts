@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -76,7 +76,36 @@ describe("SnapshotStore", () => {
     const snapshots = new SnapshotStore(db, createRecorderConfig({ dataDir, maxSnapshotContentLength: 4 }));
 
     await expect(snapshots.create(decision.record_id, undefined as never, "text")).rejects.toThrow();
+    const exactByteLimit = await snapshots.create(decision.record_id, "patch", "éé");
+    expect((await snapshots.get(exactByteLimit.snapshot_id))?.content).toBe("éé");
+    await expect(snapshots.create(decision.record_id, "patch", "ééé")).rejects.toThrow();
     await expect(snapshots.create(decision.record_id, "patch", "too long")).rejects.toThrow();
+    db.close();
+  });
+  test("rejects a snapshot directory symlink that escapes the owner data directory", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "ai-review-snapshot-owner-"));
+    const outsideDir = await mkdtemp(join(tmpdir(), "ai-review-snapshot-outside-"));
+    temporaryDirectories.push(dataDir, outsideDir);
+    await symlink(outsideDir, join(dataDir, "snapshots"), "dir");
+    const db = new Database(":memory:");
+    try {
+      expect(() => new SnapshotStore(db, createRecorderConfig({ dataDir }))).toThrow(/outside dataDir/);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does not load a snapshot file whose byte size exceeds the configured limit", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "ai-review-snapshot-size-"));
+    temporaryDirectories.push(dataDir);
+    const db = new Database(":memory:");
+    const store = new RecordStore(db);
+    await store.createSession(session);
+    await store.insertDecision(decision);
+    const snapshots = new SnapshotStore(db, createRecorderConfig({ dataDir, maxSnapshotContentLength: 8 }));
+    const reference = await snapshots.create(decision.record_id, "patch", "small");
+    await writeFile(join(dataDir, reference.path), "0123456789", "utf8");
+    expect(await snapshots.get(reference.snapshot_id)).toBeNull();
     db.close();
   });
 });

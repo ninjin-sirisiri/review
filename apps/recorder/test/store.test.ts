@@ -1,3 +1,6 @@
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import type { DecisionRecordInput, ReviewSession } from "../../../packages/contracts/src/index";
@@ -75,5 +78,31 @@ describe("RecordStore", () => {
     expect(updated.user_disposition).toBe("rejected");
     expect(await store.getDecision(decision.record_id)).toEqual(updated);
     db.close();
+  });
+  test("creates a fresh data directory before opening the file-backed database", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "ai-review-store-"));
+    const dataDir = join(parent, "new-owner");
+    const store = new RecordStore({ dataDir });
+    try {
+      await store.createSession(session);
+      expect((await stat(dataDir)).isDirectory()).toBe(true);
+      expect((await stat(join(dataDir, "records.sqlite"))).isFile()).toBe(true);
+    } finally {
+      store.close();
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("resolves relative database paths under the configured data directory", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "ai-review-relative-db-"));
+    const dataDir = join(parent, "owner");
+    const store = new RecordStore("nested/records.sqlite", { dataDir });
+    try {
+      await store.createSession(session);
+      expect((await stat(join(dataDir, "nested", "records.sqlite"))).isFile()).toBe(true);
+    } finally {
+      store.close();
+      await rm(parent, { recursive: true, force: true });
+    }
   });
 });

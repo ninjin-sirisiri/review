@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { mkdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
   ERROR_CODES,
   validateSnapshotReference,
@@ -39,12 +40,15 @@ function isRecordStore(value: unknown): value is RecordStore {
 function snapshotMode(value: unknown): value is SnapshotMode {
   return value === "changed-files" || value === "patch";
 }
+function contentByteLength(content: string): number {
+  return new TextEncoder().encode(content).byteLength;
+}
 
 export class SnapshotStore {
   readonly db: Database;
   readonly config: RecorderConfig;
   private readonly snapshotRoot: string;
-
+  private readonly canonicalSnapshotRoot: string;
   constructor(store: RecordStore, config?: ConfigInput);
   constructor(database: Database, config?: ConfigInput);
   constructor(storeOrDatabase: RecordStore | Database, configInput?: ConfigInput) {
@@ -56,11 +60,32 @@ export class SnapshotStore {
       this.config = createRecorderConfig((configInput ?? {}) as RecorderConfigOverrides);
     }
     migrateSchema(this.db);
-    this.snapshotRoot = resolve(this.config.snapshotDir);
-    const ownerRelativePath = relative(this.config.dataDir, this.snapshotRoot);
-    if (ownerRelativePath === ".." || ownerRelativePath.startsWith(`..${sep}`) || isAbsolute(ownerRelativePath)) {
+
+    mkdirSync(this.config.dataDir, { recursive: true, mode: 0o700 });
+    const ownerRoot = realpathSync(resolve(this.config.dataDir));
+    const configuredRoot = resolve(this.config.snapshotDir);
+    const lexicalRelative = relative(resolve(this.config.dataDir), configuredRoot);
+    if (lexicalRelative === ".." || lexicalRelative.startsWith(`..${sep}`) || isAbsolute(lexicalRelative)) {
       throw new PersistenceError(ERROR_CODES.PATH_OUTSIDE_ROOT, "snapshotDir must be inside dataDir");
     }
+
+    let existingAncestor = configuredRoot;
+    while (!existsSync(existingAncestor)) {
+      const parent = dirname(existingAncestor);
+      if (parent === existingAncestor) {
+        throw new PersistenceError(ERROR_CODES.PATH_OUTSIDE_ROOT, "snapshotDir has no resolvable owner-local ancestor");
+      }
+      existingAncestor = parent;
+    }
+    const canonicalAncestor = realpathSync(existingAncestor);
+    const missingSuffix = relative(existingAncestor, configuredRoot);
+    const canonicalRoot = resolve(canonicalAncestor, missingSuffix);
+    const canonicalRelative = relative(ownerRoot, canonicalRoot);
+    if (canonicalRelative === ".." || canonicalRelative.startsWith(`..${sep}`) || isAbsolute(canonicalRelative)) {
+      throw new PersistenceError(ERROR_CODES.PATH_OUTSIDE_ROOT, "snapshotDir resolves outside dataDir");
+    }
+    this.snapshotRoot = configuredRoot;
+    this.canonicalSnapshotRoot = canonicalRoot;
   }
 
   async create(recordId: string, mode: SnapshotMode, content: string): Promise<SnapshotReference> {
@@ -73,7 +98,7 @@ export class SnapshotStore {
     if (typeof content !== "string") {
       throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "snapshot content must be a string");
     }
-    if (content.length > this.config.maxSnapshotContentLength) {
+    if (contentByteLength(content) > this.config.maxSnapshotContentLength) {
       throw new PersistenceError(ERROR_CODES.PAYLOAD_TOO_LARGE, "snapshot content exceeds the configured maximum length");
     }
 
@@ -143,9 +168,11 @@ export class SnapshotStore {
     let content: string;
     try {
       const actualPath = await realpath(filePath);
-      const actualRoot = await realpath(this.snapshotRoot);
+      const actualRoot = await realpath(this.canonicalSnapshotRoot);
       const actualRelative = relative(actualRoot, actualPath);
       if (actualRelative === "" || actualRelative === ".." || actualRelative.startsWith(`..${sep}`) || isAbsolute(actualRelative)) return null;
+      const fileInfo = await stat(actualPath);
+      if (!fileInfo.isFile() || fileInfo.size > this.config.maxSnapshotContentLength) return null;
       content = await readFile(actualPath, "utf8");
     } catch {
       return null;
