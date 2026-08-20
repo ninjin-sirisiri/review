@@ -4,8 +4,11 @@ import {
   type ErrorCode,
 } from "../../../../packages/contracts/src/index";
 import { normalizeSourcePath, SourceResolutionError } from "../repositories/registry";
-import { WorkingTreeReader } from "./worktree";
-
+import {
+  WorkingTreePathMissingError,
+  WorkingTreeReader,
+  validateEnumeratedPath,
+} from "./worktree";
 interface GitResult {
   stdout: string;
   stderr: string;
@@ -54,22 +57,136 @@ export class GitReaderError extends SourceResolutionError {
     this.name = "GitReaderError";
   }
 }
-function buildTextDiff(path: string, previous: string, current: string): string {
-  const previousLines = previous.split("\n");
-  const currentLines = current.split("\n");
-  let prefix = 0;
-  while (prefix < previousLines.length && prefix < currentLines.length && previousLines[prefix] === currentLines[prefix]) prefix += 1;
-  let suffix = 0;
-  while (
-    suffix < previousLines.length - prefix &&
-    suffix < currentLines.length - prefix &&
-    previousLines[previousLines.length - suffix - 1] === currentLines[currentLines.length - suffix - 1]
-  ) suffix += 1;
-  const removed = previousLines.slice(prefix, previousLines.length - suffix);
-  const added = currentLines.slice(prefix, currentLines.length - suffix);
-  const hunk = [...removed.map((line) => `-${line}`), ...added.map((line) => `+${line}`)].join("\n");
-  return `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -${prefix + 1},${removed.length} +${prefix + 1},${added.length} @@\n${hunk}\n`;
+
+type DiffOperation =
+  | { kind: "equal"; line: string }
+  | { kind: "delete"; line: string }
+  | { kind: "insert"; line: string };
+
+interface DiffEntry {
+  operation: DiffOperation;
+  oldLine: number | null;
+  newLine: number | null;
+  oldBefore: number;
+  newBefore: number;
 }
+
+function lineDiff(previous: string[], current: string[]): DiffOperation[] {
+  const maxDistance = previous.length + current.length;
+  let frontier = new Map<number, number>([[1, 0]]);
+  const trace: Map<number, number>[] = [];
+
+  for (let distance = 0; distance <= maxDistance; distance += 1) {
+    const nextFrontier = new Map<number, number>();
+    for (let diagonal = -distance; diagonal <= distance; diagonal += 2) {
+      const down = diagonal === -distance || (diagonal !== distance && (frontier.get(diagonal - 1) ?? -1) < (frontier.get(diagonal + 1) ?? -1));
+      let x = down ? (frontier.get(diagonal + 1) ?? 0) : (frontier.get(diagonal - 1) ?? 0) + 1;
+      let y = x - diagonal;
+      while (x < previous.length && y < current.length && previous[x] === current[y]) {
+        x += 1;
+        y += 1;
+      }
+      nextFrontier.set(diagonal, x);
+      if (x >= previous.length && y >= current.length) {
+        trace.push(nextFrontier);
+        const operations: DiffOperation[] = [];
+        let backtrackX = previous.length;
+        let backtrackY = current.length;
+        for (let step = trace.length - 1; step > 0; step -= 1) {
+          const prior = trace[step - 1]!;
+          const backtrackDiagonal = backtrackX - backtrackY;
+          const backtrackDown =
+            backtrackDiagonal === -step ||
+            (backtrackDiagonal !== step && (prior.get(backtrackDiagonal - 1) ?? -1) < (prior.get(backtrackDiagonal + 1) ?? -1));
+          const priorDiagonal = backtrackDown ? backtrackDiagonal + 1 : backtrackDiagonal - 1;
+          const priorX = prior.get(priorDiagonal) ?? 0;
+          const priorY = priorX - priorDiagonal;
+          while (backtrackX > priorX && backtrackY > priorY) {
+            operations.push({ kind: "equal", line: previous[backtrackX - 1]! });
+            backtrackX -= 1;
+            backtrackY -= 1;
+          }
+          if (backtrackX === priorX) {
+            operations.push({ kind: "insert", line: current[backtrackY - 1]! });
+            backtrackY -= 1;
+          } else {
+            operations.push({ kind: "delete", line: previous[backtrackX - 1]! });
+            backtrackX -= 1;
+          }
+        }
+        while (backtrackX > 0 && backtrackY > 0) {
+          operations.push({ kind: "equal", line: previous[backtrackX - 1]! });
+          backtrackX -= 1;
+          backtrackY -= 1;
+        }
+        while (backtrackX > 0) {
+          operations.push({ kind: "delete", line: previous[backtrackX - 1]! });
+          backtrackX -= 1;
+        }
+        while (backtrackY > 0) {
+          operations.push({ kind: "insert", line: current[backtrackY - 1]! });
+          backtrackY -= 1;
+        }
+        return operations.reverse();
+      }
+    }
+    trace.push(nextFrontier);
+    frontier = nextFrontier;
+  }
+  return [];
+}
+
+function buildTextDiff(path: string, previous: string, current: string): string {
+  const operations = lineDiff(previous.split("\n"), current.split("\n"));
+  const entries: DiffEntry[] = [];
+  let oldLine = 0;
+  let newLine = 0;
+  for (const operation of operations) {
+    entries.push({
+      operation,
+      oldLine: operation.kind === "insert" ? null : oldLine + 1,
+      newLine: operation.kind === "delete" ? null : newLine + 1,
+      oldBefore: oldLine,
+      newBefore: newLine,
+    });
+    if (operation.kind !== "insert") oldLine += 1;
+    if (operation.kind !== "delete") newLine += 1;
+  }
+  const changes = entries.flatMap((entry, index) => (entry.operation.kind === "equal" ? [] : [index]));
+  if (changes.length === 0) return "";
+
+  const hunks: string[] = [];
+  let start = Math.max(0, changes[0]! - 3);
+  let end = Math.min(entries.length - 1, changes[0]! + 3);
+  for (let change = 1; change < changes.length; change += 1) {
+    const nextStart = Math.max(0, changes[change]! - 3);
+    const nextEnd = Math.min(entries.length - 1, changes[change]! + 3);
+    if (nextStart <= end + 1) {
+      end = Math.max(end, nextEnd);
+      continue;
+    }
+    hunks.push(formatHunk(entries, start, end));
+    start = nextStart;
+    end = nextEnd;
+  }
+  hunks.push(formatHunk(entries, start, end));
+  return `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n${hunks.join("")}`;
+}
+
+function formatHunk(entries: DiffEntry[], start: number, end: number): string {
+  const hunkEntries = entries.slice(start, end + 1);
+  const first = hunkEntries[0]!;
+  const oldStart = first.oldLine ?? first.oldBefore + 1;
+  const newStart = first.newLine ?? first.newBefore + 1;
+  const oldCount = hunkEntries.filter((entry) => entry.oldLine !== null).length;
+  const newCount = hunkEntries.filter((entry) => entry.newLine !== null).length;
+  const body = hunkEntries
+    .map((entry) => `${entry.operation.kind === "equal" ? " " : entry.operation.kind === "delete" ? "-" : "+"}${entry.operation.line}`)
+    .join("\n");
+  return `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@\n${body}\n`;
+}
+
+
 
 
 export class GitReader {
@@ -154,20 +271,28 @@ export class GitReader {
     const result = await this.execute(root, ["ls-tree", "-r", "--name-only", "-z", sha]);
     if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git tree metadata exceeds the configured source limit");
     if (result.exitCode !== 0) throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git tree cannot be read");
-    return result.stdout.split("\0").filter((path) => path.length > 0).map((path) => normalizeSourcePath(path));
+    return result.stdout
+      .split("\0")
+      .filter((path) => path.length > 0)
+      .map((path) => validateEnumeratedPath(root, path));
   }
 
   private async listWorktreePaths(root: string): Promise<string[]> {
     const result = await this.execute(root, ["ls-files", "-z"]);
     if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git worktree metadata exceeds the configured source limit");
     if (result.exitCode !== 0) throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git worktree files cannot be listed");
-    return result.stdout.split("\0").filter((path) => path.length > 0).map((path) => normalizeSourcePath(path));
+    return result.stdout
+      .split("\0")
+      .filter((path) => path.length > 0)
+      .map((path) => validateEnumeratedPath(root, path));
   }
 
-  private async readCommitBlob(root: string, sha: string, path: string): Promise<string | null> {
+  private async readCommitBlob(root: string, sha: string, path: string): Promise<string> {
     const result = await this.execute(root, ["show", "--no-ext-diff", "--no-textconv", "--format=", `${sha}:${path}`]);
     if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git source exceeds the configured source limit");
-    if (result.exitCode !== 0) return null;
+    if (result.exitCode !== 0) {
+      throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git source blob is unavailable");
+    }
     return result.stdout;
   }
 
@@ -175,31 +300,37 @@ export class GitReader {
     const normalizedPath = normalizeSourcePath(relativePath);
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
-    const content = await this.readCommitBlob(root, sha, normalizedPath);
-    if (content === null) {
-      throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "file is not available at the requested revision");
-    }
-    return content;
+    return this.readCommitBlob(root, sha, normalizedPath);
   }
 
   async readDiff(root: string, sha: string): Promise<string> {
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
     const [treePaths, worktreePaths] = await Promise.all([this.listTreePaths(root, sha), this.listWorktreePaths(root)]);
+    const treePathSet = new Set(treePaths);
+    const worktreePathSet = new Set(worktreePaths);
     const paths = new Set([...treePaths, ...worktreePaths]);
     const worktree = new WorkingTreeReader(this.maxBytes);
+    const encoder = new TextEncoder();
     let diff = "";
     for (const path of paths) {
-      const previous = (await this.readCommitBlob(root, sha, path)) ?? "";
+      const previous = treePathSet.has(path) ? await this.readCommitBlob(root, sha, path) : "";
       let current = "";
-      try {
-        current = (await worktree.readFile(root, path)).content;
-      } catch (error) {
-        if (!(error instanceof SourceResolutionError) || error.code !== ERROR_CODES.SOURCE_UNAVAILABLE) throw error;
+      if (worktreePathSet.has(path)) {
+        try {
+          current = (await worktree.readEnumeratedFile(root, path)).content;
+        } catch (error) {
+          if (error instanceof WorkingTreePathMissingError) {
+            current = "";
+          } else {
+            throw error;
+          }
+        }
       }
       if (previous === current) continue;
-      diff += buildTextDiff(path, previous, current);
-      if (new TextEncoder().encode(diff).byteLength > this.maxBytes) {
+      const patch = buildTextDiff(path, previous, current);
+      diff += patch;
+      if (encoder.encode(diff).byteLength > this.maxBytes) {
         throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git diff exceeds the configured source limit");
       }
     }

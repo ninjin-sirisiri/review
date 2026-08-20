@@ -199,6 +199,100 @@ describe("source resolution", () => {
     expect(await git.readDiff(context.fixture.root, context.fixture.commitSha)).toContain("version = 2");
     context.store.close();
   });
+
+  test("preserves literal backslashes in Git-enumerated paths", async () => {
+    const context = await createResolverFixture();
+    const literalPath = "literal\\name.ts";
+    await writeFile(join(context.fixture.root, literalPath), "before\n", "utf8");
+    await runGit(context.fixture.root, ["add", "--", literalPath]);
+    await runGit(context.fixture.root, ["commit", "--quiet", "-m", "literal-path"]);
+    const commitSha = await runGit(context.fixture.root, ["rev-parse", "HEAD"]);
+    await writeFile(join(context.fixture.root, literalPath), "after\n", "utf8");
+
+    const diff = await new GitReader().readDiff(context.fixture.root, commitSha);
+
+    expect(diff).toContain(`a/${literalPath}`);
+    expect(diff).toContain("-before");
+    expect(diff).toContain("+after");
+    context.store.close();
+  });
+  test("reads tracked symlinks as link text without following outside targets", async () => {
+    const context = await createResolverFixture();
+    await writeFile(join(context.fixture.root, context.fixture.path), context.fixture.committed, "utf8");
+    const outside = await mkdtemp(join(tmpdir(), "ai-review-source-link-outside-"));
+    temporaryDirectories.push(outside);
+    const outsideTarget = join(outside, "secret.ts");
+    await writeFile(outsideTarget, "secret\n", "utf8");
+    const linkPath = "outside-link.ts";
+    await symlink(outsideTarget, join(context.fixture.root, linkPath));
+    await runGit(context.fixture.root, ["add", "--", linkPath]);
+    await runGit(context.fixture.root, ["commit", "--quiet", "-m", "symlink"]);
+    const commitSha = await runGit(context.fixture.root, ["rev-parse", "HEAD"]);
+
+    const git = new GitReader();
+    const worktree = new WorkingTreeReader();
+    expect(await git.readCommitFile(context.fixture.root, commitSha, linkPath)).toBe(outsideTarget);
+    expect(await worktree.readFile(context.fixture.root, linkPath)).toEqual({ content: outsideTarget, contentHash: hash(outsideTarget) });
+    expect(await git.readDiff(context.fixture.root, commitSha)).toBe("");
+    context.store.close();
+  });
+
+  test("classifies corrupt committed blobs as source-unavailable", async () => {
+    const context = await createResolverFixture();
+    const blobSha = await runGit(context.fixture.root, ["rev-parse", `${context.fixture.commitSha}:${context.fixture.path}`]);
+    await rm(join(context.fixture.root, ".git", "objects", blobSha.slice(0, 2), blobSha.slice(2)), { force: true });
+
+    await expect(new GitReader().readCommitFile(context.fixture.root, context.fixture.commitSha, context.fixture.path)).rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
+    await expect(new GitReader().readDiff(context.fixture.root, context.fixture.commitSha)).rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
+    context.store.close();
+  });
+
+  test("classifies unreadable working-tree files as source-unavailable", async () => {
+    const context = await createResolverFixture();
+    const reader = new WorkingTreeReader(1024, () => ({
+      stream: () => {
+        throw new Error("permission denied");
+      },
+    }));
+
+    await expect(reader.readFile(context.fixture.root, context.fixture.path)).rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
+    context.store.close();
+  });
+
+  test("emits separate accurate hunks for separated line edits", async () => {
+    const context = await createResolverFixture();
+    await writeFile(join(context.fixture.root, context.fixture.path), context.fixture.committed, "utf8");
+    const separatedPath = "src/separated.ts";
+    const original = Array.from({ length: 15 }, (_, index) => `line-${index + 1}`).join("\n") + "\n";
+    await writeFile(join(context.fixture.root, separatedPath), original, "utf8");
+    await runGit(context.fixture.root, ["add", "--", separatedPath]);
+    await runGit(context.fixture.root, ["commit", "--quiet", "-m", "separated-lines"]);
+    const commitSha = await runGit(context.fixture.root, ["rev-parse", "HEAD"]);
+    const changed = original.replace("line-2", "changed-2").replace("line-12", "changed-12");
+    await writeFile(join(context.fixture.root, separatedPath), changed, "utf8");
+
+    const diff = await new GitReader().readDiff(context.fixture.root, commitSha);
+
+    expect(diff.match(/@@ /g)?.length).toBe(2);
+    expect(diff).toContain("-line-2");
+    expect(diff).toContain("+changed-2");
+    expect(diff).toContain("-line-12");
+    expect(diff).toContain("+changed-12");
+    expect(diff).not.toContain("-line-5");
+    expect(diff).not.toContain("+line-5");
+    context.store.close();
+  });
+
+  test("treats an absent tracked worktree path as a deletion", async () => {
+    const context = await createResolverFixture();
+    await rm(join(context.fixture.root, context.fixture.path), { force: true });
+
+    const diff = await new GitReader().readDiff(context.fixture.root, context.fixture.commitSha);
+
+    expect(diff).toContain("-export const version = 1;");
+    expect(diff).not.toContain("SOURCE_UNAVAILABLE");
+    context.store.close();
+  });
   test("returns snapshot content even after the live repository root disappears", async () => {
     const context = await createResolverFixture();
     const workingTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.working) }, context.fixture.working);
