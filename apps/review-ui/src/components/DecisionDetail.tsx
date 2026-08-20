@@ -35,7 +35,7 @@ export function DecisionDetail({ detail, onDispositionChange }: DecisionDetailPr
     setMutationError(null);
     try {
       const updatedDetail = await onDispositionChange(disposition);
-      setDisplayedRecord(updatedDetail?.record ?? { ...displayedRecord, user_disposition: disposition });
+      if (updatedDetail !== undefined) setDisplayedRecord(updatedDetail.record);
     } catch (error) {
       setMutationError(error instanceof Error ? error.message : "Unable to update the disposition");
     } finally {

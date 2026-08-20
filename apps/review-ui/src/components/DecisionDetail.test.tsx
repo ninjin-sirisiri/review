@@ -76,6 +76,16 @@ describe("DecisionDetail", () => {
     await waitFor(() => expect(accepted.getAttribute("aria-pressed")).toBe("true"));
     expect(onDispositionChange).toHaveBeenCalledWith("accepted");
   });
+  it("does not change the displayed disposition when the mutation has no confirmed detail", async () => {
+    const onDispositionChange = vi.fn(async () => undefined);
+    render(<DecisionDetail detail={detail} onDispositionChange={onDispositionChange} />);
+
+    const accepted = screen.getByRole("button", { name: "Accept" });
+    fireEvent.click(accepted);
+    await waitFor(() => expect(onDispositionChange).toHaveBeenCalledWith("accepted"));
+    expect(accepted.getAttribute("aria-pressed")).toBe("false");
+    expect(screen.getByRole("button", { name: "Mark unreviewed" }).getAttribute("aria-pressed")).toBe("true");
+  });
 
   it("keeps the current disposition and shows an error when mutation fails", async () => {
     const onDispositionChange = vi.fn(async () => {
