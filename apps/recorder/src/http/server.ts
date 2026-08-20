@@ -306,12 +306,40 @@ function overlapsPath(first: string, second: string): boolean {
   return relativePath === "" || (!isAbsolute(relativePath) && relativePath !== ".." && !relativePath.startsWith(`..${sep}`));
 }
 
-async function validateUiRoot(dataDir: string, uiRoot: string | undefined): Promise<string | undefined> {
+async function canonicalPathAndStorageRoot(path: string): Promise<{ path: string; storageRoot: string }> {
+  const lexicalPath = resolve(path);
+  let existingPath = lexicalPath;
+  while (true) {
+    try {
+      const canonicalExisting = await realpath(existingPath);
+      const suffix = relative(existingPath, lexicalPath);
+      const canonicalPath = resolve(canonicalExisting, suffix);
+      const storageRoot = suffix === "" ? resolve(canonicalPath, "..") : canonicalExisting;
+      return { path: canonicalPath, storageRoot };
+    } catch (error) {
+      const errno = error as NodeJS.ErrnoException;
+      if (errno.code !== "ENOENT") throw error;
+      const parent = resolve(existingPath, "..");
+      if (parent === existingPath) throw error;
+      existingPath = parent;
+    }
+  }
+}
+
+async function validateUiRoot(dataDir: string, databasePath: string, uiRoot: string | undefined): Promise<string | undefined> {
   if (uiRoot === undefined) return undefined;
   const canonicalDataDir = await realpath(resolve(dataDir));
   const canonicalUiRoot = await realpath(resolve(uiRoot));
-  if (overlapsPath(canonicalDataDir, canonicalUiRoot) || overlapsPath(canonicalUiRoot, canonicalDataDir)) {
-    throw new RangeError("uiRoot must not overlap the owner data directory");
+  const database = await canonicalPathAndStorageRoot(databasePath);
+  if (
+    overlapsPath(canonicalDataDir, canonicalUiRoot) ||
+    overlapsPath(canonicalUiRoot, canonicalDataDir) ||
+    overlapsPath(canonicalUiRoot, database.path) ||
+    overlapsPath(database.path, canonicalUiRoot) ||
+    overlapsPath(canonicalUiRoot, database.storageRoot) ||
+    overlapsPath(database.storageRoot, canonicalUiRoot)
+  ) {
+    throw new RangeError("uiRoot must not overlap owner storage");
   }
   return canonicalUiRoot;
 }
@@ -448,7 +476,7 @@ export async function createRecorderServer(options: RecorderServerOptions = {}):
   const config = makeConfig(options);
   if (config.bindAddress !== LOOPBACK_ADDRESS) throw new RangeError("Recorder API must bind to 127.0.0.1");
   const token = await ensureOwnerToken(config);
-  const staticUiRoot = await validateUiRoot(config.dataDir, options.uiRoot);
+  const staticUiRoot = await validateUiRoot(config.dataDir, config.databasePath, options.uiRoot);
   const store = new RecordStore(config);
   const snapshots = new SnapshotStore(store, config);
   const registry = new RepositoryRegistry(store);

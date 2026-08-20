@@ -328,6 +328,18 @@ describe("authenticated local Recorder HTTP API", () => {
     await expect(createRecorderServer({ dataDir, uiRoot: linkedUi, port: 0 })).rejects.toThrow();
   });
 
+  test("rejects a public UI root containing an external database path", async () => {
+    const externalDataDir = await mkdtemp(join(tmpdir(), "ai-review-http-external-data-"));
+    temporaryDirectories.push(externalDataDir);
+    const externalDatabaseDir = join(uiRoot, "database");
+    await mkdir(externalDatabaseDir, { recursive: true });
+    const config = createRecorderConfig({
+      dataDir: externalDataDir,
+      databasePath: join(externalDatabaseDir, "records.sqlite"),
+    });
+    await expect(createRecorderServer({ config, uiRoot, port: 0 })).rejects.toThrow();
+  });
+
   test("stores the owner token with restrictive permissions and binds to loopback", async () => {
     expect(app.config.bindAddress).toBe("127.0.0.1");
     expect(app.server.hostname).toBe("127.0.0.1");
