@@ -25,7 +25,7 @@ async function json<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function body(recordId = "record-1", sessionId = "session-1"): DecisionRecordInput {
+function body(recordId = "record-1", sessionId = "session-1", targetPath = "src/example.ts"): DecisionRecordInput {
   const content = "export const answer = 42;\n";
   const contentHash = createHash("sha256").update(content).digest("hex");
   return {
@@ -36,7 +36,7 @@ function body(recordId = "record-1", sessionId = "session-1"): DecisionRecordInp
     revision: { kind: "working-tree", contentHash },
     targets: [{
       repository_id: "repo-1",
-      path: "src/example.ts",
+      path: targetPath,
       line_start: 1,
       line_end: 1,
       revision: { kind: "working-tree", contentHash },
@@ -57,6 +57,7 @@ beforeEach(async () => {
   temporaryDirectories.push(dataDir, root, uiRoot);
   await mkdir(join(root, "src"), { recursive: true });
   await writeFile(join(root, "src", "example.ts"), "changed source\n", "utf8");
+  await writeFile(join(root, "src", "other.ts"), "changed source\n", "utf8");
   await writeFile(join(uiRoot, "index.html"), "<!doctype html><title>Review</title>", "utf8");
   app = await createRecorderServer({ dataDir, port: 0, uiRoot });
   token = await readOwnerToken(app.config);
@@ -87,9 +88,21 @@ describe("authenticated local Recorder HTTP API", () => {
     expect(await json<{ success: false; error: { code: string } }>(api)).toMatchObject({ success: false, error: { code: "UNAUTHORIZED" } });
   });
 
-  test("serves only static UI files and does not evaluate repository text", async () => {
-  });
+  test("serves only static UI files without evaluating repository text", async () => {
+    const page = await fetch(`${app.server.url}/`);
+    expect(page.status).toBe(200);
+    expect(await page.text()).not.toContain(root);
 
+    const head = await fetch(`${app.server.url}/`, { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+
+    const traversal = await request("/%2e%2e/%2e%2e/etc/passwd");
+    expect(traversal.status).toBe(404);
+
+    const mutation = await request("/", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root }) });
+    expect(mutation.status).toBe(404);
+  });
   test("rejects disallowed browser origins for mutations", async () => {
     const response = await request("/v1/repositories", {
       method: "POST",
@@ -183,6 +196,20 @@ describe("authenticated local Recorder HTTP API", () => {
     expect(await json<{ success: true; data: { record: { record_id: string } } }>(duplicate)).toMatchObject({ success: true, data: { record: { record_id: "record-1" } } });
   });
 
+  test("serializes concurrent same-record submissions and returns sources for the stored record", async () => {
+    await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root, repository_id: "repo-1" }) });
+    await request("/v1/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: "session-1", repository_id: "repo-1", agent_type: "codex", started_at: "2026-08-20T00:00:00Z", status: "active" }) });
+    const [first, second] = await Promise.all([
+      request("/v1/decision-records", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body("same-record", "session-1", "src/example.ts")) }),
+      request("/v1/decision-records", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body("same-record", "session-1", "src/other.ts")) }),
+    ]);
+    for (const response of [first, second]) {
+      expect([201, 200]).toContain(response.status);
+      const payload = await json<{ success: true; data: { record: { targets: Array<{ path: string }> }; sources: Array<{ path: string }> } }>(response);
+      expect(payload.data.sources[0]?.path).toBe(payload.data.record.targets[0]?.path);
+    }
+  });
+
   test("updates disposition and lists records by repository", async () => {
     await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root, repository_id: "repo-1" }) });
     await request("/v1/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: "session-1", repository_id: "repo-1", agent_type: "codex", started_at: "2026-08-20T00:00:00Z", status: "active" }) });
@@ -253,6 +280,28 @@ describe("authenticated local Recorder HTTP API", () => {
     const records = await request("/v1/decision-records?repository_id=missing-repo");
     expect(await json<{ success: true; data: unknown[] }>(records)).toEqual({ success: true, data: [] });
   });
+  test("preflights missing sessions before source resolution", async () => {
+    await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root, repository_id: "repo-1" }) });
+    const missing = body("missing-session-record", "missing-session");
+    missing.targets[0]!.repository_id = "unregistered-target";
+    const response = await request("/v1/decision-records", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(missing) });
+    expect(response.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(response)).toMatchObject({ success: false, error: { code: "INVALID_RECORD" } });
+    const records = await request("/v1/decision-records?repository_id=repo-1");
+    expect(await json<{ success: true; data: unknown[] }>(records)).toEqual({ success: true, data: [] });
+  });
+
+  test("preflights target repository invariants before source resolution", async () => {
+    await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root, repository_id: "repo-1" }) });
+    await request("/v1/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: "session-1", repository_id: "repo-1", agent_type: "codex", started_at: "2026-08-20T00:00:00Z", status: "active" }) });
+    const mismatched = body("mismatched-target");
+    mismatched.targets[0]!.repository_id = "unregistered-target";
+    const response = await request("/v1/decision-records", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(mismatched) });
+    expect(response.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(response)).toMatchObject({ success: false, error: { code: "INVALID_RECORD" } });
+    const records = await request("/v1/decision-records?repository_id=repo-1");
+    expect(await json<{ success: true; data: unknown[] }>(records)).toEqual({ success: true, data: [] });
+  });
 
   test("rejects token paths whose parent symlink escapes the data directory", async () => {
     const outside = await mkdtemp(join(tmpdir(), "ai-review-http-token-outside-"));
@@ -261,6 +310,22 @@ describe("authenticated local Recorder HTTP API", () => {
     await symlink(outside, escapedParent, "dir");
     const config = createRecorderConfig({ dataDir, tokenPath: join("token-parent", "token") });
     await expect(ensureOwnerToken(config)).rejects.toThrow();
+  });
+  test("rejects static UI roots that overlap owner data, including symlinks", async () => {
+    await expect(createRecorderServer({ dataDir, uiRoot: dataDir, port: 0 })).rejects.toThrow();
+    const nestedUi = join(dataDir, "ui-inside");
+    await mkdir(nestedUi, { recursive: true });
+    await expect(createRecorderServer({ dataDir, uiRoot: nestedUi, port: 0 })).rejects.toThrow();
+    const ancestor = await mkdtemp(join(tmpdir(), "ai-review-http-ui-ancestor-"));
+    temporaryDirectories.push(ancestor);
+    const ownerInsideAncestor = join(ancestor, "owner-data");
+    await mkdir(ownerInsideAncestor, { recursive: true });
+    await expect(createRecorderServer({ dataDir: ownerInsideAncestor, uiRoot: ancestor, port: 0 })).rejects.toThrow();
+    const linkParent = await mkdtemp(join(tmpdir(), "ai-review-http-ui-link-"));
+    temporaryDirectories.push(linkParent);
+    const linkedUi = join(linkParent, "ui-link");
+    await symlink(dataDir, linkedUi, "dir");
+    await expect(createRecorderServer({ dataDir, uiRoot: linkedUi, port: 0 })).rejects.toThrow();
   });
 
   test("stores the owner token with restrictive permissions and binds to loopback", async () => {

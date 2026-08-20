@@ -19,6 +19,22 @@ export class RecordService {
     this.store = store;
     this.snapshots = snapshots ?? new SnapshotStore(store);
   }
+  async preflight(input: unknown): Promise<DecisionRecordInput> {
+    const result = validateDecisionRecordInput(input);
+    if (!result.success) throw new ContractValidationError(result);
+    for (const target of result.data.targets) {
+      if (target.repository_id !== result.data.repository_id) {
+        throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "target.repository_id must match repository_id");
+      }
+    }
+    const session = await this.store.getSession(result.data.session_id);
+    if (session === null) throw new PersistenceError(ERROR_CODES.INVALID_RECORD, `session ${result.data.session_id} does not exist`);
+    if (session.repository_id !== result.data.repository_id || session.agent_type !== result.data.agent_type) {
+      throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "decision does not match its session");
+    }
+    return result.data;
+  }
+
 
   async record(input: DecisionRecordInput): Promise<DecisionRecord> {
     const result = validateDecisionRecordInput(input);

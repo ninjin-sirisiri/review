@@ -11,7 +11,6 @@ import {
   type SnapshotMode,
   type UserDisposition,
   isRecord,
-  validateDecisionRecordInput,
   validateReviewSession,
 } from "../../../../packages/contracts/src/index";
 import { createRecorderConfig, type RecorderConfig, type RecorderConfigOverrides } from "../config";
@@ -47,6 +46,17 @@ export interface RecorderServer {
 
 type ServerConfigInput = RecorderConfig | RecorderConfigOverrides;
 type JsonRecord = Record<string, unknown>;
+type RecordQueues = Map<string, Promise<unknown>>;
+
+function enqueueRecord<T>(queues: RecordQueues, recordId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = queues.get(recordId) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  queues.set(recordId, current);
+  void current.finally(() => {
+    if (queues.get(recordId) === current) queues.delete(recordId);
+  }).catch(() => undefined);
+  return current;
+}
 type SourceSelection = "repository" | { snapshotId: string };
 
 function isRecorderConfig(value: ServerConfigInput): value is RecorderConfig {
@@ -291,6 +301,20 @@ async function serveStatic(root: string | undefined, request: Request): Promise<
   if (request.method === "HEAD") return new Response(null, { status: 200, headers });
   return new Response(file, { status: 200, headers });
 }
+function overlapsPath(first: string, second: string): boolean {
+  const relativePath = relative(first, second);
+  return relativePath === "" || (!isAbsolute(relativePath) && relativePath !== ".." && !relativePath.startsWith(`..${sep}`));
+}
+
+async function validateUiRoot(dataDir: string, uiRoot: string | undefined): Promise<string | undefined> {
+  if (uiRoot === undefined) return undefined;
+  const canonicalDataDir = await realpath(resolve(dataDir));
+  const canonicalUiRoot = await realpath(resolve(uiRoot));
+  if (overlapsPath(canonicalDataDir, canonicalUiRoot) || overlapsPath(canonicalUiRoot, canonicalDataDir)) {
+    throw new RangeError("uiRoot must not overlap the owner data directory");
+  }
+  return canonicalUiRoot;
+}
 
 function requireObject(value: unknown, message: string): JsonRecord {
   if (!isRecord(value)) throw new PersistenceError(ERROR_CODES.INVALID_RECORD, message);
@@ -314,6 +338,7 @@ async function handleRequest(
   snapshots: SnapshotStore,
   maxJsonBytes: number,
   uiRoot: string | undefined,
+  recordQueues: RecordQueues,
 ): Promise<Response> {
   const url = new URL(request.url);
   const parts = routeParts(url.pathname);
@@ -352,17 +377,18 @@ async function handleRequest(
       const contentError = requireJsonContentType(request);
       if (contentError) return contentError;
       const input = await parseJsonBody(request, maxJsonBytes);
-      const validation = validateDecisionRecordInput(input);
-      if (!validation.success) return failure(validation.error.code, validation.error.message, 422, validation.error.field, validation.error.details);
-      const existing = await service.getDecision(validation.data.record_id);
-      if (existing !== null) {
-        const sources = await resolveRecordSources(existing, resolver);
-        return success(recordView(existing, sources), 200);
-      }
-      const candidate: DecisionRecord = { ...validation.data, user_disposition: validation.data.user_disposition ?? "unreviewed" };
-      const sources = await resolveRecordSources(candidate, resolver);
-      const record = await service.record(validation.data);
-      return success(recordView(record, sources), 201);
+      const canonicalInput = await service.preflight(input);
+      return enqueueRecord(recordQueues, canonicalInput.record_id, async () => {
+        const existing = await service.getDecision(canonicalInput.record_id);
+        if (existing !== null) {
+          const sources = await resolveRecordSources(existing, resolver);
+          return success(recordView(existing, sources), 200);
+        }
+        const candidate: DecisionRecord = { ...canonicalInput, user_disposition: canonicalInput.user_disposition ?? "unreviewed" };
+        const sources = await resolveRecordSources(candidate, resolver);
+        const record = await service.record(canonicalInput);
+        return success(recordView(record, sources), 201);
+      });
     }
 
     if (request.method === "GET" && parts.length === 2 && parts[0] === "decision-records" && parts[1] !== undefined) {
@@ -418,16 +444,17 @@ async function handleRequest(
     return errorResponse(error);
   }
 }
-
 export async function createRecorderServer(options: RecorderServerOptions = {}): Promise<RecorderServer> {
   const config = makeConfig(options);
   if (config.bindAddress !== LOOPBACK_ADDRESS) throw new RangeError("Recorder API must bind to 127.0.0.1");
   const token = await ensureOwnerToken(config);
+  const staticUiRoot = await validateUiRoot(config.dataDir, options.uiRoot);
   const store = new RecordStore(config);
   const snapshots = new SnapshotStore(store, config);
   const registry = new RepositoryRegistry(store);
   const resolver = new SourceResolver(registry, snapshots);
   const service = new RecordService(store, snapshots);
+  const recordQueues: RecordQueues = new Map();
   const maxJsonBytes = options.maxJsonBytes ?? DEFAULT_MAX_JSON_BYTES;
   if (!Number.isSafeInteger(maxJsonBytes) || maxJsonBytes <= 0) throw new RangeError("maxJsonBytes must be a positive integer");
   const server = Bun.serve({
@@ -435,7 +462,7 @@ export async function createRecorderServer(options: RecorderServerOptions = {}):
     port: config.port,
     fetch: async (request) => {
       try {
-        return await handleRequest(request, token, service, store, registry, resolver, snapshots, maxJsonBytes, options.uiRoot);
+        return await handleRequest(request, token, service, store, registry, resolver, snapshots, maxJsonBytes, staticUiRoot, recordQueues);
       } catch (error) {
         return errorResponse(error);
       }
