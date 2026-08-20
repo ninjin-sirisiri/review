@@ -23,6 +23,27 @@ export function validateEnumeratedPath(root: string, path: string): string {
   }
   return path;
 }
+async function rejectIntermediateSymlinks(root: string, path: string): Promise<void> {
+  const segments = path.split("/");
+  let current = root;
+  for (const segment of segments.slice(0, -1)) {
+    current = resolve(current, segment);
+    let information;
+    try {
+      information = await lstat(current);
+    } catch (error) {
+      if (isMissing(error)) throw new WorkingTreePathMissingError();
+      throw new SourceResolutionError(ERROR_CODES.SOURCE_UNAVAILABLE, "working-tree parent is unavailable");
+    }
+    if (information.isSymbolicLink()) {
+      throw new SourceResolutionError(ERROR_CODES.SOURCE_UNAVAILABLE, "working-tree path contains a symlinked parent");
+    }
+    if (!information.isDirectory()) {
+      throw new WorkingTreePathMissingError();
+    }
+  }
+}
+
 
 export class WorkingTreePathMissingError extends SourceResolutionError {
   constructor(message = "working-tree path is absent") {
@@ -96,6 +117,7 @@ export class WorkingTreeReader {
       throw new SourceResolutionError(ERROR_CODES.SOURCE_UNAVAILABLE, "repository root cannot be read");
     }
     const safePath = enumerated ? validateEnumeratedPath(canonicalRoot, path) : path;
+    if (enumerated) await rejectIntermediateSymlinks(canonicalRoot, safePath);
     const lexicalTarget = resolve(canonicalRoot, safePath);
     if (!isContained(canonicalRoot, lexicalTarget)) {
       throw new SourceResolutionError(ERROR_CODES.PATH_OUTSIDE_ROOT, "target path is outside the repository root");

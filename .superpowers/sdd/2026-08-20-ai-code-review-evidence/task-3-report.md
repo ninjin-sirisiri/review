@@ -246,3 +246,32 @@ Addressed the residual filter-free diff-generation correctness findings in commi
 - Diff output remains bounded to the existing 4 MiB cap and is intentionally a filter-free text diff rather than Git's filter-aware formatter.
 - Binary and unusual-byte source content continues to use the existing UTF-8 text API.
 - Untracked files remain outside the committed-tree/index path set represented by this read-only diff.
+
+## Final Fix Round Report
+
+Addressed the two remaining Task 3 P1 findings without changing the filter-free, raw-blob/raw-worktree diff design.
+
+### Findings addressed
+
+1. **Parent symlink traversal**
+   - `WorkingTreeReader.readEnumeratedFile` now walks every parent component with `lstat` before inspecting the final tracked path.
+   - Intermediate symlinks are rejected as `SOURCE_UNAVAILABLE`; non-directory parents retain the existing absent-path classification, while only the final tracked symlink is read with `readlink` and returned as link-target text.
+   - Added a regression that replaces an indexed `src` directory with an outside symlink, verifies the read is rejected, and uses a file provider seam to prove no external file stream is opened.
+2. **Unbounded Myers trace growth**
+   - Added a bounded per-file diff-work budget derived from the configured source byte limit and capped at 8 MiB worth of work units.
+   - The Myers implementation accounts for frontier construction, diagonal exploration, and equality-snake traversal before retaining additional trace state.
+   - A budget exhaustion returns the existing structured `PAYLOAD_TOO_LARGE` error instead of constructing an unbounded trace or continuing quadratic work.
+   - Added a dense-change regression with 2,200 fully changed lines that proves the reader rejects boundedly while the resulting patch remains below the byte cap.
+
+### Verification
+
+- `bun test apps/recorder/test/registry.test.ts apps/recorder/test/source-resolution.test.ts`
+  - Result: `31 pass, 0 fail, 70 expect() calls`.
+- `bun x tsc --noEmit`
+  - Result: completed successfully with no output.
+- No formatter, linter, or project-wide suite was run.
+
+### Final fix concerns
+
+- Dense diffs that exceed the bounded work budget are intentionally reported as `PAYLOAD_TOO_LARGE`, even when their eventual textual patch could fit under the byte cap.
+- Diff generation remains filter-free and uses raw committed blobs plus raw worktree entries; tracked final symlinks remain represented by literal link-target text.

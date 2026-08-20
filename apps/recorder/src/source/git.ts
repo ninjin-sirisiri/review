@@ -71,21 +71,38 @@ interface DiffEntry {
   newBefore: number;
 }
 
-function lineDiff(previous: string[], current: string[]): DiffOperation[] {
+const MAX_DIFF_WORK = 8 * 1024 * 1024;
+
+function diffWorkBudget(maxBytes: number): number {
+  return Math.min(MAX_DIFF_WORK, Math.max(100_000, maxBytes * 2));
+}
+
+function lineDiff(previous: string[], current: string[], maxWork: number): DiffOperation[] | null {
   const maxDistance = previous.length + current.length;
   let frontier = new Map<number, number>([[1, 0]]);
   const trace: Map<number, number>[] = [];
+  let work = 0;
+
+  const spendWork = (): boolean => {
+    if (work >= maxWork) return false;
+    work += 1;
+    return true;
+  };
 
   for (let distance = 0; distance <= maxDistance; distance += 1) {
+    if (!spendWork()) return null;
     const nextFrontier = new Map<number, number>();
     for (let diagonal = -distance; diagonal <= distance; diagonal += 2) {
+      if (!spendWork()) return null;
       const down = diagonal === -distance || (diagonal !== distance && (frontier.get(diagonal - 1) ?? -1) < (frontier.get(diagonal + 1) ?? -1));
       let x = down ? (frontier.get(diagonal + 1) ?? 0) : (frontier.get(diagonal - 1) ?? 0) + 1;
       let y = x - diagonal;
       while (x < previous.length && y < current.length && previous[x] === current[y]) {
+        if (!spendWork()) return null;
         x += 1;
         y += 1;
       }
+      if (!spendWork()) return null;
       nextFrontier.set(diagonal, x);
       if (x >= previous.length && y >= current.length) {
         trace.push(nextFrontier);
@@ -133,11 +150,14 @@ function lineDiff(previous: string[], current: string[]): DiffOperation[] {
     trace.push(nextFrontier);
     frontier = nextFrontier;
   }
-  return [];
+  return null;
 }
 
-function buildTextDiff(path: string, previous: string, current: string): string {
-  const operations = lineDiff(previous.split("\n"), current.split("\n"));
+function buildTextDiff(path: string, previous: string, current: string, maxWork: number): string {
+  const operations = lineDiff(previous.split("\n"), current.split("\n"), maxWork);
+  if (operations === null) {
+    throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git diff work exceeds the configured source limit");
+  }
   const entries: DiffEntry[] = [];
   let oldLine = 0;
   let newLine = 0;
@@ -187,14 +207,14 @@ function formatHunk(entries: DiffEntry[], start: number, end: number): string {
 }
 
 
-
-
 export class GitReader {
   readonly maxBytes: number;
+  readonly maxDiffWork: number;
 
   constructor(maxBytes = 4 * 1024 * 1024) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new RangeError("maxBytes must be a positive integer");
     this.maxBytes = maxBytes;
+    this.maxDiffWork = diffWorkBudget(maxBytes);
   }
 
   private async execute(root: string, args: string[], configArgs: string[] = []): Promise<GitResult> {
@@ -328,7 +348,7 @@ export class GitReader {
         }
       }
       if (previous === current) continue;
-      const patch = buildTextDiff(path, previous, current);
+      const patch = buildTextDiff(path, previous, current, this.maxDiffWork);
       diff += patch;
       if (encoder.encode(diff).byteLength > this.maxBytes) {
         throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git diff exceeds the configured source limit");

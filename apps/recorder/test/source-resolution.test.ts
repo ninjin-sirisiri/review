@@ -236,6 +236,28 @@ describe("source resolution", () => {
     expect(await git.readDiff(context.fixture.root, commitSha)).toBe("");
     context.store.close();
   });
+  test("rejects indexed files beneath an outside symlinked parent without reading external content", async () => {
+    const context = await createResolverFixture();
+    const outside = await mkdtemp(join(tmpdir(), "ai-review-source-parent-link-outside-"));
+    temporaryDirectories.push(outside);
+    await writeFile(join(outside, "example.ts"), "outside-secret\n", "utf8");
+    await rm(join(context.fixture.root, "src"), { recursive: true, force: true });
+    await symlink(outside, join(context.fixture.root, "src"));
+
+    let opened = false;
+    const worktree = new WorkingTreeReader(1024, () => {
+      opened = true;
+      return {
+        stream: () => new Response("unexpected external read").body!,
+      };
+    });
+
+    await expect(worktree.readEnumeratedFile(context.fixture.root, context.fixture.path)).rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
+    expect(opened).toBe(false);
+    await expect(new GitReader().readDiff(context.fixture.root, context.fixture.commitSha)).rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
+    context.store.close();
+  });
+
 
   test("classifies corrupt committed blobs as source-unavailable", async () => {
     const context = await createResolverFixture();
@@ -282,6 +304,22 @@ describe("source resolution", () => {
     expect(diff).not.toContain("+line-5");
     context.store.close();
   });
+  test("bounds dense line diff work before retaining an unbounded trace", async () => {
+    const context = await createResolverFixture();
+    await writeFile(join(context.fixture.root, context.fixture.path), context.fixture.committed, "utf8");
+    const densePath = "src/dense.ts";
+    const original = Array.from({ length: 2_200 }, (_, index) => `old-${index}`).join("\n") + "\n";
+    const changed = Array.from({ length: 2_200 }, (_, index) => `new-${index}`).join("\n") + "\n";
+    await writeFile(join(context.fixture.root, densePath), original, "utf8");
+    await runGit(context.fixture.root, ["add", "--", densePath]);
+    await runGit(context.fixture.root, ["commit", "--quiet", "-m", "dense-lines"]);
+    const commitSha = await runGit(context.fixture.root, ["rev-parse", "HEAD"]);
+    await writeFile(join(context.fixture.root, densePath), changed, "utf8");
+
+    await expect(new GitReader().readDiff(context.fixture.root, commitSha)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+    context.store.close();
+  });
+
 
   test("treats an absent tracked worktree path as a deletion", async () => {
     const context = await createResolverFixture();
