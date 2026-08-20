@@ -1,0 +1,20 @@
+{
+  "name": "ai-code-review-evidence",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "plugins/*"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "build": "bun build packages/contracts/src/index.ts --outdir dist/contracts",
+    "dev": "bun --watch apps/recorder/src/index.ts",
+    "recorder": "bun apps/recorder/src/index.ts",
+    "e2e": "bun test tests/e2e"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}

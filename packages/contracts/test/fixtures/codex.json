@@ -1,0 +1,36 @@
+{
+  "record_id": "codex-record-001",
+  "session_id": "codex-session-001",
+  "repository_id": "repo-fixture",
+  "agent_type": "codex",
+  "revision": {
+    "kind": "working-tree",
+    "contentHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "targets": [
+    {
+      "repository_id": "repo-fixture",
+      "path": "src/example.ts",
+      "line_start": 10,
+      "line_end": 14,
+      "revision": {
+        "kind": "working-tree",
+        "contentHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "judgment": "The change keeps the error path explicit.",
+  "rationale": "The new branch returns the existing typed error.",
+  "checks": [
+    {
+      "name": "focused tests",
+      "status": "passed",
+      "details": "The contract tests pass."
+    }
+  ],
+  "open_questions": [
+    "Should a broader integration test be added?"
+  ],
+  "created_at": "2026-08-20T00:00:00.000Z"
+}
