@@ -130,11 +130,37 @@ async function parseJsonBody(request: Request, maxBytes: number): Promise<unknow
       throw new PersistenceError(ERROR_CODES.PAYLOAD_TOO_LARGE, "request body exceeds the configured maximum length");
     }
   }
-  const body = await request.arrayBuffer();
-  if (body.byteLength > maxBytes) {
-    throw new PersistenceError(ERROR_CODES.PAYLOAD_TOO_LARGE, "request body exceeds the configured maximum length");
+  const reader = request.body?.getReader();
+  if (reader === undefined) return JSON.parse("");
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      const chunk = result.value;
+      if (chunk.byteLength > maxBytes - total) {
+        await reader.cancel();
+        throw new PersistenceError(ERROR_CODES.PAYLOAD_TOO_LARGE, "request body exceeds the configured maximum length");
+      }
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
   }
-  const content = new TextDecoder("utf-8", { fatal: true }).decode(body);
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  let content: string;
+  try {
+    content = new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    throw new SyntaxError("request body must contain valid UTF-8 JSON");
+  }
   return JSON.parse(content);
 }
 
@@ -190,7 +216,24 @@ function serializeSource(source: ResolvedSource | UnresolvedSource): Record<stri
   };
 }
 
+function unavailableSnapshotSource(record: DecisionRecord, message: string): Array<Record<string, unknown>> {
+  return record.targets.map((target) => serializeSource({
+    state: "source-unavailable",
+    repositoryId: target.repository_id,
+    path: target.path,
+    revision: target.revision,
+    target,
+    expectedHash: target.content_hash,
+    message,
+  }));
+}
+
 async function resolveRecordSources(record: DecisionRecord, resolver: SourceResolver, selection: SourceSelection = "repository"): Promise<Array<Record<string, unknown>>> {
+  if (typeof selection === "object") {
+    const snapshot = await resolver.snapshots?.get(selection.snapshotId);
+    if (snapshot === null || snapshot === undefined) return unavailableSnapshotSource(record, "snapshot is unavailable or has been tampered with");
+    if (snapshot.reference.record_id !== record.record_id) return unavailableSnapshotSource(record, "snapshot does not belong to this decision record");
+  }
   const sources: Array<Record<string, unknown>> = [];
   for (const target of record.targets) {
     const resolved = await resolver.resolve(target, selection);
@@ -272,13 +315,12 @@ async function handleRequest(
   maxJsonBytes: number,
   uiRoot: string | undefined,
 ): Promise<Response> {
-  if (!validateOwnerBearerToken(request.headers.get("authorization"), token)) return failure(ERROR_CODES.UNAUTHORIZED, "owner bearer token is required", 401);
   const url = new URL(request.url);
   const parts = routeParts(url.pathname);
-  if (parts === null) {
-    const staticResponse = await serveStatic(uiRoot, request);
-    return staticResponse ?? new Response("Not Found", { status: 404 });
-  }
+  const staticResponse = parts === null ? await serveStatic(uiRoot, request) : null;
+  if (staticResponse !== null && (request.method === "GET" || request.method === "HEAD")) return staticResponse;
+  if (!validateOwnerBearerToken(request.headers.get("authorization"), token)) return failure(ERROR_CODES.UNAUTHORIZED, "owner bearer token is required", 401);
+  if (parts === null) return staticResponse ?? new Response("Not Found", { status: 404 });
   if (isMutation(request.method) && !isAllowedOrigin(request.headers.get("origin"))) {
     return failure(ERROR_CODES.UNAUTHORIZED, "browser origin is not allowed", 403);
   }
@@ -313,9 +355,14 @@ async function handleRequest(
       const validation = validateDecisionRecordInput(input);
       if (!validation.success) return failure(validation.error.code, validation.error.message, 422, validation.error.field, validation.error.details);
       const existing = await service.getDecision(validation.data.record_id);
-      const record = existing ?? await service.record(validation.data);
-      const sources = await resolveRecordSources(record, resolver);
-      return success(recordView(record, sources), existing === null ? 201 : 200);
+      if (existing !== null) {
+        const sources = await resolveRecordSources(existing, resolver);
+        return success(recordView(existing, sources), 200);
+      }
+      const candidate: DecisionRecord = { ...validation.data, user_disposition: validation.data.user_disposition ?? "unreviewed" };
+      const sources = await resolveRecordSources(candidate, resolver);
+      const record = await service.record(validation.data);
+      return success(recordView(record, sources), 201);
     }
 
     if (request.method === "GET" && parts.length === 2 && parts[0] === "decision-records" && parts[1] !== undefined) {
