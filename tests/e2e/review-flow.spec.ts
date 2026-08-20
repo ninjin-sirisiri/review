@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "@playwright/test";
-import type { DecisionRecordInput, ReviewSession } from "../../packages/contracts/src/index";
+import type { DecisionRecord, DecisionRecordInput, ReviewSession } from "../../packages/contracts/src/index";
 
 const PROJECT_ROOT = process.cwd();
 const UI_ROOT = join(PROJECT_ROOT, "apps/review-ui/dist");
@@ -213,9 +213,19 @@ test("registers a repository, submits a JSONL adapter decision, and detects a st
   const accept = page.getByRole("button", { name: "Accept", exact: true });
   await accept.click();
   await expect(accept).toHaveAttribute("aria-pressed", "true");
+  const acceptedResponse = await apiRequest(`/v1/decision-records/${event.recordId}`);
+  expect(acceptedResponse.status).toBe(200);
+  const acceptedBody = await acceptedResponse.json() as { data: { record: DecisionRecord } };
+  expect(acceptedBody.data.record.user_disposition).toBe("accepted");
 
-  await writeFile(join(journey.root, journey.path), "export const reviewed = false;\n", "utf8");
+  const currentSource = "export const reviewed = false;";
+  await writeFile(join(journey.root, journey.path), `${currentSource}\n`, "utf8");
   await page.reload();
+  const staleResponse = await apiRequest(`/v1/decision-records/${event.recordId}`);
+  expect(staleResponse.status).toBe(200);
+  const staleBody = await staleResponse.json() as { data: { sources: Array<Record<string, unknown>> } };
+  expect(staleBody.data.sources[0]).toMatchObject({ state: "hash-mismatch" });
+  expect(JSON.stringify(staleBody)).not.toContain(currentSource);
   await expect(page.getByLabel("Owner bearer token")).toBeVisible();
   await expect(page).not.toHaveURL(new RegExp(token));
   await expect(page.evaluate(() => localStorage.length)).resolves.toBe(0);

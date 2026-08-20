@@ -37,8 +37,8 @@ async function runCommand(cwd: string, cmd: string[]): Promise<string> {
   if (exitCode === 0) throw new Error(`expected ${cmd.join(" ")} to fail`);
   return `${stdout}${stderr}`;
 }
-async function startRecorder(dataDir: string): Promise<RecorderProcess> {
-  const child = spawn("bun", ["apps/recorder/src/index.ts", "--data-dir", dataDir, "--port", "0", "--ui-root", UI_ROOT], {
+async function startManagedRecorder(command: string[]): Promise<RecorderProcess> {
+  const child = spawn("bun", command, {
     cwd: PROJECT_ROOT,
     env: { ...process.env },
     stdio: ["ignore", "pipe", "pipe"],
@@ -61,6 +61,29 @@ async function startRecorder(dataDir: string): Promise<RecorderProcess> {
   });
   const recorderToken = (await readFile(started.tokenPath, "utf8")).trim();
   return { ...started, token: recorderToken, process: child };
+}
+
+async function startRecorder(dataDir: string): Promise<RecorderProcess> {
+  return startManagedRecorder(["apps/recorder/src/index.ts", "--data-dir", dataDir, "--port", "0", "--ui-root", UI_ROOT]);
+}
+
+async function startSnapshotLimitedRecorder(dataDir: string, maxSnapshotBytes: number): Promise<RecorderProcess> {
+  const configImport = JSON.stringify(join(PROJECT_ROOT, "apps/recorder/src/config.ts"));
+  const serverImport = JSON.stringify(join(PROJECT_ROOT, "apps/recorder/src/http/server.ts"));
+  const script = `import { createRecorderConfig } from ${configImport};
+import { createRecorderServer } from ${serverImport};
+const dataDir = process.argv[2];
+const uiRoot = process.argv[3];
+const config = createRecorderConfig({ dataDir, port: 0, maxSnapshotBytes: ${maxSnapshotBytes} });
+const app = await createRecorderServer({ config, uiRoot });
+console.log(\`Recorder listening at \${app.server.url}\`);
+console.log(\`Recorder token: \${app.config.tokenPath}\`);
+const stop = async () => { await app.stop(); process.exitCode = 0; };
+process.once("SIGINT", stop);
+process.once("SIGTERM", stop);`;
+  const scriptPath = join(dataDir, "start-limited-recorder.ts");
+  await writeFile(scriptPath, script, "utf8");
+  return startManagedRecorder([scriptPath, dataDir, UI_ROOT]);
 }
 
 async function stopRecorder(recorder: RecorderProcess): Promise<void> {
@@ -227,20 +250,24 @@ test("rejects oversized chunked JSON and malformed UTF-8 before persistence", as
 });
 
 test("rejects root-outside, direct symlink, parent-symlink, and unregistered nested Git targets", async () => {
-  const outside = join(securityRoot, "src", "outside.ts");
   const rootOutside = await createRecord(recordInput(securityRepositoryId, "unused", "../outside.ts", "hash"), 422);
+  expect(rootOutside.response.status).toBe(422);
   expect(rootOutside.body).toMatchObject({ success: false, error: { code: "PATH_OUTSIDE_ROOT" } });
+  expect(JSON.stringify(rootOutside.body)).not.toContain("outside secret");
 
   for (const path of ["src/direct-link.ts", "src/parent-link/secret.ts"]) {
     const sessionId = await createSession(securityRepositoryId);
     const result = await createRecord(recordInput(securityRepositoryId, sessionId, path, "hash"), 422);
+    expect(result.response.status).toBe(422);
     expect(result.body).toMatchObject({ success: false, error: { code: "PATH_OUTSIDE_ROOT" } });
+    expect(JSON.stringify(result.body)).not.toContain("outside secret");
   }
 
   const nestedSession = await createSession(securityRepositoryId);
   const nested = await createRecord(recordInput(securityRepositoryId, nestedSession, "src/nested/inside.ts", "hash"), 404);
+  expect(nested.response.status).toBe(404);
   expect(nested.body).toMatchObject({ success: false, error: { code: "REPOSITORY_NOT_REGISTERED" } });
-  expect(outside).not.toContain("secret");
+  expect(JSON.stringify(nested.body)).not.toContain("outside secret");
 });
 
 test("renders source text as text and never evaluates markup", async ({ page }) => {
@@ -300,9 +327,34 @@ test("caps source and patch reads without returning oversized content", async ()
   expect(source).toMatchObject({ state: "source-unavailable" });
   expect(source.content).toBeUndefined();
   const recordId = ((result.body.data as Record<string, unknown>).record as DecisionRecord).record_id;
-  const oversizedPatch = await postJson(`/v1/decision-records/${recordId}/snapshot`, { mode: "patch", content: "d".repeat(1_000_001) });
-  expect(oversizedPatch.status).toBe(413);
-  expect(await oversizedPatch.json()).toMatchObject({ success: false, error: { code: "PAYLOAD_TOO_LARGE" } });
+  const limitedDataDir = await mkdtemp(join(tmpdir(), "ai-review-snapshot-cap-data-"));
+  temporaryDirectories.push(limitedDataDir);
+  const originalApp = app;
+  const originalToken = token;
+  const limitedApp = await startSnapshotLimitedRecorder(limitedDataDir, 64);
+  app = limitedApp;
+  token = limitedApp.token;
+  try {
+    const registration = await postJson("/v1/repositories", { root: securityRoot, repository_id: securityRepositoryId });
+    expect(registration.status).toBe(201);
+    const snapshotSession = await createSession(securityRepositoryId);
+    const snapshotRecord = await createRecord(recordInput(
+      securityRepositoryId,
+      snapshotSession,
+      "src/secure.ts",
+      createHash("sha256").update("export const secure = true;\n", "utf8").digest("hex"),
+    ));
+    const snapshotRecordId = ((snapshotRecord.body.data as Record<string, unknown>).record as DecisionRecord).record_id;
+    const patchContent = "d".repeat(65);
+    expect(new TextEncoder().encode(JSON.stringify({ mode: "patch", content: patchContent })).byteLength).toBeLessThan(1_000_000);
+    const oversizedPatch = await postJson(`/v1/decision-records/${snapshotRecordId}/snapshot`, { mode: "patch", content: patchContent });
+    expect(oversizedPatch.status).toBe(413);
+    expect(await oversizedPatch.json()).toMatchObject({ success: false, error: { code: "PAYLOAD_TOO_LARGE" } });
+  } finally {
+    app = originalApp;
+    token = originalToken;
+    await stopRecorder(limitedApp);
+  }
 });
 
 test("never executes revision or path filter text as a command", async () => {

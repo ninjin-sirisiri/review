@@ -55,3 +55,20 @@ The CLI parser had no UI-root branch at that point. The tests were retained unch
 - The Recorder API intentionally remains bearer-protected and mutation Origin-protected; the UI token is only held in React state and is not persisted or placed in the URL.
 - The source/patch cap E2E verifies the public HTTP contracts (large live source is suppressed and oversized patch snapshot content is rejected). Existing focused source-resolution tests continue to cover the internal Git diff algorithm's work and output bounds.
 - No formatters, linters, or project-wide test suites were run, per Task 7 instructions.
+
+## Reviewer follow-up
+
+The follow-up pass tightened three assertion gaps without weakening the original tests:
+
+- Path-boundary cases now assert each actual HTTP status, error code, and response body excludes the outside secret text.
+- The complete journey now fetches the accepted decision through the authenticated API, verifies persisted `user_disposition: "accepted"`, reloads after editing, then verifies the API source state is `hash-mismatch` and excludes current source content.
+- Snapshot content-limit verification now runs a separate Recorder fixture created with `createRecorderConfig({ maxSnapshotBytes: 64 })`; its 65-byte patch body is below the 1,000,000-byte JSON request limit and receives the snapshot-specific `PAYLOAD_TOO_LARGE` response.
+
+Post-follow-up verification:
+
+- `bunx tsc --noEmit` — PASS.
+- `node node_modules/@playwright/test/cli.js test tests/e2e/security-boundaries.spec.ts --config=playwright.config.ts` — 8 passed.
+- `node node_modules/@playwright/test/cli.js test tests/e2e/review-flow.spec.ts --config=playwright.config.ts` — 3 passed.
+- Final focused package tests — 93 passed; UI tests — 14 passed; UI build — PASS.
+- Final `bun run e2e` — 11 passed.
+- Final live smoke — repository/session HTTP 201; Codex and Claude Code adapters each exited 0 with successful submission envelopes.
