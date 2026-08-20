@@ -39,7 +39,7 @@ const SNAPSHOT_MODES: Record<SnapshotReference["mode"], true> = {
   "changed-files": true,
   patch: true,
 };
-const ISO_UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3,})?Z$/;
+const ISO_UTC_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/;
 
 function hasOwnKey<T extends Record<string, true>>(table: T, value: unknown): value is keyof T {
   return typeof value === "string" && Object.prototype.hasOwnProperty.call(table, value);
@@ -99,17 +99,30 @@ function nonEmptyString(value: unknown, field: string, maxLength = MAX_IDENTIFIE
 function textField(value: unknown, field: string): ApiFailure | null {
   return nonEmptyString(value, field, MAX_TEXT_FIELD_LENGTH);
 }
-
 function timestamp(value: unknown, field: string, optional = false): ApiFailure | null {
   if (value === undefined && optional) return null;
   const stringError = nonEmptyString(value, field, 128);
   if (stringError) return stringError;
-  if (!ISO_UTC_TIMESTAMP_PATTERN.test(value as string) || !Number.isFinite(Date.parse(value as string))) {
+  const match = ISO_UTC_TIMESTAMP_PATTERN.exec(value as string);
+  const parsedTime = Date.parse(value as string);
+  if (!match || !Number.isFinite(parsedTime)) {
     return invalid(`${field} must be an ISO-8601 UTC timestamp`, field);
+  }
+  const parsedDate = new Date(parsedTime);
+  const milliseconds = Number((match[7] ?? "").padEnd(3, "0") || "0");
+  if (
+    parsedDate.getUTCFullYear() !== Number(match[1]) ||
+    parsedDate.getUTCMonth() + 1 !== Number(match[2]) ||
+    parsedDate.getUTCDate() !== Number(match[3]) ||
+    parsedDate.getUTCHours() !== Number(match[4]) ||
+    parsedDate.getUTCMinutes() !== Number(match[5]) ||
+    parsedDate.getUTCSeconds() !== Number(match[6]) ||
+    parsedDate.getUTCMilliseconds() !== milliseconds
+  ) {
+    return invalid(`${field} must be a valid ISO-8601 UTC timestamp`, field);
   }
   return null;
 }
-
 function firstError(...errors: Array<ApiFailure | null>): ApiFailure | null {
   return errors.find((error): error is ApiFailure => error !== null) ?? null;
 }
@@ -119,7 +132,7 @@ function normalizeRelativePath(value: unknown, field: string): ValidationResult<
   if (stringError) return stringError;
   const original = value as string;
   const slashPath = original.replaceAll("\\", "/");
-  if (slashPath.startsWith("/") || slashPath.startsWith("//") || /^[A-Za-z]:/.test(slashPath)) {
+  if (slashPath.startsWith("/") || slashPath.startsWith("//")) {
     return failure(ERROR_CODES.PATH_OUTSIDE_ROOT, `${field} must be relative to the repository root`, field);
   }
 
@@ -132,7 +145,11 @@ function normalizeRelativePath(value: unknown, field: string): ValidationResult<
     segments.push(segment);
   }
   if (segments.length === 0) return failure(ERROR_CODES.PATH_OUTSIDE_ROOT, `${field} must name a file`, field);
-  return success(segments.join("/"));
+  const normalizedPath = segments.join("/");
+  if (/^[A-Za-z]:/.test(normalizedPath)) {
+    return failure(ERROR_CODES.PATH_OUTSIDE_ROOT, `${field} must be relative to the repository root`, field);
+  }
+  return success(normalizedPath);
 }
 
 export function validateRevisionRef(value: unknown): ValidationResult<RevisionRef> {

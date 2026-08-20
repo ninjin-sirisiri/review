@@ -157,13 +157,13 @@ describe("decision input validation", () => {
     expect(absolute.success).toBe(false);
     if (!absolute.success) expect(absolute.error.code).toBe(ERROR_CODES.PATH_OUTSIDE_ROOT);
   });
-  test("rejects drive-relative Windows paths", () => {
+  test.each(["C:..\\outside.ts", "C:../outside.ts", "./C:..\\outside.ts", "./C:../outside.ts"])("rejects drive-relative Windows path %s", (path) => {
     const result = validateDecisionRecordInput(
       validInput({
         targets: [
           {
             ...(baseInput().targets as Array<Record<string, unknown>>)[0],
-            path: "C:..\\outside.ts",
+            path,
           },
         ],
       }),
@@ -172,11 +172,16 @@ describe("decision input validation", () => {
     if (!result.success) expect(result.error.code).toBe(ERROR_CODES.PATH_OUTSIDE_ROOT);
   });
 
-  test("rejects non-UTC and non-ISO timestamps", () => {
-    const dateOnly = validateDecisionRecordInput(validInput({ created_at: "2026-08-20" }));
-    const localTime = validateDecisionRecordInput(validInput({ created_at: "2026-08-20T00:00:00+09:00" }));
-    expect(dateOnly.success).toBe(false);
-    expect(localTime.success).toBe(false);
+  test("accepts valid ISO-8601 UTC timestamps with short fractional seconds", () => {
+    for (const createdAt of ["2026-08-20T00:00:00.1Z", "2026-08-20T00:00:00.12Z"]) {
+      expect(validateDecisionRecordInput(validInput({ created_at: createdAt })).success).toBe(true);
+    }
+  });
+
+  test("rejects non-UTC, non-ISO, and invalid-calendar timestamps", () => {
+    for (const createdAt of ["2026-08-20", "2026-08-20T00:00:00+09:00", "2026-02-31T00:00:00Z"]) {
+      expect(validateDecisionRecordInput(validInput({ created_at: createdAt })).success).toBe(false);
+    }
   });
 
   test("rejects invalid line ranges", () => {
