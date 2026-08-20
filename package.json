@@ -11,9 +11,10 @@
     "build": "bun build packages/contracts/src/index.ts --outdir dist/contracts",
     "dev": "bun --watch apps/recorder/src/index.ts",
     "recorder": "bun apps/recorder/src/index.ts",
-    "e2e": "bun test tests/e2e"
+    "e2e": "bun run --cwd apps/review-ui build && bunx playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/bun": "latest",
     "typescript": "latest"
   }

@@ -3,8 +3,8 @@ import { createRecorderServer, type RecorderServer } from "./http/server";
 export interface RecorderCliOptions {
   dataDir?: string;
   port?: number;
+  uiRoot?: string;
 }
-
 function parsePort(value: string): number {
   const port = Number(value);
   if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) throw new RangeError("--port must be an integer between 0 and 65535");
@@ -27,6 +27,13 @@ export function parseRecorderCliArgs(args: string[]): RecorderCliOptions {
       if (value === undefined || value.length === 0 || value.startsWith("--")) throw new Error("--port requires a value");
       options.port = parsePort(value);
       if (argument === "--port") index += 1;
+      continue;
+    }
+    if (argument === "--ui-root" || argument?.startsWith("--ui-root=")) {
+      const value = argument === "--ui-root" ? args[index + 1] : argument.slice("--ui-root=".length);
+      if (value === undefined || value.length === 0 || value.startsWith("--")) throw new Error("--ui-root requires a value");
+      options.uiRoot = value;
+      if (argument === "--ui-root") index += 1;
       continue;
     }
     throw new Error(`unknown argument: ${argument}`);
