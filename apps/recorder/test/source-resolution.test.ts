@@ -199,4 +199,76 @@ describe("source resolution", () => {
     expect(await git.readDiff(context.fixture.root, context.fixture.commitSha)).toContain("version = 2");
     context.store.close();
   });
+  test("returns snapshot content even after the live repository root disappears", async () => {
+    const context = await createResolverFixture();
+    const workingTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.working) }, context.fixture.working);
+    workingTarget.repository_id = context.repositoryId;
+    const snapshot = await context.snapshots.create("source-resolution-record", "changed-files", context.fixture.working);
+    await rm(context.fixture.root, { recursive: true, force: true });
+
+    const resolved = await context.resolver.resolve(workingTarget, { snapshotId: snapshot.snapshot_id });
+
+    expect(resolved.state).toBe("snapshot-resolved");
+    expect(resolved.content).toBe(context.fixture.working);
+    context.store.close();
+  });
+
+  test("returns source-unavailable when a registered live root disappears", async () => {
+    const context = await createResolverFixture();
+    const workingTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.working) }, context.fixture.working);
+    workingTarget.repository_id = context.repositoryId;
+    await rm(context.fixture.root, { recursive: true, force: true });
+
+    const resolved = await context.resolver.resolve(workingTarget, "repository");
+
+    expect(resolved.state).toBe("source-unavailable");
+    context.store.close();
+  });
+
+  test("classifies a valid non-Git root as source-unavailable for commit reads", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ai-review-source-non-git-"));
+    temporaryDirectories.push(root);
+    const store = new RecordStore(new Database(":memory:"));
+    const registry = new RepositoryRegistry(store);
+    const registered = await registry.register(root);
+    const resolver = new SourceResolver(registry);
+    const nonGitTarget: TargetReference = {
+      repository_id: registered.repository_id,
+      path: "missing.ts",
+      line_start: 1,
+      line_end: 1,
+      revision: { kind: "commit", sha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+      content_hash: hash("missing"),
+    };
+
+    const resolved = await resolver.resolve(nonGitTarget, "repository");
+
+    expect(resolved.state).toBe("source-unavailable");
+    store.close();
+  });
+
+  test("does not execute repository-configured filters while reading a diff", async () => {
+    const context = await createResolverFixture();
+    const marker = join(tmpdir(), `ai-review-filter-command-${crypto.randomUUID()}`);
+    await writeFile(join(context.fixture.root, ".gitattributes"), "*.ts filter=evil\n", "utf8");
+    await runGit(context.fixture.root, ["add", "--", ".gitattributes"]);
+    await runGit(context.fixture.root, ["commit", "--quiet", "-m", "attributes"]);
+    const attributesCommit = await runGit(context.fixture.root, ["rev-parse", "HEAD"]);
+    await runGit(context.fixture.root, ["config", "filter.evil.clean", `touch ${marker}; cat`]);
+    await runGit(context.fixture.root, ["config", "filter.evil.smudge", "cat"]);
+    await writeFile(join(context.fixture.root, context.fixture.path), "export const version = 3;\n", "utf8");
+
+    await new GitReader().readDiff(context.fixture.root, attributesCommit);
+
+    expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
+    context.store.close();
+  });
+
+  test("rejects oversized live source output before buffering", async () => {
+    const context = await createResolverFixture();
+
+    await expect(new WorkingTreeReader(8).readFile(context.fixture.root, context.fixture.path)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+    await expect(new GitReader(8).readCommitFile(context.fixture.root, context.fixture.commitSha, context.fixture.path)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+    context.store.close();
+  });
 });

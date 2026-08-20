@@ -45,38 +45,47 @@ export class SourceResolver {
   readonly registry: RepositoryRegistry;
   readonly git: GitReader;
   readonly worktree: WorkingTreeReader;
-  readonly snapshots?: SnapshotStore;
+  readonly snapshots: SnapshotStore | undefined;
 
-  constructor(registry: RepositoryRegistry, snapshots?: SnapshotStore, git = new GitReader(), worktree = new WorkingTreeReader()) {
+  constructor(registry: RepositoryRegistry, snapshots?: SnapshotStore, git?: GitReader, worktree?: WorkingTreeReader) {
     this.registry = registry;
     this.snapshots = snapshots;
-    this.git = git;
-    this.worktree = worktree;
+    const maxSourceContentLength = registry.store.config.maxSourceContentLength;
+    this.git = git ?? new GitReader(maxSourceContentLength);
+    this.worktree = worktree ?? new WorkingTreeReader(maxSourceContentLength);
   }
 
   async resolve(target: TargetReference, source: "repository" | { snapshotId: string }): Promise<ResolvedSource | UnresolvedSource> {
-    const canonicalPath = await this.registry.assertTarget(target.repository_id, target.path);
     if (typeof source === "object" && source !== null && typeof source.snapshotId === "string") {
-      return this.resolveSnapshot(target, canonicalPath, source.snapshotId);
+      return this.resolveSnapshot(target, source.snapshotId);
     }
     if (source !== "repository") {
-      return this.unavailable(target, canonicalPath, "source selection is not supported");
+      return this.unavailable(target, target.path, "source selection is not supported");
+    }
+    let canonicalPath: string;
+    try {
+      canonicalPath = await this.registry.assertTarget(target.repository_id, target.path);
+    } catch (error) {
+      if (error instanceof SourceResolutionError && error.code === ERROR_CODES.SOURCE_UNAVAILABLE) {
+        return this.unavailable(target, target.path, "repository source is unavailable");
+      }
+      throw error;
     }
     if (target.revision.kind === "commit") {
-      return this.resolveCommit(target, canonicalPath);
+      return this.resolveCommit(target as TargetReference & { revision: { kind: "commit"; sha: string } }, canonicalPath);
     }
     return this.resolveWorkingTree(target, canonicalPath);
   }
 
-  private async resolveSnapshot(target: TargetReference, canonicalPath: string, snapshotId: string): Promise<ResolvedSource | UnresolvedSource> {
-    if (this.snapshots === undefined) return this.unavailable(target, canonicalPath, "snapshot storage is unavailable");
+  private async resolveSnapshot(target: TargetReference, snapshotId: string): Promise<ResolvedSource | UnresolvedSource> {
+    if (this.snapshots === undefined) return this.unavailable(target, target.path, "snapshot storage is unavailable");
     let stored: LoadedSnapshot | null;
     try {
       stored = await this.snapshots.get(snapshotId);
     } catch {
       stored = null;
     }
-    if (stored === null) return this.unavailable(target, canonicalPath, "snapshot is unavailable or has been tampered with");
+    if (stored === null) return this.unavailable(target, target.path, "snapshot is unavailable or has been tampered with");
     return {
       state: "snapshot-resolved",
       repositoryId: target.repository_id,
@@ -88,8 +97,7 @@ export class SourceResolver {
       snapshot: stored.reference,
     };
   }
-
-  private async resolveCommit(target: TargetReference, canonicalPath: string): Promise<ResolvedSource | UnresolvedSource> {
+  private async resolveCommit(target: TargetReference & { revision: { kind: "commit"; sha: string } }, canonicalPath: string): Promise<ResolvedSource | UnresolvedSource> {
     const repository = await this.registry.get(target.repository_id);
     if (repository === null) return this.unavailable(target, canonicalPath, "repository is unavailable");
     let content: string;

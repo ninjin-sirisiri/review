@@ -102,6 +102,26 @@ async function rejectNestedRepository(root: string, target: string): Promise<voi
   }
 }
 
+async function discoverGitTopLevel(root: string): Promise<string | null> {
+  try {
+    const child = Bun.spawn({
+      cmd: ["git", "-C", root, "rev-parse", "--show-toplevel"],
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_TERMINAL_PROMPT: "0",
+      },
+    });
+    const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+    if (exitCode !== 0) return null;
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
 export class RepositoryRegistry {
   readonly store: RecordStore;
 
@@ -118,13 +138,30 @@ export class RepositoryRegistry {
       canonicalRoot = await realpath(root);
       const information = await stat(canonicalRoot);
       if (!information.isDirectory()) throw new Error("repository root is not a directory");
-    } catch (error) {
-      if (error instanceof SourceResolutionError) throw error;
+    } catch {
       throw new SourceResolutionError(ERROR_CODES.SOURCE_UNAVAILABLE, "repository root cannot be resolved");
+    }
+    const gitTopLevel = await discoverGitTopLevel(canonicalRoot);
+    if (gitTopLevel !== null) {
+      let canonicalGitTopLevel: string;
+      try {
+        canonicalGitTopLevel = await realpath(gitTopLevel);
+      } catch {
+        throw new SourceResolutionError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git worktree root cannot be resolved");
+      }
+      if (canonicalGitTopLevel !== canonicalRoot) {
+        throw new SourceResolutionError(ERROR_CODES.PATH_OUTSIDE_ROOT, "registered root is nested under a different Git checkout");
+      }
     }
     const id = repositoryId ?? createHash("sha256").update(canonicalRoot, "utf8").digest("hex");
     if (typeof id !== "string" || id.trim().length === 0 || id.length > 256) {
       throw new SourceResolutionError(ERROR_CODES.INVALID_RECORD, "repository_id must be a non-empty string");
+    }
+    const existing = this.store.db.query(
+      "SELECT root FROM repositories WHERE repository_id = $repository_id",
+    ).get({ $repository_id: id }) as { root: string | null } | null;
+    if (existing !== null && existing.root !== null && existing.root !== canonicalRoot) {
+      throw new SourceResolutionError(ERROR_CODES.INVALID_RECORD, "repository_id is already registered to a different root");
     }
     const stored = await this.store.createRepository({ repository_id: id, root: canonicalRoot });
     if (stored.root !== canonicalRoot) {

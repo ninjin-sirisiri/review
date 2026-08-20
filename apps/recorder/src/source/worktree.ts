@@ -9,6 +9,13 @@ function isContained(root: string, candidate: string): boolean {
 }
 
 export class WorkingTreeReader {
+  readonly maxBytes: number;
+
+  constructor(maxBytes = 4 * 1024 * 1024) {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new RangeError("maxBytes must be a positive integer");
+    this.maxBytes = maxBytes;
+  }
+
   async readFile(root: string, relativePath: string): Promise<{ content: string; contentHash: string }> {
     const normalizedPath = normalizeSourcePath(relativePath);
     let canonicalRoot: string;
@@ -40,6 +47,9 @@ export class WorkingTreeReader {
     }
     if (!information.isFile()) {
       throw new SourceResolutionError(ERROR_CODES.SOURCE_UNAVAILABLE, "working-tree target is not a file");
+    }
+    if (information.size > this.maxBytes) {
+      throw new SourceResolutionError(ERROR_CODES.PAYLOAD_TOO_LARGE, "working-tree source exceeds the configured source limit");
     }
     let content: string;
     try {

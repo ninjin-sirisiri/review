@@ -54,6 +54,31 @@ describe("RepositoryRegistry", () => {
     expect(await registry.assertTarget(registered.repository_id, fixture.file)).toBe(await realpath(join(fixture.root, fixture.file)));
     store.close();
   });
+  test("rejects registering a directory nested under a parent Git checkout", async () => {
+    const parent = await createFixture();
+    const nested = join(parent.root, "nested-worktree");
+    await mkdir(nested, { recursive: true });
+    const store = new RecordStore(new Database(":memory:"));
+    const registry = new RepositoryRegistry(store);
+
+    await expect(registry.register(nested, "nested-repository")).rejects.toMatchObject({ code: "PATH_OUTSIDE_ROOT" });
+    store.close();
+  });
+
+  test("rejects explicit repository ID retargeting but allows identical and null-root registration", async () => {
+    const first = await createFixture();
+    const second = await createFixture();
+    const store = new RecordStore(new Database(":memory:"));
+    const registry = new RepositoryRegistry(store);
+
+    const registered = await registry.register(first.root, "shared-repository");
+    expect((await registry.register(first.root, "shared-repository")).root).toBe(registered.root);
+    await expect(registry.register(second.root, "shared-repository")).rejects.toMatchObject({ code: "INVALID_RECORD" });
+
+    await store.createRepository({ repository_id: "initial-null-root" });
+    expect((await registry.register(second.root, "initial-null-root")).root).toBe(await realpath(second.root));
+    store.close();
+  });
 
   test.each(["../outside.ts", "/etc/passwd", "C:..\\outside.ts", "C:/outside.ts", "\\\\server\\share\\outside.ts"])(
     "rejects target path %s outside the registered root",
