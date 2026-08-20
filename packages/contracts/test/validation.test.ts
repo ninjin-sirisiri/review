@@ -6,6 +6,8 @@ import {
   type UserDisposition,
   validateDecisionRecordInput,
   validateRevisionRef,
+  validateReviewSession,
+  validateSnapshotReference,
 } from "../src/index";
 
 const claudeFixturePath = new URL("./fixtures/claude-code.json", import.meta.url);
@@ -68,6 +70,43 @@ describe("revision references", () => {
     const result = validateRevisionRef({ kind: "working-tree", contentHash: "b".repeat(64) });
     expect(result.success).toBe(true);
   });
+
+  test.each([
+    { kind: "commit", sha: "a".repeat(40), contentHash: "b".repeat(64) },
+    { kind: "working-tree", contentHash: "b".repeat(64), sha: "a".repeat(40) },
+  ])("rejects extra fields on discriminated revisions", (revision) => {
+    const result = validateRevisionRef(revision);
+    expect(result.success).toBe(false);
+  });
+});
+
+test("rejects inherited enum-like values across contract parsers", () => {
+  const inputWithInheritedAgent = validInput({ agent_type: "toString" });
+  const inputWithInheritedDisposition = validInput({ user_disposition: "constructor" });
+  const inputWithInheritedCheckStatus = validInput({
+    checks: [{ name: "tests", status: "toString" }],
+  });
+  const sessionWithInheritedStatus = {
+    session_id: "session-001",
+    repository_id: "repo-001",
+    agent_type: "toString",
+    started_at: "2026-08-20T00:00:00.000Z",
+    status: "constructor",
+  };
+  const snapshotWithInheritedMode = {
+    snapshot_id: "snapshot-001",
+    record_id: "record-001",
+    mode: "toString",
+    path: "patch.diff",
+    content_hash: "b".repeat(64),
+    created_at: "2026-08-20T00:00:00.000Z",
+  };
+
+  expect(validateDecisionRecordInput(inputWithInheritedAgent).success).toBe(false);
+  expect(validateDecisionRecordInput(inputWithInheritedDisposition).success).toBe(false);
+  expect(validateDecisionRecordInput(inputWithInheritedCheckStatus).success).toBe(false);
+  expect(validateReviewSession(sessionWithInheritedStatus).success).toBe(false);
+  expect(validateSnapshotReference(snapshotWithInheritedMode).success).toBe(false);
 });
 
 describe("decision input validation", () => {
@@ -117,6 +156,27 @@ describe("decision input validation", () => {
     );
     expect(absolute.success).toBe(false);
     if (!absolute.success) expect(absolute.error.code).toBe(ERROR_CODES.PATH_OUTSIDE_ROOT);
+  });
+  test("rejects drive-relative Windows paths", () => {
+    const result = validateDecisionRecordInput(
+      validInput({
+        targets: [
+          {
+            ...(baseInput().targets as Array<Record<string, unknown>>)[0],
+            path: "C:..\\outside.ts",
+          },
+        ],
+      }),
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.code).toBe(ERROR_CODES.PATH_OUTSIDE_ROOT);
+  });
+
+  test("rejects non-UTC and non-ISO timestamps", () => {
+    const dateOnly = validateDecisionRecordInput(validInput({ created_at: "2026-08-20" }));
+    const localTime = validateDecisionRecordInput(validInput({ created_at: "2026-08-20T00:00:00+09:00" }));
+    expect(dateOnly.success).toBe(false);
+    expect(localTime.success).toBe(false);
   });
 
   test("rejects invalid line ranges", () => {

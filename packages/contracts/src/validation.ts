@@ -39,6 +39,11 @@ const SNAPSHOT_MODES: Record<SnapshotReference["mode"], true> = {
   "changed-files": true,
   patch: true,
 };
+const ISO_UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3,})?Z$/;
+
+function hasOwnKey<T extends Record<string, true>>(table: T, value: unknown): value is keyof T {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(table, value);
+}
 
 export interface ValidationIssue {
   field: string;
@@ -99,8 +104,8 @@ function timestamp(value: unknown, field: string, optional = false): ApiFailure 
   if (value === undefined && optional) return null;
   const stringError = nonEmptyString(value, field, 128);
   if (stringError) return stringError;
-  if (!Number.isFinite(Date.parse(value as string))) {
-    return invalid(`${field} must be an ISO-8601 timestamp`, field);
+  if (!ISO_UTC_TIMESTAMP_PATTERN.test(value as string) || !Number.isFinite(Date.parse(value as string))) {
+    return invalid(`${field} must be an ISO-8601 UTC timestamp`, field);
   }
   return null;
 }
@@ -114,7 +119,7 @@ function normalizeRelativePath(value: unknown, field: string): ValidationResult<
   if (stringError) return stringError;
   const original = value as string;
   const slashPath = original.replaceAll("\\", "/");
-  if (slashPath.startsWith("/") || slashPath.startsWith("//") || /^[A-Za-z]:\//.test(slashPath)) {
+  if (slashPath.startsWith("/") || slashPath.startsWith("//") || /^[A-Za-z]:/.test(slashPath)) {
     return failure(ERROR_CODES.PATH_OUTSIDE_ROOT, `${field} must be relative to the repository root`, field);
   }
 
@@ -131,14 +136,20 @@ function normalizeRelativePath(value: unknown, field: string): ValidationResult<
 }
 
 export function validateRevisionRef(value: unknown): ValidationResult<RevisionRef> {
-  if (!isRecord(value) || !hasOnlyKeys(value, ["kind", "sha", "contentHash"])) {
+  if (!isRecord(value) || typeof value.kind !== "string") {
     return invalid("revision must be a commit or working-tree reference", "revision");
   }
   if (value.kind === "commit") {
+    if (!hasOnlyKeys(value, ["kind", "sha"])) {
+      return invalid("commit revision must contain only kind and sha", "revision");
+    }
     const error = nonEmptyString(value.sha, "revision.sha", 128);
     return error ? error : success({ kind: "commit", sha: value.sha as string });
   }
   if (value.kind === "working-tree") {
+    if (!hasOnlyKeys(value, ["kind", "contentHash"])) {
+      return invalid("working-tree revision must contain only kind and contentHash", "revision");
+    }
     const error = nonEmptyString(value.contentHash, "revision.contentHash", 128);
     return error ? error : success({ kind: "working-tree", contentHash: value.contentHash as string });
   }
@@ -152,7 +163,7 @@ function validateCheck(value: unknown, index: number): ValidationResult<CheckEvi
   }
   const error = firstError(textField(value.name, `${field}.name`), value.details === undefined ? null : textField(value.details, `${field}.details`));
   if (error) return error;
-  if (typeof value.status !== "string" || !CHECK_STATUSES[value.status as CheckEvidence["status"]]) {
+  if (typeof value.status !== "string" || !hasOwnKey(CHECK_STATUSES, value.status)) {
     return invalid(`${field}.status must be passed, failed, or not-run`, `${field}.status`);
   }
   return success({
@@ -222,7 +233,7 @@ export function validateDecisionRecordInput(value: unknown): ValidationResult<De
   );
   if (requiredError) return requiredError;
 
-  if (typeof value.agent_type !== "string" || !AGENTS[value.agent_type as AgentType]) {
+  if (typeof value.agent_type !== "string" || !hasOwnKey(AGENTS, value.agent_type)) {
     return invalid("agent_type must be claude-code or codex", "agent_type");
   }
   const revisionResult = validateRevisionRef(value.revision);
@@ -250,7 +261,7 @@ export function validateDecisionRecordInput(value: unknown): ValidationResult<De
     if (error) return error;
     openQuestions.push(value.open_questions[index] as string);
   }
-  if (value.user_disposition !== undefined && (typeof value.user_disposition !== "string" || !DISPOSITIONS[value.user_disposition as UserDisposition])) {
+  if (value.user_disposition !== undefined && (typeof value.user_disposition !== "string" || !hasOwnKey(DISPOSITIONS, value.user_disposition))) {
     return invalid("user_disposition must be unreviewed, accepted, or rejected", "user_disposition");
   }
 
@@ -290,8 +301,8 @@ export function validateReviewSession(value: unknown): ValidationResult<ReviewSe
     timestamp(value.ended_at, "ended_at", true),
   );
   if (requiredError) return requiredError;
-  if (typeof value.agent_type !== "string" || !AGENTS[value.agent_type as AgentType]) return invalid("agent_type is invalid", "agent_type");
-  if (typeof value.status !== "string" || !SESSION_STATUSES[value.status as ReviewSession["status"]]) return invalid("status is invalid", "status");
+  if (typeof value.agent_type !== "string" || !hasOwnKey(AGENTS, value.agent_type)) return invalid("agent_type is invalid", "agent_type");
+  if (typeof value.status !== "string" || !hasOwnKey(SESSION_STATUSES, value.status)) return invalid("status is invalid", "status");
   return success({
     session_id: value.session_id as string,
     repository_id: value.repository_id as string,
@@ -315,7 +326,7 @@ export function validateSnapshotReference(value: unknown): ValidationResult<Snap
   if (requiredError) return requiredError;
   const pathResult = normalizeRelativePath(value.path, "path");
   if (!pathResult.success) return pathResult;
-  if (typeof value.mode !== "string" || !SNAPSHOT_MODES[value.mode as SnapshotReference["mode"]]) return invalid("mode is invalid", "mode");
+  if (typeof value.mode !== "string" || !hasOwnKey(SNAPSHOT_MODES, value.mode)) return invalid("mode is invalid", "mode");
   return success({
     snapshot_id: value.snapshot_id as string,
     record_id: value.record_id as string,
