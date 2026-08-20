@@ -39,7 +39,7 @@ const SNAPSHOT_MODES: Record<SnapshotReference["mode"], true> = {
   "changed-files": true,
   patch: true,
 };
-const ISO_UTC_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/;
+const ISO_UTC_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$/;
 
 function hasOwnKey<T extends Record<string, true>>(table: T, value: unknown): value is keyof T {
   return typeof value === "string" && Object.prototype.hasOwnProperty.call(table, value);
@@ -109,7 +109,7 @@ function timestamp(value: unknown, field: string, optional = false): ApiFailure 
     return invalid(`${field} must be an ISO-8601 UTC timestamp`, field);
   }
   const parsedDate = new Date(parsedTime);
-  const milliseconds = Number((match[7] ?? "").padEnd(3, "0") || "0");
+  const milliseconds = Number((match[7] ?? "").slice(0, 3).padEnd(3, "0") || "0");
   if (
     parsedDate.getUTCFullYear() !== Number(match[1]) ||
     parsedDate.getUTCMonth() + 1 !== Number(match[2]) ||

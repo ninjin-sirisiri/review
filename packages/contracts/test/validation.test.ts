@@ -172,9 +172,16 @@ describe("decision input validation", () => {
     if (!result.success) expect(result.error.code).toBe(ERROR_CODES.PATH_OUTSIDE_ROOT);
   });
 
-  test("accepts valid ISO-8601 UTC timestamps with short fractional seconds", () => {
-    for (const createdAt of ["2026-08-20T00:00:00.1Z", "2026-08-20T00:00:00.12Z"]) {
-      expect(validateDecisionRecordInput(validInput({ created_at: createdAt })).success).toBe(true);
+  test("accepts valid ISO-8601 UTC timestamps with arbitrary fractional precision", () => {
+    for (const createdAt of [
+      "2026-08-20T00:00:00.1Z",
+      "2026-08-20T00:00:00.12Z",
+      "2026-08-20T00:00:00.1234Z",
+      "2026-08-20T00:00:00.123456789Z",
+    ]) {
+      const result = validateDecisionRecordInput(validInput({ created_at: createdAt }));
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.created_at).toBe(createdAt);
     }
   });
 
