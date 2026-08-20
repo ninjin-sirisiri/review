@@ -20,15 +20,27 @@ describe("SourceReference", () => {
       path: "src/example.ts",
       revision: { kind: "commit", sha: "abc123" },
       target,
-      content: "const html = \"<script>alert('unsafe')</script>\";\nreturn html;",
-      content_hash: "expected-hash",
+      content: [
+        "const before = 1;",
+        "const html = \"<script>alert('unsafe')</script>\";",
+        "const context = true;",
+        "return html;",
+        "const after = true;",
+      ].join("\n"),
     };
 
     render(<SourceReference source={source} />);
 
     expect(screen.getByRole("heading", { name: "src/example.ts" })).toBeTruthy();
+    expect(screen.getByText("1")).toBeTruthy();
     expect(screen.getByText("4")).toBeTruthy();
+    expect(screen.getByText("5")).toBeTruthy();
     expect(screen.getByText("const html = \"<script>alert('unsafe')</script>\";")).toBeTruthy();
+    const lines = screen.getAllByRole("listitem");
+    expect(lines).toHaveLength(5);
+    expect(lines[0]?.className).not.toContain("source-line--target");
+    expect(lines[3]?.className).toContain("source-line--target");
+    expect(lines[4]?.className).toContain("source-line--target");
     expect(screen.getByText(/commit abc123/)).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
   });

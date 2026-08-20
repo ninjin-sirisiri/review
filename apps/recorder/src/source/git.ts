@@ -217,7 +217,7 @@ export class GitReader {
     this.maxDiffWork = diffWorkBudget(maxBytes);
   }
 
-  private async execute(root: string, args: string[], configArgs: string[] = []): Promise<GitResult> {
+  private async execute(root: string, args: string[]): Promise<GitResult> {
     let canonicalRoot: string;
     try {
       canonicalRoot = await realpath(root);
@@ -227,7 +227,16 @@ export class GitReader {
       throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "repository root cannot be read");
     }
     const child = Bun.spawn({
-      cmd: ["git", "-C", canonicalRoot, ...configArgs, ...args],
+      cmd: [
+        "git",
+        "-C",
+        canonicalRoot,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        ...args,
+      ],
       stdout: "pipe",
       stderr: "pipe",
       env: {

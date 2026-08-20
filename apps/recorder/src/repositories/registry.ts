@@ -101,11 +101,52 @@ async function rejectNestedRepository(root: string, target: string): Promise<voi
     current = dirname(current);
   }
 }
+interface BoundedOutput {
+  text: string;
+  oversized: boolean;
+}
 
-async function discoverGitTopLevel(root: string): Promise<string | null> {
+async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<BoundedOutput> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let oversized = false;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      totalBytes += next.value.byteLength;
+      if (totalBytes <= maxBytes) chunks.push(next.value);
+      else oversized = true;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (oversized) return { text: "", oversized: true };
+  const content = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    content.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { text: new TextDecoder().decode(content), oversized: false };
+}
+
+
+async function discoverGitTopLevel(root: string, maxBytes: number): Promise<string | null> {
   try {
     const child = Bun.spawn({
-      cmd: ["git", "-C", root, "rev-parse", "--show-toplevel"],
+      cmd: [
+        "git",
+        "-C",
+        root,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "rev-parse",
+        "--show-toplevel",
+      ],
       stdout: "pipe",
       stderr: "pipe",
       env: {
@@ -115,10 +156,18 @@ async function discoverGitTopLevel(root: string): Promise<string | null> {
         GIT_TERMINAL_PROMPT: "0",
       },
     });
-    const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+    const [stdout, stderr, exitCode] = await Promise.all([
+      readBounded(child.stdout, maxBytes),
+      readBounded(child.stderr, maxBytes),
+      child.exited,
+    ]);
+    if (stdout.oversized || stderr.oversized) {
+      throw new SourceResolutionError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git metadata exceeds the configured source limit");
+    }
     if (exitCode !== 0) return null;
-    return stdout.trim() || null;
-  } catch {
+    return stdout.text.trim() || null;
+  } catch (error) {
+    if (error instanceof SourceResolutionError) throw error;
     return null;
   }
 }
@@ -141,7 +190,7 @@ export class RepositoryRegistry {
     } catch {
       throw new SourceResolutionError(ERROR_CODES.SOURCE_UNAVAILABLE, "repository root cannot be resolved");
     }
-    const gitTopLevel = await discoverGitTopLevel(canonicalRoot);
+    const gitTopLevel = await discoverGitTopLevel(canonicalRoot, this.store.config.maxSourceContentLength);
     if (gitTopLevel !== null) {
       let canonicalGitTopLevel: string;
       try {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -450,6 +450,24 @@ describe("source resolution", () => {
     expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
     context.store.close();
   });
+  test("does not execute repository hooks or fsmonitor while reading a diff", async () => {
+    const context = await createResolverFixture();
+    const marker = join(tmpdir(), `ai-review-git-hook-${crypto.randomUUID()}`);
+    const hooks = join(context.fixture.root, ".malicious-hooks");
+    const fsmonitor = join(hooks, "query-watchman");
+    await mkdir(hooks, { recursive: true });
+    await writeFile(fsmonitor, `#!/bin/sh\ntouch "${marker}"\n`, "utf8");
+    await chmod(fsmonitor, 0o755);
+    await runGit(context.fixture.root, ["config", "core.hooksPath", hooks]);
+    await runGit(context.fixture.root, ["config", "core.fsmonitor", fsmonitor]);
+    await writeFile(join(context.fixture.root, context.fixture.path), "export const version = 6;\n", "utf8");
+
+    await new GitReader().readDiff(context.fixture.root, context.fixture.commitSha);
+
+    expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
+    context.store.close();
+  });
+
 
   test("rejects oversized live source output before buffering", async () => {
     const context = await createResolverFixture();

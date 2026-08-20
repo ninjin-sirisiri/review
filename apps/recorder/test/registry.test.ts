@@ -113,4 +113,13 @@ describe("RepositoryRegistry", () => {
     await expect(registry.assertTarget(registered.repository_id, "nested/module.ts")).rejects.toMatchObject({ code: "REPOSITORY_NOT_REGISTERED" });
     store.close();
   });
+  test("rejects oversized Git discovery output before buffering", async () => {
+    const fixture = await createFixture();
+    const store = new RecordStore(new Database(":memory:"), { maxSourceContentLength: 8 });
+    const registry = new RepositoryRegistry(store);
+
+    await expect(registry.register(fixture.root)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+    store.close();
+  });
+
 });

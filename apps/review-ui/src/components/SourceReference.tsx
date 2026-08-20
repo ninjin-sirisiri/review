@@ -73,12 +73,19 @@ export function SourceReference({ source }: SourceReferenceProps) {
         )}
       </dl>
       <ol className="source-lines" aria-label={`Source from ${source.path}`}>
-        {lines.map((line, index) => (
-          <li key={`${source.path}-${index + 1}`}>
-            <span className="line-number" aria-hidden="true">{source.target.line_start + index}</span>
-            <code>{line || " "}</code>
-          </li>
-        ))}
+        {lines.map((line, index) => {
+          const lineNumber = index + 1;
+          const isTargetLine = lineNumber >= source.target.line_start && lineNumber <= source.target.line_end;
+          return (
+            <li
+              key={`${source.path}-${lineNumber}`}
+              className={isTargetLine ? "source-line--target" : undefined}
+            >
+              <span className="line-number" aria-hidden="true">{lineNumber}</span>
+              <code>{line || " "}</code>
+            </li>
+          );
+        })}
       </ol>
     </section>
   );

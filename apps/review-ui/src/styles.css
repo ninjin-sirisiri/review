@@ -85,6 +85,7 @@ strong { color: #f0f5fa; }
 .source-lines { overflow: auto; max-height: 30rem; margin: 0; padding: 0.65rem 0; list-style: none; counter-reset: source-line; }
 .source-lines li { display: grid; grid-template-columns: 4.2rem minmax(0, 1fr); min-width: max-content; padding-right: 1rem; color: #dbe6ef; white-space: pre; }
 .source-lines li:hover { background: #1b2a38; }
+.source-lines li.source-line--target { background: #193b35; box-shadow: inset 3px 0 #7bd8b6; }
 .line-number { padding-right: 1rem; color: #627b8f; text-align: right; user-select: none; }
 .source-warning { padding: 1rem; border: 2px solid #b57a49; border-radius: 0.5rem; color: #ffe8c9; background: #3f2b1f; }
 .source-warning h3 { color: #ffe8c9; }
