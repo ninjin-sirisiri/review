@@ -1,0 +1,7 @@
+.worktrees/
+.superpowers/
+node_modules/
+dist/
+.ai-review/
+.env
+.env.*
