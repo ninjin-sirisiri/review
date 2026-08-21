@@ -9,7 +9,7 @@
       "name": "ai-code-review-claude",
       "source": "./plugins/claude-code",
       "description": "Sends structured Claude Code review judgments to the local AI Code Review Evidence Recorder",
-      "version": "0.1.0"
+      "version": "0.1.1"
     }
   ]
 }
