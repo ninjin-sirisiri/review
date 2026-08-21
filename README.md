@@ -296,6 +296,22 @@ export RECORDER_URL="http://127.0.0.1:4318/v1/decision-records"
 export RECORDER_TOKEN_PATH="$PWD/.ai-review/token"
 ```
 
+### Claude Codeプラグインのローカルインストール
+
+このリポジトリには、Claude Code用のローカルmarketplaceと`ai-code-review-claude`プラグインが含まれています。bundleを更新した場合は先に再生成します。
+
+```bash
+bun run build:claude-plugin
+claude plugin validate plugins/claude-code
+claude plugin marketplace add ./
+claude plugin install ai-code-review-claude@ai-code-review-local --scope local
+claude plugin list
+```
+
+インストール後は`ai-code-review-claude@ai-code-review-local`が`local` scopeで有効になります。プラグインの`bin`には`ai-review-claude-code`が追加されます。
+
+現在のプラグインはClaude Codeの全会話を自動収集するhookではありません。Claude Code側のhookまたはイベント接続から、下記のJSONL形式をアダプターへ渡します。これにより、source bodyや会話全文を送らず、構造化された判断だけをRecorderへ記録します。
+
 ### JSONL入力形式
 
 ```json

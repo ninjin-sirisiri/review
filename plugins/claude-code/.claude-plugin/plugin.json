@@ -1,0 +1,8 @@
+{
+  "name": "ai-code-review-claude",
+  "description": "Sends structured Claude Code review judgments to a local Recorder",
+  "version": "0.1.0",
+  "author": {
+    "name": "AI Code Review Evidence"
+  }
+}

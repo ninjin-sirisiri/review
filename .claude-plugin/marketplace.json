@@ -1,0 +1,15 @@
+{
+  "name": "ai-code-review-local",
+  "description": "Local AI-generated code review evidence tooling",
+  "owner": {
+    "name": "AI Code Review Evidence"
+  },
+  "plugins": [
+    {
+      "name": "ai-code-review-claude",
+      "source": "./plugins/claude-code",
+      "description": "Sends structured Claude Code review judgments to the local AI Code Review Evidence Recorder",
+      "version": "0.1.0"
+    }
+  ]
+}
