@@ -352,8 +352,10 @@ printf '%s\n' '<JSONL入力>' | bun plugins/codex/src/index.ts
 Claude Code:
 
 ```bash
-printf '%s\n' '<JSONL入力>' | bun plugins/claude-code/src/index.ts
+printf '%s\n' '<JSONL入力>' | ai-review-claude-code
 ```
+
+プラグイン未インストールの開発時だけ、bundle生成前のsource entrypointを直接実行できます。
 
 ホスト側のhookやイベントからJSONLをアダプターへ接続する設定は、利用するClaude Code／Codex環境側で行います。アダプターはリポジトリを直接読み取らず、判断記録だけをRecorderへ送ります。
 
