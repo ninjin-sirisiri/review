@@ -440,6 +440,10 @@ async function handleRequest(
       return success(await service.listDecisions(repositoryId));
     }
 
+    if (request.method === "GET" && parts.length === 1 && parts[0] === "repositories") {
+      return success(await registry.list());
+    }
+
     if (request.method === "PATCH" && parts.length === 3 && parts[0] === "decision-records" && parts[2] === "disposition") {
       const contentError = requireJsonContentType(request);
       if (contentError) return contentError;

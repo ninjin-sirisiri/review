@@ -228,6 +228,17 @@ export class RepositoryRegistry {
     return { repository_id: row.repository_id, root: row.root, created_at: row.created_at };
   }
 
+  async list(): Promise<RegisteredRepository[]> {
+    const rows = this.store.db.query(
+      "SELECT repository_id, root, created_at FROM repositories ORDER BY created_at, repository_id",
+    ).all() as Array<{ repository_id: string; root: string | null; created_at: string }>;
+    return rows.flatMap((row) => (
+      row.root === null || !isAbsolute(row.root)
+        ? []
+        : [{ repository_id: row.repository_id, root: row.root, created_at: row.created_at }]
+    ));
+  }
+
   async assertTarget(repositoryId: string, relativePath: string): Promise<string> {
     const repository = await this.get(repositoryId);
     if (repository === null) {

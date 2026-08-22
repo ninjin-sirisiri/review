@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -194,6 +194,29 @@ describe("authenticated local Recorder HTTP API", () => {
     });
     expect(duplicate.status).toBe(200);
     expect(await json<{ success: true; data: { record: { record_id: string } } }>(duplicate)).toMatchObject({ success: true, data: { record: { record_id: "record-1" } } });
+  });
+
+  test("lists registered repositories with their canonical roots", async () => {
+    const empty = await request("/v1/repositories");
+    expect(empty.status).toBe(200);
+    expect(await json<{ success: true; data: unknown[] }>(empty)).toEqual({ success: true, data: [] });
+
+    const secondRoot = await mkdtemp(join(tmpdir(), "ai-review-http-root2-"));
+    temporaryDirectories.push(secondRoot);
+    await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root, repository_id: "repo-1" }) });
+    await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root: secondRoot, repository_id: "repo-2" }) });
+
+    const response = await request("/v1/repositories");
+    expect(response.status).toBe(200);
+    const payload = await json<{ success: true; data: Array<{ repository_id: string; root: string; created_at: string }> }>(response);
+    expect(payload.success).toBe(true);
+    expect(payload.data.map((repository) => repository.repository_id).sort()).toEqual(["repo-1", "repo-2"]);
+    const [canonicalRoot, canonicalSecondRoot] = await Promise.all([realpath(root), realpath(secondRoot)]);
+    expect(payload.data.find((repository) => repository.repository_id === "repo-1")?.root).toBe(canonicalRoot);
+    expect(payload.data.find((repository) => repository.repository_id === "repo-2")?.root).toBe(canonicalSecondRoot);
+    for (const repository of payload.data) {
+      expect(repository.created_at.length).toBeGreaterThan(0);
+    }
   });
 
   test("serializes concurrent same-record submissions and returns sources for the stored record", async () => {

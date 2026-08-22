@@ -1,5 +1,12 @@
 import { FormEvent, useState } from "react";
-import { ReviewApi, ReviewApiError, type DecisionRecordDetail, type DecisionRecordSummary, type UserDisposition } from "./api";
+import {
+  ReviewApi,
+  ReviewApiError,
+  type DecisionRecordDetail,
+  type DecisionRecordSummary,
+  type RegisteredRepositorySummary,
+  type UserDisposition,
+} from "./api";
 import { DecisionDetail } from "./components/DecisionDetail";
 import { DecisionList } from "./components/DecisionList";
 import "./styles.css";
@@ -18,7 +25,8 @@ function apiMessage(error: unknown): string {
 
 export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) {
   const [tokenInput, setTokenInput] = useState("");
-  const [repositoryInput, setRepositoryInput] = useState("");
+  const [repositories, setRepositories] = useState<RegisteredRepositorySummary[] | null>(null);
+  const [selectedRepositoryId, setSelectedRepositoryId] = useState("");
   const [api, setApi] = useState<ReviewApi | null>(null);
   const [repositoryId, setRepositoryId] = useState<string | null>(null);
   const [decisions, setDecisions] = useState<DecisionRecordSummary[]>([]);
@@ -28,31 +36,43 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function bootstrap(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const token = tokenInput.trim();
-    const repository = repositoryInput.trim();
-    if (token.length === 0 || repository.length === 0) {
-      setError("Owner token and repository ID are required.");
+    if (token.length === 0) {
+      setError("Owner bearer token is required.");
       return;
     }
 
-    const client = apiFactory(token);
     setIsLoading(true);
     setError(null);
-    setDetail(null);
-    setSelectedRecordId(undefined);
     try {
+      if (repositories === null) {
+        const client = apiFactory(token);
+        const found = await client.listRepositories();
+        setApi(client);
+        setRepositories(found);
+        if (found.length === 1) setSelectedRepositoryId(found[0].repository_id);
+        return;
+      }
+
+      const repository = selectedRepositoryId.trim();
+      if (repository.length === 0 || !repositories.some((candidate) => candidate.repository_id === repository)) {
+        setError("Select a registered repository.");
+        return;
+      }
+
+      const client = api ?? apiFactory(token);
       const records = await client.listDecisions(repository);
-      setApi(client);
       setRepositoryId(repository);
       setDecisions(records);
       const first = records[0];
       if (first !== undefined) await selectDecision(client, first.record_id);
     } catch (requestError) {
-      setApi(null);
-      setRepositoryId(null);
-      setDecisions([]);
+      if (repositories === null) {
+        setApi(null);
+        setRepositories(null);
+      }
       setError(apiMessage(requestError));
     } finally {
       setIsLoading(false);
@@ -93,6 +113,8 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   function resetSession() {
     setApi(null);
     setRepositoryId(null);
+    setRepositories(null);
+    setSelectedRepositoryId("");
     setDecisions([]);
     setSelectedRecordId(undefined);
     setDetail(null);
@@ -101,13 +123,14 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   }
 
   if (api === null || repositoryId === null) {
+    const pickingRepository = repositories !== null;
     return (
       <main className="app-shell app-shell--bootstrap">
         <section className="bootstrap-card" aria-labelledby="bootstrap-heading">
           <p className="eyebrow">Local review evidence</p>
           <h1 id="bootstrap-heading">Review decisions with their source</h1>
-          <p>Enter the owner token from Recorder and a repository ID. The token stays in this browser tab's memory and is never written to storage or included in a URL.</p>
-          <form onSubmit={bootstrap}>
+          <p>Enter the owner token from Recorder and pick one of its registered repositories. The token stays in this browser tab's memory and is never written to storage or included in a URL.</p>
+          <form onSubmit={handleSubmit}>
             <fieldset>
               <legend>Recorder connection</legend>
               <label htmlFor="owner-token">Owner bearer token</label>
@@ -120,23 +143,43 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
                 onChange={(event) => setTokenInput(event.target.value)}
                 required
               />
-              <label htmlFor="repository-id">Repository ID</label>
-              <input
-                id="repository-id"
-                name="repository-id"
-                type="text"
-                value={repositoryInput}
-                onChange={(event) => setRepositoryInput(event.target.value)}
-                required
-              />
+              {pickingRepository && (
+                <>
+                  <label htmlFor="repository">Repository</label>
+                  <select
+                    id="repository"
+                    name="repository"
+                    value={selectedRepositoryId}
+                    onChange={(event) => setSelectedRepositoryId(event.target.value)}
+                    required
+                  >
+                    <option value="" disabled>Select a repository…</option>
+                    {repositories.map((candidate) => (
+                      <option key={candidate.repository_id} value={candidate.repository_id}>
+                        {candidate.root}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
             </fieldset>
             {error !== null && <p className="inline-error" role="alert">{error}</p>}
-            <button type="submit" disabled={isLoading}>{isLoading ? "Connecting…" : "Open review timeline"}</button>
+            <button type="submit" disabled={isLoading}>
+              {isLoading
+                ? pickingRepository
+                  ? "Opening…"
+                  : "Connecting…"
+                : pickingRepository
+                  ? "Open review timeline"
+                  : "Load repositories"}
+            </button>
           </form>
         </section>
       </main>
     );
   }
+
+  const activeRepository = repositories?.find((candidate) => candidate.repository_id === repositoryId);
 
   return (
     <main className="app-shell">
@@ -144,7 +187,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
         <div>
           <p className="eyebrow">Local review evidence</p>
           <h1>Decision review</h1>
-          <p className="app-header__repo">Repository <code>{repositoryId}</code></p>
+          <p className="app-header__repo">Repository <code>{activeRepository?.root ?? repositoryId}</code></p>
         </div>
         <button type="button" className="button-secondary" onClick={resetSession}>Clear session</button>
       </header>

@@ -23,6 +23,28 @@ describe("ReviewApi", () => {
     );
   });
 
+  it("lists registered repositories for the entered owner token", async () => {
+    const fetchImpl = vi.fn(async () =>
+      response({
+        success: true,
+        data: [{ repository_id: "repo-1", root: "/work/repo-one", created_at: "2026-08-22T00:00:00.000Z" }],
+      }),
+    );
+    const api = new ReviewApi("owner-token", { baseUrl: "http://recorder.test/", fetchImpl });
+
+    const repositories = await api.listRepositories();
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "http://recorder.test/v1/repositories",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer owner-token" }),
+      }),
+    );
+    expect(repositories).toEqual([
+      { repository_id: "repo-1", root: "/work/repo-one", created_at: "2026-08-22T00:00:00.000Z" },
+    ]);
+  });
+
   it("propagates unauthorized API envelopes instead of falling back", async () => {
     const api = new ReviewApi("owner-token", {
       fetchImpl: async () => response({ success: false, error: { code: "UNAUTHORIZED", message: "owner bearer token is required" } }, 401),

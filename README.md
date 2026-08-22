@@ -123,7 +123,7 @@ bun run recorder \
 http://127.0.0.1:4318/
 ```
 
-静的UIシェルは公開されていますが、`/v1` APIはowner bearer tokenが必要です。画面でtokenと`repository_id`を入力してください。tokenはReactのメモリ内だけに保持され、URL、cookie、localStorage、sessionStorageには保存されません。
+静的UIシェルは公開されていますが、`/v1` APIはowner bearer tokenが必要です。画面でtokenを入力して「Load repositories」を実行すると、Recorderに登録済みのリポジトリが一覧表示されるので選択してタイムラインを開きます。tokenはReactのメモリ内だけに保持され、URL、cookie、localStorage、sessionStorageには保存されません。
 
 `uiRoot`をRecorderのdata directory、SQLiteファイル、snapshot directoryと重ねることはできません。これはtokenやレビュー記録の静的公開を防ぐためです。
 
@@ -165,6 +165,16 @@ Recorderは次を検証します。
 - nested Git repository／未登録submodule
 - Gitのtop-levelと登録ルートの一致
 - 明示したrepository IDの衝突
+
+### 登録済みリポジトリを一覧取得
+
+```bash
+curl -sS \
+  -H "$(auth_header)" \
+  http://127.0.0.1:4318/v1/repositories
+```
+
+`repository_id`、canonical `root`、`created_at`の一覧を`created_at`順で返します。UIの「Load repositories」もこのエンドポイントを使用します。
 
 ### Review sessionを作成
 
@@ -627,7 +637,7 @@ omp plugin list
 - Recorderが出力したtoken pathを確認する
 - `RECORDER_TOKEN_PATH`が同じRecorderのtokenを指しているか確認する
 - tokenをコマンドライン引数へ渡していないか確認する
-- UIではtoken入力後にrepository IDを入力する
+- UIではtoken入力後に「Load repositories」で登録済みリポジトリを選択する
 
 ### `REPOSITORY_NOT_REGISTERED`またはsessionエラー
 

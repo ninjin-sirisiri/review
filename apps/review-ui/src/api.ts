@@ -20,6 +20,12 @@ export type DecisionRecordSummary = Pick<
   | "user_disposition"
 >;
 
+export interface RegisteredRepositorySummary {
+  repository_id: string;
+  root: string;
+  created_at: string;
+}
+
 export interface ResolvedSourceReference {
   state: "resolved" | "snapshot-resolved";
   repository_id: string;
@@ -201,6 +207,10 @@ export class ReviewApi {
     return this.request<DecisionRecordSummary[]>(
       `/v1/decision-records?repository_id=${encodeURIComponent(normalizedRepositoryId)}`,
     );
+  }
+
+  listRepositories(): Promise<RegisteredRepositorySummary[]> {
+    return this.request<RegisteredRepositorySummary[]>("/v1/repositories");
   }
 
   getDecision(recordId: string): Promise<DecisionRecordDetail> {
