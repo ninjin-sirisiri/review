@@ -1,11 +1,28 @@
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
+import { afterAll, beforeEach, expect, test } from "bun:test";
 import { grantDecisionPermits, normalizeDecisionProposal } from "../../common/src/decision-gate";
 import type { AdapterBridge, SubmitResult } from "../../common/src/adapter-contract";
 import type { RecorderSetupClient } from "../../common/src/recorder-setup";
 import { checkPreToolUse, handleSessionStart, recordDecision } from "../src/gate-command";
+
+const GATED_ENV_KEYS = ["AI_REVIEW_SESSION_ID", "AI_REVIEW_REPOSITORY_ROOT", "AI_REVIEW_AGENT_TYPE", "AI_REVIEW_GATE_ROOT"];
+const preservedEnv: Record<string, string | undefined> = {};
+
+beforeEach(() => {
+  for (const key of GATED_ENV_KEYS) {
+    preservedEnv[key] = process.env[key];
+    delete process.env[key];
+  }
+});
+
+afterAll(() => {
+  for (const [key, value] of Object.entries(preservedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
 
 async function fixture(): Promise<{ root: string; file: string; gateRoot: string }> {
   const root = await mkdtemp(join(tmpdir(), "ai-review-hook-"));
