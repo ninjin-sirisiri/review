@@ -1,0 +1,41 @@
+---
+name: record-before-edit
+description: Use when any agent is about to edit, write, patch, or otherwise change source code, configuration, tests, or notebooks in the active repository
+---
+
+# Record Before Edit
+
+A code edit is permitted only after a structured judgment has been accepted by the local Recorder. The plugin hook enforces this for every Claude Code agent and subagent; this skill tells the agent how to satisfy the gate.
+
+## Required sequence
+
+1. Inspect the current file and decide the intended change. Reading, searching, and tests are allowed before recording.
+2. Record the judgment through `ai-review-record` before calling `Edit` or `Write`:
+
+```sh
+cat <<'JSON' | ai-review-record
+{
+  "targets": [
+    {"path": "src/example.ts", "lineStart": 10, "lineEnd": 24}
+  ],
+  "judgment": "the change preserves the validation invariant",
+  "rationale": "the new branch reuses the existing guard and leaves the error path intact",
+  "checks": [{"name": "focused test", "status": "not-run"}],
+  "openQuestions": ["does the integration path need a regression test?"]
+}
+JSON
+```
+
+3. Continue only when the command prints `"success":true`. The permit is tied to the target's current content hash and is consumed by one matching edit. Record every file that will be edited; a changed hash, different path, expired permit, failed Recorder submission, or second edit requires a new record.
+
+`SessionStart` supplies the session and repository defaults. Pass `repositoryRoot` or `sessionId` only when operating outside that initialized session. For a new file, record its path with `lineStart: 1`; the empty pre-edit content is hashed by the command.
+
+## Non-negotiable rules
+
+- Never call `Edit`, `Write`, `NotebookEdit`, `MultiEdit`, `git apply`, `sed -i`, redirection, or another mutation path before recording.
+- Do not record after editing. A passing test after the edit does not repair the missing pre-edit judgment.
+- Do not bypass the gate through Bash or a delegated subagent. Plugin hooks run for subagents too.
+- “One line”, “obvious”, “tests are green”, “already changed”, “mechanical”, urgency, and sunk cost are not exceptions.
+- The raw adapter command records evidence but does not create an edit permit; use `ai-review-record`.
+
+If recording fails, stop the edit, report the structured error, and resolve the Recorder/session/target problem first. Do not create a temporary allow-list or edit anyway.

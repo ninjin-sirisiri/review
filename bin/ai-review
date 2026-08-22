@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_install_root() {
+  local source="${BASH_SOURCE[0]}"
+  while [[ -L "$source" ]]; do
+    local dir
+    dir="$(cd -P "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    [[ "$source" != /* ]] && source="$dir/$source"
+  done
+  cd -P "$(dirname "$source")/.." && pwd
+}
+
+ROOT="$(resolve_install_root)"
+DEFAULT_UI_ROOT="$ROOT/apps/review-ui/dist"
+RECORDER="$ROOT/apps/recorder/src/index.ts"
+SETUP="$ROOT/apps/recorder/src/setup.ts"
+
+usage() {
+  cat <<EOF
+Usage: ai-review [setup] [options]
+
+Start the local AI Code Review Evidence recorder and Review UI.
+This command can be run from any directory.
+
+Commands:
+  setup               Register repository and session with Recorder
+
+Recorder options:
+  --data-dir <path>   Data directory (default: ~/.ai-code-review-evidence)
+  --port <port>       Listen port (default: 4318)
+  --ui-root <path>    Built Review UI directory
+                      (default: <install-root>/apps/review-ui/dist)
+  -h, --help          Show this help
+
+Setup options:
+  --root <path>       Repository root (default: current directory)
+  --session-id <id>   Host session ID (default: AI_REVIEW_SESSION_ID or UUID)
+  --agent-type <type> claude-code or codex (default: claude-code)
+  --recorder-url <url> Loopback Recorder decision endpoint
+  --token-path <path> Token file path
+
+Requires Bun on PATH.
+EOF
+}
+
+if ! command -v bun >/dev/null 2>&1; then
+  echo "ai-review: bun is required but was not found on PATH" >&2
+  exit 1
+fi
+
+if [[ "${1:-}" == "setup" ]]; then
+  shift
+  if [[ ! -f "$SETUP" ]]; then
+    echo "ai-review: setup entrypoint not found: $SETUP" >&2
+    exit 1
+  fi
+  exec bun "$SETUP" "$@"
+fi
+
+if [[ ! -f "$RECORDER" ]]; then
+  echo "ai-review: recorder entrypoint not found: $RECORDER" >&2
+  exit 1
+fi
+
+has_port=0
+has_ui_root=0
+forward=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --port)
+      has_port=1
+      if [[ $# -lt 2 ]]; then
+        echo "ai-review: --port requires a value" >&2
+        exit 1
+      fi
+      forward+=("$1" "$2")
+      shift 2
+      ;;
+    --port=*)
+      has_port=1
+      forward+=("$1")
+      shift
+      ;;
+    --ui-root)
+      has_ui_root=1
+      if [[ $# -lt 2 ]]; then
+        echo "ai-review: --ui-root requires a value" >&2
+        exit 1
+      fi
+      forward+=("$1" "$2")
+      shift 2
+      ;;
+    --ui-root=*)
+      has_ui_root=1
+      forward+=("$1")
+      shift
+      ;;
+    --data-dir)
+      if [[ $# -lt 2 ]]; then
+        echo "ai-review: --data-dir requires a value" >&2
+        exit 1
+      fi
+      forward+=("$1" "$2")
+      shift 2
+      ;;
+    --data-dir=*)
+      forward+=("$1")
+      shift
+      ;;
+    *)
+      echo "ai-review: unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "$has_ui_root" -eq 0 ]]; then
+  if [[ ! -f "$DEFAULT_UI_ROOT/index.html" ]]; then
+    bun run --cwd "$ROOT/apps/review-ui" build
+  fi
+  if [[ ! -f "$DEFAULT_UI_ROOT/index.html" ]]; then
+    echo "ai-review: Review UI is not built: $DEFAULT_UI_ROOT" >&2
+    exit 1
+  fi
+  forward+=(--ui-root "$DEFAULT_UI_ROOT")
+fi
+
+if [[ "$has_port" -eq 0 ]]; then
+  forward+=(--port 4318)
+fi
+
+exec bun "$RECORDER" "${forward[@]}"

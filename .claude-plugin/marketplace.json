@@ -8,8 +8,8 @@
     {
       "name": "ai-code-review-claude",
       "source": "./plugins/claude-code",
-      "description": "Sends structured Claude Code review judgments to the local AI Code Review Evidence Recorder",
-      "version": "0.1.1"
+      "description": "Records pre-edit judgments and sends structured review evidence to the local Recorder",
+      "version": "0.2.0"
     }
   ]
 }

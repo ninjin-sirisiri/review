@@ -33,6 +33,11 @@ var CHECK_STATUSES = {
   failed: true,
   "not-run": true
 };
+var SESSION_STATUSES = {
+  active: true,
+  completed: true,
+  failed: true
+};
 var ISO_UTC_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$/;
 function hasOwnKey(table, value) {
   return typeof value === "string" && Object.prototype.hasOwnProperty.call(table, value);
@@ -262,6 +267,26 @@ function validateDecisionRecordInput(value) {
     open_questions: openQuestions,
     created_at: value.created_at,
     ...value.user_disposition === undefined ? {} : { user_disposition: value.user_disposition }
+  });
+}
+function validateReviewSession(value) {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["session_id", "repository_id", "agent_type", "started_at", "ended_at", "status"])) {
+    return invalid("review session has an unsupported field");
+  }
+  const requiredError = firstError(nonEmptyString(value.session_id, "session_id"), nonEmptyString(value.repository_id, "repository_id"), timestamp(value.started_at, "started_at"), timestamp(value.ended_at, "ended_at", true));
+  if (requiredError)
+    return requiredError;
+  if (typeof value.agent_type !== "string" || !hasOwnKey(AGENTS, value.agent_type))
+    return invalid("agent_type is invalid", "agent_type");
+  if (typeof value.status !== "string" || !hasOwnKey(SESSION_STATUSES, value.status))
+    return invalid("status is invalid", "status");
+  return success({
+    session_id: value.session_id,
+    repository_id: value.repository_id,
+    agent_type: value.agent_type,
+    started_at: value.started_at,
+    ...value.ended_at === undefined ? {} : { ended_at: value.ended_at },
+    status: value.status
   });
 }
 class ContractValidationError extends Error {
@@ -667,12 +692,679 @@ async function runAdapter(agentType, stdin, stdout, bridge) {
   }
 }
 
+// plugins/claude-code/src/gate-command.ts
+import { appendFile, realpath as realpath2 } from "fs/promises";
+import { createHash as createHash3 } from "crypto";
+import { resolve as resolve2 } from "path";
+
+// plugins/common/src/decision-gate.ts
+import { createHash as createHash2, randomUUID } from "crypto";
+import { lstat, mkdir, readFile as readFile2, readdir, realpath, rename, rm, stat, writeFile } from "fs/promises";
+import { homedir as homedir2 } from "os";
+import { isAbsolute as isAbsolute2, join as join2, relative, resolve, sep } from "path";
+var DEFAULT_PERMIT_TTL_MS = 10 * 60 * 1000;
+var MAX_HASH_BYTES = 10 * 1024 * 1024;
+var PROPOSAL_KEYS = [
+  "sessionId",
+  "repositoryRoot",
+  "revision",
+  "targets",
+  "judgment",
+  "rationale",
+  "checks",
+  "openQuestions",
+  "recordId",
+  "createdAt"
+];
+var TARGET_KEYS2 = ["path", "lineStart", "lineEnd", "revision", "contentHash"];
+function fail2(message) {
+  throw new Error(message);
+}
+function nonEmptyString2(value, field) {
+  if (typeof value !== "string" || value.trim().length === 0)
+    fail2(`${field} must be a non-empty string`);
+  return value;
+}
+function onlyKeys2(value, allowed, label) {
+  const unexpected = Object.keys(value).find((key) => !allowed.includes(key));
+  if (unexpected !== undefined)
+    fail2(`${label}.${unexpected} is not supported`);
+}
+function sha256(value) {
+  return createHash2("sha256").update(value, "utf8").digest("hex");
+}
+function hashText(value) {
+  return sha256(value);
+}
+function normalizedRelativePath(root, candidate) {
+  const absoluteCandidate = resolve(root, candidate);
+  const relativeCandidate = relative(root, absoluteCandidate);
+  if (relativeCandidate === "" || relativeCandidate === ".." || relativeCandidate.startsWith(`..${sep}`) || isAbsolute2(relativeCandidate)) {
+    fail2("target path must stay inside repositoryRoot");
+  }
+  return relativeCandidate.split(sep).join("/");
+}
+async function currentFileText(path) {
+  try {
+    const details = await stat(path);
+    if (!details.isFile())
+      fail2(`target is not a regular file: ${path}`);
+    if (details.size > MAX_HASH_BYTES)
+      fail2(`target exceeds the hash size limit: ${path}`);
+    return await readFile2(path, "utf8");
+  } catch (error) {
+    const code = error.code;
+    if (code === "ENOENT")
+      return "";
+    if (error instanceof Error && error.message.startsWith("target "))
+      throw error;
+    throw new Error(`target could not be read: ${path}`);
+  }
+}
+async function canonicalPath(root, filePath) {
+  let canonicalRoot;
+  try {
+    canonicalRoot = await realpath(root);
+  } catch {
+    return null;
+  }
+  try {
+    if ((await lstat(filePath)).isSymbolicLink())
+      return null;
+  } catch (error) {
+    if (error.code !== "ENOENT")
+      return null;
+  }
+  let canonicalFile;
+  try {
+    canonicalFile = await realpath(filePath);
+  } catch (error) {
+    if (error.code !== "ENOENT")
+      return null;
+    try {
+      const parent = await realpath(resolve(filePath, ".."));
+      canonicalFile = resolve(parent, filePath.split(sep).pop() ?? "");
+    } catch {
+      return null;
+    }
+  }
+  const relativeFile = relative(canonicalRoot, canonicalFile);
+  if (relativeFile === "" || relativeFile === ".." || relativeFile.startsWith(`..${sep}`) || isAbsolute2(relativeFile))
+    return null;
+  return { root: canonicalRoot, path: canonicalFile };
+}
+async function hashExistingFile(path) {
+  return hashText(await currentFileText(path));
+}
+function gateBase(options) {
+  return options.gateRoot ?? process.env.AI_REVIEW_GATE_ROOT ?? join2(homedir2(), ".ai-code-review-evidence", "gates");
+}
+function gateDirectory(root, sessionId, options = {}) {
+  return join2(gateBase(options), sha256(root), sha256(sessionId));
+}
+function permitPath(directory) {
+  return join2(directory, `permit-${randomUUID()}.json`);
+}
+function parseProposal(value) {
+  if (!isRecord(value))
+    fail2("decision proposal must be an object");
+  onlyKeys2(value, PROPOSAL_KEYS, "proposal");
+  if (!Array.isArray(value.targets) || value.targets.length === 0)
+    fail2("proposal.targets must contain at least one target");
+  if (typeof value.judgment !== "string" || value.judgment.trim().length === 0)
+    fail2("proposal.judgment must be a non-empty string");
+  if (typeof value.rationale !== "string" || value.rationale.trim().length === 0)
+    fail2("proposal.rationale must be a non-empty string");
+  const targets = value.targets.map((candidate, index) => {
+    if (!isRecord(candidate))
+      fail2(`proposal.targets[${index}] must be an object`);
+    onlyKeys2(candidate, TARGET_KEYS2, `proposal.targets[${index}]`);
+    const path = nonEmptyString2(candidate.path, `proposal.targets[${index}].path`);
+    if (!Number.isSafeInteger(candidate.lineStart) || candidate.lineStart < 1)
+      fail2(`proposal.targets[${index}].lineStart must be a positive integer`);
+    if (candidate.lineEnd !== undefined && (!Number.isSafeInteger(candidate.lineEnd) || candidate.lineEnd < candidate.lineStart)) {
+      fail2(`proposal.targets[${index}].lineEnd must be at or after lineStart`);
+    }
+    return {
+      path,
+      lineStart: candidate.lineStart,
+      ...candidate.lineEnd === undefined ? {} : { lineEnd: candidate.lineEnd },
+      ...candidate.revision === undefined ? {} : { revision: candidate.revision },
+      ...candidate.contentHash === undefined ? {} : { contentHash: nonEmptyString2(candidate.contentHash, `proposal.targets[${index}].contentHash`) }
+    };
+  });
+  return {
+    ...value.sessionId === undefined ? {} : { sessionId: nonEmptyString2(value.sessionId, "proposal.sessionId") },
+    ...value.repositoryRoot === undefined ? {} : { repositoryRoot: nonEmptyString2(value.repositoryRoot, "proposal.repositoryRoot") },
+    ...value.revision === undefined ? {} : { revision: value.revision },
+    targets,
+    judgment: value.judgment,
+    rationale: value.rationale,
+    ...value.checks === undefined ? {} : { checks: value.checks },
+    ...value.openQuestions === undefined ? {} : { openQuestions: value.openQuestions },
+    ...value.recordId === undefined ? {} : { recordId: nonEmptyString2(value.recordId, "proposal.recordId") },
+    ...value.createdAt === undefined ? {} : { createdAt: nonEmptyString2(value.createdAt, "proposal.createdAt") }
+  };
+}
+async function normalizeDecisionProposal(value, defaults) {
+  const proposal = parseProposal(value);
+  const sessionId = proposal.sessionId ?? defaults.sessionId;
+  if (sessionId === undefined)
+    fail2("sessionId is required; start the plugin session first");
+  const repositoryRoot = resolve(proposal.repositoryRoot ?? defaults.repositoryRoot ?? process.cwd());
+  if (!isAbsolute2(repositoryRoot))
+    fail2("repositoryRoot must be an absolute path");
+  const canonicalRoot = await realpath(repositoryRoot).catch(() => fail2("repositoryRoot does not exist"));
+  const targetData = [];
+  for (const target of proposal.targets) {
+    const path = normalizedRelativePath(canonicalRoot, target.path);
+    if (await canonicalPath(canonicalRoot, resolve(canonicalRoot, path)) === null) {
+      fail2(`target path must resolve inside repositoryRoot: ${path}`);
+    }
+    const text = await currentFileText(resolve(canonicalRoot, path));
+    const contentHash = hashText(text);
+    if (target.contentHash !== undefined && target.contentHash !== contentHash) {
+      fail2(`target contentHash does not match the current file: ${path}`);
+    }
+    const lineCount = Math.max(1, text.split(/\r?\n/).length - (text.endsWith(`
+`) ? 1 : 0));
+    targetData.push({
+      path,
+      lineStart: target.lineStart,
+      lineEnd: target.lineEnd ?? Math.max(target.lineStart, lineCount),
+      contentHash,
+      ...target.revision === undefined ? {} : { revision: target.revision }
+    });
+  }
+  const revision2 = proposal.revision ?? {
+    kind: "working-tree",
+    contentHash: sha256(targetData.map((target) => `${target.path}\x00${target.contentHash}`).sort().join(`
+`))
+  };
+  return {
+    sessionId,
+    repositoryRoot: canonicalRoot,
+    revision: revision2,
+    targets: targetData.map((target) => ({
+      path: target.path,
+      lineStart: target.lineStart,
+      lineEnd: target.lineEnd,
+      revision: target.revision ?? revision2,
+      contentHash: target.contentHash
+    })),
+    judgment: proposal.judgment,
+    rationale: proposal.rationale,
+    checks: proposal.checks ?? [],
+    openQuestions: proposal.openQuestions ?? [],
+    ...proposal.recordId === undefined ? {} : { recordId: proposal.recordId },
+    ...proposal.createdAt === undefined ? {} : { createdAt: proposal.createdAt }
+  };
+}
+async function grantDecisionPermits(event, options) {
+  const recordId = nonEmptyString2(options.recordId, "recordId");
+  const sessionId = nonEmptyString2(event.sessionId, "sessionId");
+  const root = await realpath(event.repositoryRoot).catch(() => fail2("repositoryRoot does not exist"));
+  const ttlMs = options.ttlMs ?? DEFAULT_PERMIT_TTL_MS;
+  if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0)
+    fail2("permit ttl must be a positive integer");
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  const directory = gateDirectory(root, sessionId, options);
+  await mkdir(directory, { recursive: true, mode: 448 });
+  for (const target of event.targets) {
+    const path = normalizedRelativePath(root, target.path);
+    const permit = { sessionId, repositoryRoot: root, recordId, path, contentHash: target.contentHash, expiresAt };
+    await writeFile(permitPath(directory), `${JSON.stringify(permit)}
+`, { encoding: "utf8", mode: 384 });
+  }
+  return { permits: event.targets.length, gateDirectory: directory, expiresAt };
+}
+async function claimPermit(path) {
+  const claimed = `${path}.claim-${process.pid}-${randomUUID()}`;
+  try {
+    await rename(path, claimed);
+    return claimed;
+  } catch {
+    return null;
+  }
+}
+async function consumeDecisionPermit(options) {
+  const canonical = await canonicalPath(options.repositoryRoot, options.filePath);
+  if (canonical === null)
+    return false;
+  const directory = gateDirectory(canonical.root, options.sessionId, options.gateRoot === undefined ? {} : { gateRoot: options.gateRoot });
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  const relativeFile = relative(canonical.root, canonical.path).split(sep).join("/");
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json"))
+      continue;
+    const original = join2(directory, entry.name);
+    let raw;
+    try {
+      raw = await readFile2(original, "utf8");
+    } catch {
+      continue;
+    }
+    let permit;
+    try {
+      const value = JSON.parse(raw);
+      if (typeof value.sessionId !== "string" || typeof value.repositoryRoot !== "string" || typeof value.recordId !== "string" || typeof value.path !== "string" || typeof value.contentHash !== "string" || typeof value.expiresAt !== "string")
+        continue;
+      permit = value;
+    } catch {
+      continue;
+    }
+    if (permit.sessionId !== options.sessionId || permit.repositoryRoot !== canonical.root || permit.path !== relativeFile)
+      continue;
+    if (Date.parse(permit.expiresAt) <= Date.now()) {
+      await rm(original, { force: true }).catch(() => {
+        return;
+      });
+      continue;
+    }
+    const actualHash = await hashExistingFile(canonical.path).catch(() => null);
+    if (actualHash !== permit.contentHash)
+      continue;
+    const claimed = await claimPermit(original);
+    if (claimed === null)
+      continue;
+    await rm(claimed, { force: true }).catch(() => {
+      return;
+    });
+    return true;
+  }
+  return false;
+}
+function likelyCodeMutation(command) {
+  const normalized = command.replaceAll("\\", "/");
+  return /(?:^|[;&|]\s*)(?:apply_patch|patch)\b/i.test(normalized) || /\bgit\s+(?:apply|am|checkout|restore|reset|rebase|merge)\b/i.test(normalized) || /\b(?:sed|perl)\s+[^\n]*-i(?:\s|$)/i.test(normalized) || /\b(?:tee|install|cp|mv)\s+[^\n]*(?:>|$)/i.test(normalized) || /(?:^|\s)(?:>|>>|1>|2>)\s*[^\s|;&]+/.test(normalized) || /\b(?:python|python3|node|nodejs|bun)\s+[^\n]*(?:writeFile|appendFile|write_text|open\s*\([^)]*['"][wax+])/i.test(normalized);
+}
+function defaultGateRoot() {
+  return process.env.AI_REVIEW_GATE_ROOT ?? join2(homedir2(), ".ai-code-review-evidence", "gates");
+}
+
+// plugins/common/src/recorder-setup.ts
+import { readFile as readFile3 } from "fs/promises";
+import { isAbsolute as isAbsolute3 } from "path";
+var MAX_RESPONSE_BYTES2 = 1e6;
+var DEFAULT_TIMEOUT_MS = 2000;
+
+class RecorderSetupError extends Error {
+  code;
+  status;
+  constructor(code, message, status) {
+    super(message);
+    this.name = "RecorderSetupError";
+    this.code = code;
+    if (status !== undefined)
+      this.status = status;
+  }
+}
+function loopbackEndpoint(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new RecorderSetupError("INVALID_ENDPOINT", "Recorder endpoint must be a valid URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new RecorderSetupError("INVALID_ENDPOINT", "Recorder endpoint must use HTTP or HTTPS");
+  }
+  if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost" && url.hostname !== "[::1]") {
+    throw new RecorderSetupError("INVALID_ENDPOINT", "Recorder endpoint must use a loopback host");
+  }
+  return url.toString();
+}
+function positiveTimeout(value) {
+  if (!Number.isSafeInteger(value) || value <= 0)
+    throw new RecorderSetupError("INVALID_TIMEOUT", "Recorder setup timeout must be a positive integer");
+  return value;
+}
+function resourceEndpoint(endpoint, resource) {
+  const url = new URL(endpoint);
+  const decisionRecords = "/decision-records";
+  if (url.pathname.endsWith(decisionRecords)) {
+    url.pathname = `${url.pathname.slice(0, -decisionRecords.length)}/${resource}`;
+  } else {
+    url.pathname = `/v1/${resource}`;
+  }
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+function objectValue(value, field) {
+  if (!isRecord(value))
+    throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", `Recorder response data.${field} must be an object`);
+  return value;
+}
+function requiredString2(value, field) {
+  if (typeof value !== "string" || value.trim().length === 0)
+    throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", `Recorder response ${field} must be a non-empty string`);
+  return value;
+}
+function errorDetail(value) {
+  if (!isRecord(value) || !isRecord(value.error))
+    return {};
+  return {
+    ...typeof value.error.code === "string" ? { code: value.error.code } : {},
+    ...typeof value.error.message === "string" ? { message: value.error.message } : {}
+  };
+}
+async function responseJson(response) {
+  const text = await response.text();
+  if (new TextEncoder().encode(text).byteLength > MAX_RESPONSE_BYTES2)
+    throw new RecorderSetupError("PAYLOAD_TOO_LARGE", "Recorder response exceeds the setup limit");
+  if (text.length === 0)
+    return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", "Recorder returned malformed JSON");
+  }
+}
+async function withTimeout(operation, timeoutMs) {
+  const controller = new AbortController;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await operation(controller.signal);
+  } catch (error) {
+    if (error instanceof RecorderSetupError)
+      throw error;
+    if (controller.signal.aborted)
+      throw new RecorderSetupError("RECORDER_UNAVAILABLE", "Recorder setup request timed out");
+    throw new RecorderSetupError("RECORDER_UNAVAILABLE", error instanceof Error ? error.message : String(error));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+class RecorderSetupClient {
+  endpoint;
+  tokenPath;
+  timeoutMs;
+  fetchImpl;
+  constructor(options = {}) {
+    this.endpoint = loopbackEndpoint(options.endpoint ?? process.env.RECORDER_URL ?? DEFAULT_RECORDER_ENDPOINT);
+    this.tokenPath = options.tokenPath ?? process.env.RECORDER_TOKEN_PATH ?? DEFAULT_RECORDER_TOKEN_PATH;
+    this.timeoutMs = positiveTimeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    this.fetchImpl = options.fetchImpl ?? fetch;
+  }
+  async registerRepository(root) {
+    if (typeof root !== "string" || root.trim().length === 0 || !isAbsolute3(root)) {
+      throw new RecorderSetupError("INVALID_RECORD", "repository root must be an absolute path");
+    }
+    const data = await this.post("repositories", { root });
+    const object = objectValue(data, "repository");
+    return {
+      repository_id: requiredString2(object.repository_id, "repository_id"),
+      root: requiredString2(object.root, "root"),
+      created_at: requiredString2(object.created_at, "created_at")
+    };
+  }
+  async registerSession(input) {
+    const validation2 = validateReviewSession(input);
+    if (!validation2.success)
+      throw new RecorderSetupError(validation2.error.code, validation2.error.message);
+    const data = await this.post("sessions", validation2.data);
+    const object = objectValue(data, "session");
+    const agentType = requiredString2(object.agent_type, "agent_type");
+    if (agentType !== "claude-code" && agentType !== "codex")
+      throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", "Recorder response agent_type is invalid");
+    const status = requiredString2(object.status, "status");
+    if (status !== "active" && status !== "completed" && status !== "failed")
+      throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", "Recorder response status is invalid");
+    return {
+      session_id: requiredString2(object.session_id, "session_id"),
+      repository_id: requiredString2(object.repository_id, "repository_id"),
+      agent_type: agentType,
+      started_at: requiredString2(object.started_at, "started_at"),
+      status
+    };
+  }
+  async ensureSession(root, input) {
+    const repository = await this.registerRepository(root);
+    if (repository.root !== root)
+      throw new RecorderSetupError("INVALID_RECORD", "Recorder returned a repository root different from the requested root");
+    if (repository.repository_id !== input.repository_id)
+      throw new RecorderSetupError("INVALID_RECORD", "Recorder returned a repository ID different from the session input");
+    const session = await this.registerSession(input);
+    return { repository, session };
+  }
+  async post(resource, body) {
+    const endpoint = resourceEndpoint(this.endpoint, resource);
+    return withTimeout(async (signal) => {
+      let token;
+      try {
+        token = (await readFile3(this.tokenPath, "utf8")).trim();
+      } catch {
+        throw new RecorderSetupError("UNAUTHORIZED", "Recorder token file could not be read");
+      }
+      if (token.length === 0)
+        throw new RecorderSetupError("UNAUTHORIZED", "Recorder token file is empty");
+      const response = await this.fetchImpl(endpoint, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(body),
+        signal
+      });
+      const parsed = await responseJson(response);
+      if (!response.ok) {
+        const detail = errorDetail(parsed);
+        throw new RecorderSetupError(detail.code ?? "RECORDER_ERROR", detail.message ?? `Recorder returned HTTP ${response.status}`, response.status);
+      }
+      if (!isRecord(parsed) || parsed.success !== true || !("data" in parsed))
+        throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", "Recorder returned an invalid setup success envelope", response.status);
+      return parsed.data;
+    }, this.timeoutMs);
+  }
+}
+
+// plugins/claude-code/src/gate-command.ts
+var MAX_STDIN_BYTES = 1e6;
+function jsonRecord(value, field) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error(`${field} must be an object`);
+  return value;
+}
+async function stdinText() {
+  const content = await new Response(Bun.stdin.stream()).text();
+  if (new TextEncoder().encode(content).byteLength > MAX_STDIN_BYTES)
+    throw new Error("hook input exceeds the command limit");
+  return content;
+}
+function sessionIdFromInput(input) {
+  if (typeof input.session_id === "string" && input.session_id.trim().length > 0)
+    return input.session_id;
+  const value = process.env.AI_REVIEW_SESSION_ID;
+  if (value === undefined || value.trim().length === 0)
+    throw new Error("Claude session id is unavailable; restart the session so the plugin can initialize it");
+  return value;
+}
+function cwdFromInput(input) {
+  const value = process.env.AI_REVIEW_REPOSITORY_ROOT ?? (typeof input.cwd === "string" && input.cwd.trim().length > 0 ? input.cwd : process.cwd());
+  return resolve2(value);
+}
+function filePathFromTool(input) {
+  if (typeof input.tool_input !== "object" || input.tool_input === null || Array.isArray(input.tool_input))
+    return null;
+  const toolInput = input.tool_input;
+  for (const key of ["file_path", "notebook_path", "path"]) {
+    if (typeof toolInput[key] === "string" && toolInput[key].trim().length > 0)
+      return resolve2(toolInput[key]);
+  }
+  return null;
+}
+function shellCommandFromTool(input) {
+  if (typeof input.tool_input !== "object" || input.tool_input === null || Array.isArray(input.tool_input))
+    return null;
+  const command = input.tool_input.command;
+  return typeof command === "string" ? command : null;
+}
+function deny(reason) {
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason
+    }
+  };
+}
+function editReason(path) {
+  return `Code edit blocked for ${path}: record a structured judgment first with ai-review-record. The record must target this file at its current content hash; use the built-in Edit or Write tool after the command succeeds.`;
+}
+async function checkPreToolUse(input, options = {}) {
+  const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
+  if (toolName === "Bash" || toolName === "PowerShell") {
+    const command = shellCommandFromTool(input);
+    if (command === null || !likelyCodeMutation(command))
+      return null;
+    return deny("Shell command blocked because it may edit code. Record a judgment first, then use Edit or Write; arbitrary shell mutation is not accepted by the judgment gate.");
+  }
+  if (toolName !== "Edit" && toolName !== "Write" && toolName !== "NotebookEdit" && toolName !== "MultiEdit")
+    return null;
+  const filePath = filePathFromTool(input);
+  if (filePath === null)
+    return deny("Code edit blocked because the hook could not identify its target path; use Edit or Write with a file path after recording a judgment.");
+  let sessionId;
+  try {
+    sessionId = sessionIdFromInput(input);
+  } catch (error) {
+    return deny(error instanceof Error ? error.message : String(error));
+  }
+  const repositoryRoot = cwdFromInput(input);
+  const permitted = await consumeDecisionPermit({
+    sessionId,
+    repositoryRoot,
+    filePath,
+    gateRoot: options.gateRoot ?? defaultGateRoot()
+  });
+  return permitted ? null : deny(editReason(filePath));
+}
+function shellQuote(value) {
+  return "'" + value.replaceAll("'", `'"'"'`) + "'";
+}
+function repositoryId2(root) {
+  return createHash3("sha256").update(root, "utf8").digest("hex");
+}
+function sessionRegistration(root, sessionId) {
+  return {
+    session_id: sessionId,
+    repository_id: repositoryId2(root),
+    agent_type: "claude-code",
+    started_at: new Date().toISOString(),
+    status: "active"
+  };
+}
+async function handleSessionStart(input, options = {}) {
+  const root = jsonRecord(input, "SessionStart input");
+  const sessionId = typeof root.session_id === "string" ? root.session_id : "";
+  const cwd = typeof root.cwd === "string" ? resolve2(root.cwd) : process.cwd();
+  if (sessionId.trim().length === 0)
+    throw new Error("SessionStart input did not include session_id");
+  const canonicalRoot = await realpath2(cwd).catch(() => cwd);
+  const setupClient = options.setupClient ?? new RecorderSetupClient;
+  let registration;
+  let setupError;
+  try {
+    registration = (await setupClient.ensureSession(canonicalRoot, sessionRegistration(canonicalRoot, sessionId))).session;
+  } catch (error) {
+    setupError = error;
+  }
+  const envFile = options.envFile ?? process.env.CLAUDE_ENV_FILE;
+  if (envFile !== undefined && envFile.trim().length > 0) {
+    await appendFile(envFile, `export AI_REVIEW_SESSION_ID=${shellQuote(sessionId)}
+export AI_REVIEW_REPOSITORY_ROOT=${shellQuote(canonicalRoot)}
+export AI_REVIEW_AGENT_TYPE=claude-code
+`, "utf8");
+  }
+  if (setupError !== undefined)
+    throw setupError;
+  if (registration === undefined)
+    throw new Error("SessionStart registration did not return a session");
+  return registration;
+}
+async function recordDecision(value, options = {}) {
+  const agentType = options.agentType ?? (process.env.AI_REVIEW_AGENT_TYPE === "codex" ? "codex" : "claude-code");
+  const sessionId = options.sessionId ?? process.env.AI_REVIEW_SESSION_ID;
+  const repositoryRoot = options.repositoryRoot ?? process.env.AI_REVIEW_REPOSITORY_ROOT;
+  const event = await normalizeDecisionProposal(value, {
+    ...sessionId === undefined ? {} : { sessionId },
+    ...repositoryRoot === undefined ? {} : { repositoryRoot }
+  });
+  const record = mapHostEvent(agentType, event);
+  const bridge = options.bridge ?? new RecorderBridge;
+  const submitted = await bridge.submit(record);
+  if (!submitted.success) {
+    return {
+      success: false,
+      recordId: record.record_id,
+      ...submitted.status === undefined ? {} : { status: submitted.status },
+      code: submitted.code,
+      message: submitted.message
+    };
+  }
+  const permits = await grantDecisionPermits(event, {
+    recordId: record.record_id,
+    ...options.gateRoot === undefined ? {} : { gateRoot: options.gateRoot }
+  });
+  return { success: true, recordId: record.record_id, status: submitted.status, duplicate: submitted.duplicate, permits: permits.permits };
+}
+async function runPreEditHook() {
+  const result = await checkPreToolUse(JSON.parse(await stdinText()));
+  if (result !== null)
+    process.stdout.write(`${JSON.stringify(result)}
+`);
+}
+async function runRecordCommand() {
+  try {
+    const result = await recordDecision(JSON.parse(await stdinText()));
+    process.stdout.write(`${JSON.stringify(result)}
+`);
+    if (!result.success)
+      process.exitCode = 1;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stdout.write(`${JSON.stringify({ success: false, recordId: "", code: "INVALID_RECORD", message })}
+`);
+    process.exitCode = 1;
+  }
+}
+async function runSessionStartHook() {
+  try {
+    await handleSessionStart(JSON.parse(await stdinText()));
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}
+`);
+    if (!(error instanceof RecorderSetupError))
+      process.exitCode = 1;
+  }
+}
+
 // plugins/claude-code/src/index.ts
 if (import.meta.main) {
-  await runAdapter("claude-code", process.stdin, process.stdout);
+  const command = process.argv[2];
+  if (command === "pre-edit") {
+    await runPreEditHook();
+  } else if (command === "record") {
+    await runRecordCommand();
+  } else if (command === "session-start") {
+    await runSessionStartHook();
+  } else {
+    await runAdapter("claude-code", process.stdin, process.stdout);
+  }
 }
 export {
   runAdapter,
+  recordDecision,
   mapHostEvent,
+  handleSessionStart,
+  checkPreToolUse,
   RecorderBridge
 };

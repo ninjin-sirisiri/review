@@ -6,12 +6,17 @@
     "apps/*",
     "plugins/*"
   ],
+  "bin": {
+    "ai-review": "./bin/ai-review"
+  },
   "scripts": {
     "test": "bun test packages/*/test apps/recorder/test plugins/*/test && bun run --cwd apps/review-ui test",
     "build": "bun build packages/contracts/src/index.ts --outdir dist/contracts",
     "build:claude-plugin": "bun build plugins/claude-code/src/index.ts --target bun --outfile plugins/claude-code/bin/adapter.mjs",
     "dev": "bun --watch apps/recorder/src/index.ts",
     "recorder": "bun apps/recorder/src/index.ts",
+    "ai-review": "./bin/ai-review",
+    "install:command": "bash scripts/install-ai-review.sh",
     "e2e": "bun run --cwd apps/review-ui build && bunx playwright test"
   },
   "devDependencies": {

@@ -60,9 +60,35 @@ contractsのビルド:
 bun run build
 ```
 
+## グローバルコマンド
+
+RecorderとReview UIを、任意のディレクトリから起動できます。
+
+```bash
+bun run install:command
+```
+
+このコマンドは `bin/ai-review` を `~/.local/bin/ai-review` へシンボリックリンクし、必要ならシェル設定へ `~/.local/bin` を追加します。新しいターミナルを開いたあと:
+
+```bash
+ai-review
+```
+
+既定値は次のとおりです。
+
+- データディレクトリ: `~/.ai-code-review-evidence`
+- ポート: `4318`
+- UI: このリポジトリの `apps/review-ui/dist`（未ビルドなら起動時にビルド）
+
+開発用にプロジェクト内へ保存する場合:
+
+```bash
+ai-review --data-dir ./.ai-review --port 4318
+```
+
 ## Recorderの起動
 
-まずReview UIをビルドし、Recorderへ静的UIのルートを渡します。
+リポジトリ直下から直接起動する場合は、先にReview UIをビルドし、Recorderへ静的UIのルートを渡します。
 
 ```bash
 bun run --cwd apps/review-ui build
@@ -308,9 +334,27 @@ claude plugin install ai-code-review-claude@ai-code-review-local --scope local
 claude plugin list
 ```
 
-インストール後は`ai-code-review-claude@ai-code-review-local`が`local` scopeで有効になります。プラグインの`bin`には`ai-review-claude-code`が追加されます。
+インストール後は`ai-code-review-claude@ai-code-review-local`が`local` scopeで有効になります。プラグインの`bin`には`ai-review-claude-code`と`ai-review-record`が追加されます。
 
-現在のプラグインはClaude Codeの全会話を自動収集するhookではありません。Claude Code側のhookまたはイベント接続から、下記のJSONL形式をアダプターへ渡します。これにより、source bodyや会話全文を送らず、構造化された判断だけをRecorderへ記録します。
+プラグインにはClaude Codeの全エージェント共通の判断ゲートを含めています。`SessionStart` hookがセッション識別子を初期化し、`PreToolUse` hookが`Edit`／`Write`（およびノートブック編集）を、対象ファイルの現在hashに一致する判断記録が先にRecorderへ保存されていない限り拒否します。プラグインhookはClaude Codeのsubagentにも適用されます。`Bash`／`PowerShell`の明らかなファイル変更コマンドも、組み込みの`Edit`／`Write`へ戻すよう拒否します。
+
+編集前に、判断対象を指定して一度だけ使えるpermitを発行します。
+
+```bash
+cat <<'JSON' | ai-review-record
+{
+  "targets": [{"path": "src/example.ts", "lineStart": 10, "lineEnd": 24}],
+  "judgment": "この変更は既存の処理を壊さない",
+  "rationale": "既存のバリデーションを経由している",
+  "checks": [{"name": "focused test", "status": "not-run"}],
+  "openQuestions": []
+}
+JSON
+```
+
+出力が`"success":true`になった後だけ`Edit`／`Write`を呼び出します。permitは対象path、現在のcontent hash、セッションに結び付けられ、1回の一致する編集で消費されます。記録失敗、対象hashの変化、別ファイルへの編集、permit期限切れの場合は編集を続けず、記録をやり直してください。`ai-review-record`はコード本文をRecorderへ送らず、現在ファイルのhashだけを計算します。
+
+現在のプラグインはClaude Codeの全会話を自動収集するhookではありません。下記のJSONL入力を`ai-review-claude-code`へ渡す既存のアダプター経路も利用できます。ただし、この経路は判断記録を保存しますが、編集permitは発行しません。編集前の操作には必ず`ai-review-record`を使用します。
 
 ### JSONL入力形式
 
@@ -368,6 +412,201 @@ printf '%s\n' '<JSONL入力>' | ai-review-claude-code
 - retry queueはプロセス内・有限容量で、無期限のoffline queueではない
 - `session`と`repository`は先にRecorderへ登録する
 
+## AI編集前の判断記録セットアップ
+
+この節では、AIが編集する前に判断をRecorderへ保存し、保存済み判断に対応する編集だけを許可する構成を説明します。
+
+### 重要な前提
+
+`repository_id`とtokenを用意するだけでは、編集は自動記録されません。通常の自動化された処理は次の順序です。
+
+```text
+Recorder起動
+  → pluginを有効化してホストを再起動
+  → SessionStartがrepository/sessionを自動登録
+  → AIがai-review-recordを実行
+  → 判断記録をRecorderへ保存
+  → 対象hashに紐づく1回限りの編集permitを発行
+  → Edit／Writeを許可
+```
+
+`SessionStart` hookはrepository IDやtoken自体を生成しませんが、Recorderへrepositoryとsessionを自動登録します。設定される環境変数は次のとおりです。
+
+- `AI_REVIEW_SESSION_ID`
+- `AI_REVIEW_REPOSITORY_ROOT`
+- `AI_REVIEW_AGENT_TYPE`
+
+repository IDはcanonicalなrepository rootのSHA-256です。tokenはRecorderの初回起動時にtoken fileへ生成され、既存tokenがあれば再利用されます。
+
+### 1. Recorderを一度起動
+
+Review UIをビルドしてRecorderを起動します。
+
+```bash
+bun run --cwd apps/review-ui build
+bun run recorder \
+  --data-dir "$HOME/.ai-code-review-evidence" \
+  --port 4318 \
+  --ui-root "$PWD/apps/review-ui/dist"
+```
+
+既存のRecorderを使用する場合は、次のURLを使用します。
+
+```bash
+export RECORDER_URL="http://127.0.0.1:4318/v1/decision-records"
+```
+
+### 2. token pathを確認
+
+標準のtoken pathは次です。
+
+```bash
+export RECORDER_TOKEN_PATH="${RECORDER_TOKEN_PATH:-$HOME/.ai-code-review-evidence/token}"
+test -s "$RECORDER_TOKEN_PATH"
+printf 'token path: %s\n' "$RECORDER_TOKEN_PATH"
+```
+
+token本体をコマンドライン引数やログへ出力しないでください。`--data-dir ./.ai-review`で起動した場合は、次を設定します。
+
+```bash
+export RECORDER_TOKEN_PATH="$PWD/.ai-review/token"
+```
+
+### 3. pluginを一度インストール
+
+Claude Code:
+
+```bash
+bun run build:claude-plugin
+claude plugin validate plugins/claude-code
+claude plugin marketplace add ./
+claude plugin install ai-code-review-claude@ai-code-review-local --scope user
+```
+
+Oh My Pi:
+
+```bash
+omp plugin marketplace add ./
+omp plugin install ai-code-review-claude@ai-code-review-local --scope user
+omp plugin list
+```
+
+次の表示があれば、Oh My Piのuser scopeで有効です。
+
+```text
+ai-code-review-claude@ai-code-review-local (0.2.0) (user)
+```
+
+インストール後はClaude Code／OMPを再起動してください。`omp plugin install ./plugins/claude-code`はnpm/extension packageとして扱われ、`package.json`がないため使用できません。ローカルmarketplace経由でインストールします。
+
+### 4. SessionStartの自動登録
+
+ホストを再起動すると、`SessionStart` hookが次を自動実行します。
+
+1. 現在のrepository rootをcanonical化
+2. Recorderへrepositoryを登録
+3. `AI_REVIEW_SESSION_ID`に対応するsessionを登録
+4. `AI_REVIEW_SESSION_ID`、root、agent typeを環境へ保存
+
+自動登録の確認:
+
+```bash
+printf 'session: %s\n' "$AI_REVIEW_SESSION_ID"
+printf 'root: %s\n' "$AI_REVIEW_REPOSITORY_ROOT"
+printf 'agent: %s\n' "$AI_REVIEW_AGENT_TYPE"
+```
+
+Recorderが停止している場合、SessionStartは警告を出しますが、編集を許可しません。Recorderを起動してホストを再起動するか、手動fallbackを実行してください。
+
+### 5. 手動fallback: repositoryとsessionを登録
+
+OMPがClaude Codeの`CLAUDE_ENV_FILE`互換を提供しない場合や、SessionStartを再実行したい場合は、次の1コマンドを使用します。
+
+```bash
+ai-review setup \
+  --root "$PWD" \
+  --agent-type claude-code
+```
+
+`--session-id`を省略した場合はUUIDを生成します。生成結果は表示されますが、次回hookで同じsessionを使うため、出力されたIDを`AI_REVIEW_SESSION_ID`へexportしてください。token本体は出力されません。
+
+repository IDとsessionをAPIで登録する必要がある場合は、既存のAPIマニュアルにある`POST /v1/repositories`と`POST /v1/sessions`を使用します。
+
+### 6. 編集前に判断を記録
+
+AIが対象ファイルを確認した後、`Edit`または`Write`の前に`ai-review-record`を実行します。
+
+```bash
+cat <<'JSON' | ai-review-record
+{
+  "targets": [
+    {"path": "src/example.ts", "lineStart": 10, "lineEnd": 24}
+  ],
+  "judgment": "この変更は既存の処理を壊さない",
+  "rationale": "既存のバリデーションを経由している",
+  "checks": [
+    {"name": "focused test", "status": "not-run"}
+  ],
+  "openQuestions": []
+}
+JSON
+```
+
+`"success":true`が返った後だけ編集します。コマンドは対象ファイルの現在hashを計算し、判断をRecorderへ保存してから、対象path・hash・sessionに拘束された1回限りのpermitを発行します。
+
+次の場合は編集が拒否されます。
+
+- `ai-review-record`を実行していない
+- Recorderへの保存に失敗した
+- 対象ファイルが記録後に変更された
+- 記録対象と別のファイルを編集した
+- permitを2回以上使用した
+- permitが期限切れになった
+- `Edit`／`Write`をBashの編集コマンドで迂回した
+
+記録失敗時に一時的なallow-listを作ったり、編集後に記録したりしてはいけません。対象を再確認して新しい判断を記録してください。
+
+複数ファイルを編集する場合は、すべての対象pathを`targets`へ含めます。新規ファイルは、存在しない状態で対象pathと`lineStart: 1`を指定します。
+
+### 7. 動作確認
+
+```bash
+printf 'session: %s\n' "$AI_REVIEW_SESSION_ID"
+test -s "$RECORDER_TOKEN_PATH"
+omp plugin list
+```
+
+`ai-review setup`の成功結果には、少なくとも次が含まれます。
+
+```json
+{
+  "success": true,
+  "repositoryId": "<repository_id>",
+  "sessionId": "<session_id>",
+  "root": "<canonical_root>",
+  "agentType": "claude-code",
+  "tokenPath": "<token_path>"
+}
+```
+
+判断記録コマンドの成功結果には、少なくとも次が含まれます。
+
+```json
+{
+  "success": true,
+  "recordId": "<record_id>",
+  "permits": 1
+}
+```
+
+`Edit`／`Write`が`Code edit blocked`になった場合は、Recorderの稼働、token path、pluginの再起動、session IDの一致を順番に確認します。
+
+### 自動記録の範囲
+
+この構成は、AIの判断をhookが勝手に生成して全編集を無条件に記録する仕組みではありません。AIが`ai-review-record`で判断・根拠・対象を明示し、hookがその記録済みpermitを検証してから編集を許可します。
+
+そのため、repository IDとtokenだけを設定しても記録は始まりません。Recorder、repository、session、plugin、`ai-review-record`の5つがそろって初めて編集前記録が機能します。
+
 ## セキュリティとデータ境界
 
 - Recorderは`127.0.0.1`のみで待ち受けます
@@ -392,7 +631,7 @@ printf '%s\n' '<JSONL入力>' | ai-review-claude-code
 
 ### `REPOSITORY_NOT_REGISTERED`またはsessionエラー
 
-判断記録の前に、リポジトリとsessionをRecorderへ登録してください。アダプターは自動で登録しません。
+SessionStartの自動登録または`ai-review setup`を実行してください。アダプターは判断記録を保存しますが、登録前のsession/repositoryを推測して作成しません。
 
 ### `hash-mismatch`
 
