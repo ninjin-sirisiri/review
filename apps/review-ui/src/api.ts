@@ -3,6 +3,7 @@ import type {
   ApiResponse,
   CheckEvidence,
   DecisionRecord,
+  FileDiff,
   RevisionRef,
   TargetReference,
   UserDisposition,
@@ -15,6 +16,7 @@ export type DecisionRecordSummary = Pick<
   | "repository_id"
   | "agent_type"
   | "revision"
+  | "targets"
   | "judgment"
   | "created_at"
   | "user_disposition"
@@ -213,6 +215,25 @@ export class ReviewApi {
     return this.request<RegisteredRepositorySummary[]>("/v1/repositories");
   }
 
+  listRepositoryFiles(repositoryId: string): Promise<{ repository_id: string; paths: string[] }> {
+    const normalizedRepositoryId = repositoryId.trim();
+    if (normalizedRepositoryId.length === 0) {
+      return Promise.reject(new ReviewApiError("Repository ID is required", { status: 422, code: "INVALID_RECORD" }));
+    }
+    return this.request<{ repository_id: string; paths: string[] }>(
+      `/v1/repositories/${encodeURIComponent(normalizedRepositoryId)}/files`,
+    );
+  }
+
+  getFileDiff(repositoryId: string, path: string, base = "HEAD"): Promise<FileDiff> {
+    const normalizedRepositoryId = repositoryId.trim();
+    if (normalizedRepositoryId.length === 0) {
+      return Promise.reject(new ReviewApiError("Repository ID is required", { status: 422, code: "INVALID_RECORD" }));
+    }
+    const params = new URLSearchParams({ path, base });
+    return this.request<FileDiff>(`/v1/repositories/${encodeURIComponent(normalizedRepositoryId)}/diff?${params.toString()}`);
+  }
+
   getDecision(recordId: string): Promise<DecisionRecordDetail> {
     const normalizedRecordId = recordId.trim();
     if (normalizedRecordId.length === 0) {
@@ -236,5 +257,5 @@ export class ReviewApi {
   }
 }
 
-export type { CheckEvidence, DecisionRecord, TargetReference, UserDisposition };
+export type { CheckEvidence, DecisionRecord, FileDiff, TargetReference, UserDisposition };
 export type ApiEnvelope<T> = ApiResponse<T>;

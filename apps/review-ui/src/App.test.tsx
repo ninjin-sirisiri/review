@@ -10,6 +10,7 @@ function summary(recordId: string, judgment: string): DecisionRecordSummary {
     repository_id: "repo-1",
     agent_type: "codex",
     revision: { kind: "commit", sha: "abc123" },
+    targets: [],
     judgment,
     created_at: "2026-08-20T10:00:00.000Z",
     user_disposition: "unreviewed",

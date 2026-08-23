@@ -78,4 +78,54 @@ describe("ReviewApi", () => {
     );
     expect(fetchImpl).toHaveBeenNthCalledWith(2, "/v1/decision-records/record-1", expect.anything());
   });
+
+  it("lists repository files under the owner bearer token", async () => {
+    const fetchImpl = vi.fn(async () =>
+      response({ success: true, data: { repository_id: "repo-1", paths: ["src/a.ts", "src/b.ts"] } }),
+    );
+    const api = new ReviewApi("owner-token", { fetchImpl });
+
+    const files = await api.listRepositoryFiles("repo-1");
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "/v1/repositories/repo-1/files",
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer owner-token" }) }),
+    );
+    expect(files).toEqual({ repository_id: "repo-1", paths: ["src/a.ts", "src/b.ts"] });
+  });
+
+  it("fetches a structured path diff with an explicit base", async () => {
+    const fileDiff = { path: "src/a.ts", base_sha: "abc", hunks: [], old_missing: false, new_missing: false, binary: false };
+    const fetchImpl = vi.fn(async () => response({ success: true, data: fileDiff }));
+    const api = new ReviewApi("owner-token", { fetchImpl });
+
+    const diff = await api.getFileDiff("repo-1", "src/a.ts", "abc");
+    expect(diff).toEqual(fileDiff);
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      1,
+      "/v1/repositories/repo-1/diff?path=src%2Fa.ts&base=abc",
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer owner-token" }) }),
+    );
+
+    await api.getFileDiff("repo-1", "src/a.ts");
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      2,
+      "/v1/repositories/repo-1/diff?path=src%2Fa.ts&base=HEAD",
+      expect.anything(),
+    );
+
+    await expect(api.getFileDiff("  ", "src/a.ts")).rejects.toMatchObject({ name: "ReviewApiError", code: "INVALID_RECORD" });
+  });
+
+  it("propagates diff endpoint error envelopes", async () => {
+    const api = new ReviewApi("owner-token", {
+      fetchImpl: async () => response({ success: false, error: { code: "PAYLOAD_TOO_LARGE", message: "source exceeds the limit" } }, 413),
+    });
+
+    await expect(api.getFileDiff("repo-1", "src/a.ts")).rejects.toMatchObject({
+      name: "ReviewApiError",
+      code: "PAYLOAD_TOO_LARGE",
+      status: 413,
+    });
+  });
 });
