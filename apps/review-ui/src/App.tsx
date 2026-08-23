@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { useState } from "react";
 import {
   ReviewApi,
   ReviewApiError,
@@ -7,6 +7,7 @@ import {
   type RegisteredRepositorySummary,
   type UserDisposition,
 } from "./api";
+import { BootstrapScreen } from "./components/BootstrapScreen";
 import { DecisionDetail } from "./components/DecisionDetail";
 import { DecisionList } from "./components/DecisionList";
 import "./styles.css";
@@ -36,8 +37,8 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function handleSubmit() {
+    setError(null);
     const token = tokenInput.trim();
     if (token.length === 0) {
       setError("Owner bearer token is required.");
@@ -123,59 +124,17 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   }
 
   if (api === null || repositoryId === null) {
-    const pickingRepository = repositories !== null;
     return (
-      <main className="app-shell app-shell--bootstrap">
-        <section className="bootstrap-card" aria-labelledby="bootstrap-heading">
-          <p className="eyebrow">Local review evidence</p>
-          <h1 id="bootstrap-heading">Review decisions with their source</h1>
-          <p>Enter the owner token from Recorder and pick one of its registered repositories. The token stays in this browser tab's memory and is never written to storage or included in a URL.</p>
-          <form onSubmit={handleSubmit}>
-            <fieldset>
-              <legend>Recorder connection</legend>
-              <label htmlFor="owner-token">Owner bearer token</label>
-              <input
-                id="owner-token"
-                name="owner-token"
-                type="password"
-                autoComplete="off"
-                value={tokenInput}
-                onChange={(event) => setTokenInput(event.target.value)}
-                required
-              />
-              {pickingRepository && (
-                <>
-                  <label htmlFor="repository">Repository</label>
-                  <select
-                    id="repository"
-                    name="repository"
-                    value={selectedRepositoryId}
-                    onChange={(event) => setSelectedRepositoryId(event.target.value)}
-                    required
-                  >
-                    <option value="" disabled>Select a repository…</option>
-                    {repositories.map((candidate) => (
-                      <option key={candidate.repository_id} value={candidate.repository_id}>
-                        {candidate.root}
-                      </option>
-                    ))}
-                  </select>
-                </>
-              )}
-            </fieldset>
-            {error !== null && <p className="inline-error" role="alert">{error}</p>}
-            <button type="submit" disabled={isLoading}>
-              {isLoading
-                ? pickingRepository
-                  ? "Opening…"
-                  : "Connecting…"
-                : pickingRepository
-                  ? "Open review timeline"
-                  : "Load repositories"}
-            </button>
-          </form>
-        </section>
-      </main>
+      <BootstrapScreen
+        tokenInput={tokenInput}
+        onTokenChange={setTokenInput}
+        repositories={repositories}
+        selectedRepositoryId={selectedRepositoryId}
+        onRepositoryChange={setSelectedRepositoryId}
+        isLoading={isLoading}
+        error={error}
+        onSubmit={() => void handleSubmit()}
+      />
     );
   }
 
