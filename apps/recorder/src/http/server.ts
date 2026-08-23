@@ -444,6 +444,25 @@ async function handleRequest(
       return success(await registry.list());
     }
 
+    if (request.method === "GET" && parts.length === 3 && parts[0] === "repositories" && parts[2] === "files") {
+      const repository = await registry.get(parts[1] ?? "");
+      if (repository === null) return failure(ERROR_CODES.REPOSITORY_NOT_REGISTERED, "repository is not registered", 404);
+      const paths = await resolver.git.listWorktreeFiles(repository.root);
+      paths.sort();
+      return success({ repository_id: repository.repository_id, paths });
+    }
+
+    if (request.method === "GET" && parts.length === 3 && parts[0] === "repositories" && parts[2] === "diff") {
+      const repository = await registry.get(parts[1] ?? "");
+      if (repository === null) return failure(ERROR_CODES.REPOSITORY_NOT_REGISTERED, "repository is not registered", 404);
+      const pathParam = url.searchParams.get("path");
+      if (pathParam === null || pathParam.trim().length === 0) return failure(ERROR_CODES.INVALID_RECORD, "path query parameter is required", 422, "path");
+      await registry.assertTarget(repository.repository_id, pathParam);
+      const base = url.searchParams.get("base") ?? "HEAD";
+      const baseSha = await resolver.git.resolveRevision(repository.root, base);
+      return success(await resolver.git.readPathDiff(repository.root, baseSha, pathParam));
+    }
+
     if (request.method === "PATCH" && parts.length === 3 && parts[0] === "decision-records" && parts[2] === "disposition") {
       const contentError = requireJsonContentType(request);
       if (contentError) return contentError;

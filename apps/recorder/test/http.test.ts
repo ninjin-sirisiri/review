@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -7,6 +8,7 @@ import type { DecisionRecordInput, ReviewSession } from "../../../packages/contr
 import { createRecorderConfig } from "../src/config";
 import { createRecorderServer, type RecorderServer } from "../src/http/server";
 import { ensureOwnerToken, readOwnerToken } from "../src/auth/token";
+import { RecordStore } from "../src/store/records";
 
 const temporaryDirectories: string[] = [];
 let app: RecorderServer;
@@ -23,6 +25,12 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
 
 async function json<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
+}
+
+async function runGit(args: string[]): Promise<void> {
+  const child = spawn("git", args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+  const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
+  if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed`);
 }
 
 function body(recordId = "record-1", sessionId = "session-1", targetPath = "src/example.ts"): DecisionRecordInput {
@@ -377,5 +385,106 @@ describe("authenticated local Recorder HTTP API", () => {
     expect(app.server.hostname).toBe("127.0.0.1");
     expect((await stat(app.config.tokenPath)).mode & 0o777).toBe(0o600);
     expect((await readFile(app.config.tokenPath, "utf8")).trim()).toBe(token);
+  });
+
+  test("lists tracked repository files for the explorer", async () => {
+    await runGit(["init", "--quiet"]);
+    await runGit(["config", "user.email", "fixture@example.test"]);
+    await runGit(["config", "user.name", "Fixture"]);
+    await runGit(["add", "--", "src/example.ts", "src/other.ts"]);
+    await runGit(["commit", "--quiet", "-m", "tracked"]);
+    await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root, repository_id: "repo-1" }) });
+
+    const unauthorized = await fetch(`${app.server.url}/v1/repositories/repo-1/files`);
+    expect(unauthorized.status).toBe(401);
+
+    const response = await request("/v1/repositories/repo-1/files");
+    expect(response.status).toBe(200);
+    expect(await json<{ success: true; data: { repository_id: string; paths: string[] } }>(response)).toEqual({
+      success: true,
+      data: { repository_id: "repo-1", paths: ["src/example.ts", "src/other.ts"] },
+    });
+
+    const unregistered = await request("/v1/repositories/repo-missing/files");
+    expect(unregistered.status).toBe(404);
+    expect(await json<{ success: false; error: { code: string } }>(unregistered)).toMatchObject({ success: false, error: { code: "REPOSITORY_NOT_REGISTERED" } });
+  });
+
+  test("returns a structured path diff against the recorded revision or HEAD", async () => {
+    await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root, repository_id: "repo-1" }) });
+    await writeFile(join(root, "src", "example.ts"), "first source\nsecond line\n", "utf8");
+    await runGit(["init", "--quiet"]);
+    await runGit(["config", "user.email", "fixture@example.test"]);
+    await runGit(["config", "user.name", "Fixture"]);
+    await runGit(["add", "--", "src/example.ts"]);
+    await runGit(["commit", "--quiet", "-m", "base"]);
+    const baseSha = await new Promise<string>((resolve, reject) => {
+      const child = spawn("git", ["rev-parse", "HEAD"], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      child.once("exit", (code) => (code === 0 ? resolve(stdout.trim()) : reject(new Error("rev-parse failed"))));
+    });
+    // Restore the pre-commit working-tree content so both diff sides exist.
+    await writeFile(join(root, "src", "example.ts"), "changed source\n", "utf8");
+    const response = await request(`/v1/repositories/repo-1/diff?path=${encodeURIComponent("src/example.ts")}&base=${baseSha}`);
+    expect(response.status).toBe(200);
+    const payload = await json<{ success: true; data: { path: string; base_sha: string; binary: boolean; hunks: Array<{ lines: Array<{ type: string; oldLine: number | null; newLine: number | null; content: string }> }> } }>(response);
+    expect(payload.success).toBe(true);
+    expect(payload.data.path).toBe("src/example.ts");
+    expect(payload.data.base_sha).toBe(baseSha);
+    expect(payload.data.binary).toBe(false);
+    const lines = payload.data.hunks[0]!.lines;
+    expect(lines.find((line) => line.type === "del")?.content).toBe("first source");
+    expect(lines.find((line) => line.type === "add")?.content).toBe("changed source");
+
+    const headResponse = await request(`/v1/repositories/repo-1/diff?path=${encodeURIComponent("src/example.ts")}`);
+    expect(headResponse.status).toBe(200);
+
+    const missingPath = await request(`/v1/repositories/repo-1/diff`);
+    expect(missingPath.status).toBe(422);
+
+    const outside = await request(`/v1/repositories/repo-1/diff?path=${encodeURIComponent("../outside.ts")}`);
+    expect(outside.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(outside)).toMatchObject({ success: false, error: { code: "PATH_OUTSIDE_ROOT" } });
+
+    const badRevision = await request(`/v1/repositories/repo-1/diff?path=${encodeURIComponent("src/example.ts")}&base=$(touch /tmp/pwned)`);
+    expect(badRevision.status).toBe(404);
+    expect(await json<{ success: false; error: { code: string } }>(badRevision)).toMatchObject({ success: false, error: { code: "REVISION_NOT_FOUND" } });
+
+    const unregistered = await request(`/v1/repositories/repo-missing/diff?path=src/example.ts`);
+    expect(unregistered.status).toBe(404);
+  });
+
+  test("rejects oversized working-tree sources on the diff endpoint with 413", async () => {
+    const limitedDataDir = await mkdtemp(join(tmpdir(), "ai-review-http-diff-limit-"));
+    temporaryDirectories.push(limitedDataDir);
+    const limitedRoot = await mkdtemp(join(tmpdir(), "ai-review-http-diff-root-"));
+    temporaryDirectories.push(limitedRoot);
+    const limitedUi = await mkdtemp(join(tmpdir(), "ai-review-http-diff-ui-"));
+    temporaryDirectories.push(limitedUi);
+    await mkdir(join(limitedRoot, "src"), { recursive: true });
+    await writeFile(join(limitedRoot, "src", "example.ts"), "x".repeat(64), "utf8");
+    // A maxSourceBytes-limited server cannot register repositories via POST /v1/repositories:
+    // discoverGitTopLevel bounds `git rev-parse --show-toplevel` output at the source limit and any
+    // canonical root path exceeds it, so registration itself fails with PAYLOAD_TOO_LARGE before the
+    // diff route runs. Seed the row through RecordStore so the request exercises the diff route's
+    // own PAYLOAD_TOO_LARGE mapping.
+    const seedStore = new RecordStore(createRecorderConfig({ dataDir: limitedDataDir }));
+    await seedStore.createRepository({ repository_id: "limited-repo", root: await realpath(limitedRoot) });
+    seedStore.close();
+    const limitedApp = await createRecorderServer({
+      config: createRecorderConfig({ dataDir: limitedDataDir, port: 0, maxSourceBytes: 16 }),
+      uiRoot: limitedUi,
+      port: 0,
+    });
+    try {
+      const limitedToken = await readOwnerToken(limitedApp.config);
+      const limitedHeaders = new Headers({ Authorization: `Bearer ${limitedToken}` });
+      const response = await fetch(`${limitedApp.server.url}/v1/repositories/limited-repo/diff?path=src/example.ts`, { headers: limitedHeaders });
+      expect(response.status).toBe(413);
+      expect(await response.json()).toMatchObject({ success: false, error: { code: "PAYLOAD_TOO_LARGE" } });
+    } finally {
+      await limitedApp.stop();
+    }
   });
 });
