@@ -476,4 +476,78 @@ describe("source resolution", () => {
     await expect(new GitReader(8).readCommitFile(context.fixture.root, context.fixture.commitSha, context.fixture.path)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
     context.store.close();
   });
+
+  test("readPathDiff returns structured hunks with exact old and new line numbers", async () => {
+    const context = await createResolverFixture();
+    const diff = await new GitReader().readPathDiff(context.fixture.root, context.fixture.commitSha, context.fixture.path);
+
+    expect(diff.path).toBe("src/example.ts");
+    expect(diff.base_sha).toBe(context.fixture.commitSha);
+    expect(diff.old_missing).toBe(false);
+    expect(diff.new_missing).toBe(false);
+    expect(diff.binary).toBe(false);
+    expect(diff.hunks).toHaveLength(1);
+    expect(diff.hunks[0]!.oldStart).toBe(1);
+    expect(diff.hunks[0]!.newStart).toBe(1);
+    const lines = diff.hunks[0]!.lines;
+    expect(lines.find((line) => line.type === "del")).toEqual({ type: "del", oldLine: 1, newLine: null, content: "export const version = 1;" });
+    expect(lines.find((line) => line.type === "add")).toEqual({ type: "add", oldLine: null, newLine: 1, content: "export const version = 2;" });
+    expect(lines.filter((line) => line.type === "context")).toContainEqual({ type: "context", oldLine: 2, newLine: 2, content: "" });
+    context.store.close();
+  });
+
+  test("readPathDiff marks created and deleted files with missing sides", async () => {
+    const context = await createResolverFixture();
+    await writeFile(join(context.fixture.root, "src/added.ts"), "brand new\n", "utf8");
+
+    const created = await new GitReader().readPathDiff(context.fixture.root, context.fixture.commitSha, "src/added.ts");
+    expect(created.old_missing).toBe(true);
+    expect(created.new_missing).toBe(false);
+    expect(created.hunks[0]!.lines.every((line) => line.type === "add")).toBe(true);
+
+    await rm(join(context.fixture.root, context.fixture.path), { force: true });
+    const deleted = await new GitReader().readPathDiff(context.fixture.root, context.fixture.commitSha, context.fixture.path);
+    expect(deleted.new_missing).toBe(true);
+    expect(deleted.old_missing).toBe(false);
+    expect(deleted.hunks[0]!.lines.every((line) => line.type === "del")).toBe(true);
+    context.store.close();
+  });
+
+  test("readPathDiff reports binary content without hunks", async () => {
+    const context = await createResolverFixture();
+    const binaryPath = "src/blob.bin";
+    await writeFile(join(context.fixture.root, binaryPath), Buffer.from([0x00, 0x01, 0x02]), "utf8");
+
+    const diff = await new GitReader().readPathDiff(context.fixture.root, context.fixture.commitSha, binaryPath);
+
+    expect(diff.binary).toBe(true);
+    expect(diff.hunks).toHaveLength(0);
+    expect(diff.old_missing).toBe(true);
+    expect(diff.new_missing).toBe(false);
+    context.store.close();
+  });
+
+  test("resolveRevision normalizes HEAD and rejects unsafe or absent revisions", async () => {
+    const context = await createResolverFixture();
+    const git = new GitReader();
+
+    expect(await git.resolveRevision(context.fixture.root, "HEAD")).toBe(context.fixture.commitSha);
+    expect(await git.resolveRevision(context.fixture.root, context.fixture.commitSha)).toBe(context.fixture.commitSha);
+    await expect(git.resolveRevision(context.fixture.root, "../escape")).rejects.toMatchObject({ code: "REVISION_NOT_FOUND" });
+    await expect(git.resolveRevision(context.fixture.root, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")).rejects.toMatchObject({ code: "REVISION_NOT_FOUND" });
+
+    const emptyRoot = await mkdtemp(join(tmpdir(), "ai-review-source-empty-repo-"));
+    temporaryDirectories.push(emptyRoot);
+    await runGit(emptyRoot, ["init", "--quiet"]);
+    await expect(git.resolveRevision(emptyRoot, "HEAD")).rejects.toMatchObject({ code: "REVISION_NOT_FOUND" });
+    context.store.close();
+  });
+
+  test("lists tracked working-tree files as a public read-only operation", async () => {
+    const context = await createResolverFixture();
+    const paths = await new GitReader().listWorktreeFiles(context.fixture.root);
+    expect(paths).toContain("src/example.ts");
+    expect(paths.every((path) => !path.startsWith("/"))).toBe(true);
+    context.store.close();
+  });
 });

@@ -3,6 +3,7 @@ import {
   ERROR_CODES,
   type ErrorCode,
 } from "../../../../packages/contracts/src/index";
+import type { FileDiff, DiffHunk, DiffLine } from "../../../../packages/contracts/src/index";
 import { normalizeSourcePath, SourceResolutionError } from "../repositories/registry";
 import {
   WorkingTreePathMissingError,
@@ -153,11 +154,7 @@ function lineDiff(previous: string[], current: string[], maxWork: number): DiffO
   return null;
 }
 
-function buildTextDiff(path: string, previous: string, current: string, maxWork: number): string {
-  const operations = lineDiff(previous.split("\n"), current.split("\n"), maxWork);
-  if (operations === null) {
-    throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git diff work exceeds the configured source limit");
-  }
+function toEntries(operations: DiffOperation[]): DiffEntry[] {
   const entries: DiffEntry[] = [];
   let oldLine = 0;
   let newLine = 0;
@@ -172,10 +169,19 @@ function buildTextDiff(path: string, previous: string, current: string, maxWork:
     if (operation.kind !== "insert") oldLine += 1;
     if (operation.kind !== "delete") newLine += 1;
   }
-  const changes = entries.flatMap((entry, index) => (entry.operation.kind === "equal" ? [] : [index]));
-  if (changes.length === 0) return "";
+  return entries;
+}
 
-  const hunks: string[] = [];
+interface GroupedHunk {
+  oldStart: number;
+  newStart: number;
+  entries: DiffEntry[];
+}
+
+function groupHunks(entries: DiffEntry[]): GroupedHunk[] {
+  const changes = entries.flatMap((entry, index) => (entry.operation.kind === "equal" ? [] : [index]));
+  if (changes.length === 0) return [];
+  const ranges: Array<{ start: number; end: number }> = [];
   let start = Math.max(0, changes[0]! - 3);
   let end = Math.min(entries.length - 1, changes[0]! + 3);
   for (let change = 1; change < changes.length; change += 1) {
@@ -185,25 +191,40 @@ function buildTextDiff(path: string, previous: string, current: string, maxWork:
       end = Math.max(end, nextEnd);
       continue;
     }
-    hunks.push(formatHunk(entries, start, end));
+    ranges.push({ start, end });
     start = nextStart;
     end = nextEnd;
   }
-  hunks.push(formatHunk(entries, start, end));
-  return `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n${hunks.join("")}`;
+  ranges.push({ start, end });
+  return ranges.map(({ start, end }) => {
+    const hunkEntries = entries.slice(start, end + 1);
+    const first = hunkEntries[0]!;
+    return {
+      oldStart: first.oldLine ?? first.oldBefore + 1,
+      newStart: first.newLine ?? first.newBefore + 1,
+      entries: hunkEntries,
+    };
+  });
 }
 
-function formatHunk(entries: DiffEntry[], start: number, end: number): string {
-  const hunkEntries = entries.slice(start, end + 1);
-  const first = hunkEntries[0]!;
-  const oldStart = first.oldLine ?? first.oldBefore + 1;
-  const newStart = first.newLine ?? first.newBefore + 1;
-  const oldCount = hunkEntries.filter((entry) => entry.oldLine !== null).length;
-  const newCount = hunkEntries.filter((entry) => entry.newLine !== null).length;
-  const body = hunkEntries
+function formatHunk(hunk: GroupedHunk): string {
+  const oldCount = hunk.entries.filter((entry) => entry.oldLine !== null).length;
+  const newCount = hunk.entries.filter((entry) => entry.newLine !== null).length;
+  const body = hunk.entries
     .map((entry) => `${entry.operation.kind === "equal" ? " " : entry.operation.kind === "delete" ? "-" : "+"}${entry.operation.line}`)
     .join("\n");
-  return `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@\n${body}\n`;
+  return `@@ -${hunk.oldStart},${oldCount} +${hunk.newStart},${newCount} @@\n${body}\n`;
+}
+
+function buildTextDiff(path: string, previous: string, current: string, maxWork: number): string {
+  const operations = lineDiff(previous.split("\n"), current.split("\n"), maxWork);
+  if (operations === null) {
+    throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git diff work exceeds the configured source limit");
+  }
+  const grouped = groupHunks(toEntries(operations));
+  if (grouped.length === 0) return "";
+  const hunks = grouped.map((hunk) => formatHunk(hunk));
+  return `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n${hunks.join("")}`;
 }
 
 
@@ -306,7 +327,7 @@ export class GitReader {
       .map((path) => validateEnumeratedPath(root, path));
   }
 
-  private async listWorktreePaths(root: string): Promise<string[]> {
+  async listWorktreeFiles(root: string): Promise<string[]> {
     const result = await this.execute(root, ["ls-files", "-z"]);
     if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git worktree metadata exceeds the configured source limit");
     if (result.exitCode !== 0) throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git worktree files cannot be listed");
@@ -332,10 +353,64 @@ export class GitReader {
     return this.readCommitBlob(root, sha, normalizedPath);
   }
 
+  async resolveRevision(root: string, base: string): Promise<string> {
+    await this.verifyRepository(root);
+    if (base !== "HEAD" && !isSafeRevision(base)) {
+      throw new GitReaderError(ERROR_CODES.REVISION_NOT_FOUND, "revision is not an allowed commit reference");
+    }
+    const result = await this.execute(root, ["rev-parse", `${base}^{commit}`]);
+    if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git metadata exceeds the configured source limit");
+    if (result.exitCode !== 0) throw new GitReaderError(ERROR_CODES.REVISION_NOT_FOUND, "revision was not found");
+    return result.stdout.trim();
+  }
+
+  async readPathDiff(root: string, sha: string, relativePath: string): Promise<FileDiff> {
+    const normalizedPath = normalizeSourcePath(relativePath);
+    await this.verifyRepository(root);
+    await this.verifyRevision(root, sha);
+    const treePaths = new Set(await this.listTreePaths(root, sha));
+    let previous = "";
+    let oldMissing = true;
+    if (treePaths.has(normalizedPath)) {
+      previous = await this.readCommitBlob(root, sha, normalizedPath);
+      oldMissing = false;
+    }
+    let current = "";
+    let newMissing = true;
+    try {
+      current = (await new WorkingTreeReader(this.maxBytes).readEnumeratedFile(root, normalizedPath)).content;
+      newMissing = false;
+    } catch (error) {
+      if (!(error instanceof WorkingTreePathMissingError)) throw error;
+      current = "";
+    }
+    const binary = previous.includes("\0") || current.includes("\0");
+    if (binary) {
+      return { path: normalizedPath, base_sha: sha, hunks: [], old_missing: oldMissing, new_missing: newMissing, binary: true };
+    }
+    const previousLines = previous === "" ? [] : previous.split("\n");
+    const currentLines = current === "" ? [] : current.split("\n");
+    const operations = lineDiff(previousLines, currentLines, this.maxDiffWork);
+    if (operations === null) {
+      throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git diff work exceeds the configured source limit");
+    }
+    const hunks: DiffHunk[] = groupHunks(toEntries(operations)).map((hunk) => ({
+      oldStart: hunk.oldStart,
+      newStart: hunk.newStart,
+      lines: hunk.entries.map((entry): DiffLine => ({
+        type: entry.operation.kind === "equal" ? "context" : entry.operation.kind === "delete" ? "del" : "add",
+        oldLine: entry.oldLine,
+        newLine: entry.newLine,
+        content: entry.operation.line,
+      })),
+    }));
+    return { path: normalizedPath, base_sha: sha, hunks, old_missing: oldMissing, new_missing: newMissing, binary: false };
+  }
+
   async readDiff(root: string, sha: string): Promise<string> {
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
-    const [treePaths, worktreePaths] = await Promise.all([this.listTreePaths(root, sha), this.listWorktreePaths(root)]);
+    const [treePaths, worktreePaths] = await Promise.all([this.listTreePaths(root, sha), this.listWorktreeFiles(root)]);
     const treePathSet = new Set(treePaths);
     const worktreePathSet = new Set(worktreePaths);
     const paths = new Set([...treePaths, ...worktreePaths]);
