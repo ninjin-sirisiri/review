@@ -279,8 +279,12 @@ test("renders source text as text and never evaluates markup", async ({ page }) 
 
   await page.goto(app.url);
   await page.getByLabel("Owner bearer token").fill(token);
-  await page.getByLabel("Repository ID").fill(xssRepositoryId);
+  // BootstrapScreenは2段階送信:最初の送信でリポジトリ一覧をロードしてからRepositoryセレクトが現れる
+  await page.getByRole("button", { name: "Load repositories" }).click();
+  await page.getByLabel("Repository").selectOption(xssRepositoryId);
   await page.getByRole("button", { name: "Open review timeline" }).click();
+  // ソース本文はdiffペインがファイルを開いてから表示する(§6.2.6)
+  await page.getByRole("button", { name: /unsafe\.ts/ }).click();
   await expect(page.getByText(payload.trim(), { exact: true })).toBeVisible();
   expect(await page.evaluate(() => (window as Window & { __reviewXss?: boolean }).__reviewXss)).toBeUndefined();
   expect(await page.locator("script").count()).toBe(1);

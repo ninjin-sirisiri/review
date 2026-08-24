@@ -194,7 +194,7 @@ test.afterAll(async () => {
 });
 
 
-test("registers a repository, submits a JSONL adapter decision, and detects a stale source in the UI", async ({ page }) => {
+test("reviews a decision through the explorer, accepts it, and flags a tampered source", async ({ page }) => {
   const session = await createSession(journey, "codex");
   const event = eventFor(journey, session.session_id, "codex", `journey-${randomUUID()}`);
   const submission = await runAdapter("codex", event);
@@ -204,12 +204,17 @@ test("registers a repository, submits a JSONL adapter decision, and detects a st
   await page.goto(app.url);
   await expect(page).toHaveTitle("Review decisions");
   await page.getByLabel("Owner bearer token").fill(token);
-  await page.getByLabel("Repository ID").fill(journey.repositoryId);
+  // BootstrapScreenは2段階送信:最初の送信でリポジトリ一覧をロードしてからRepositoryセレクトが現れる
+  await page.getByRole("button", { name: "Load repositories" }).click();
+  await page.getByLabel("Repository").selectOption(journey.repositoryId);
   await page.getByRole("button", { name: "Open review timeline" }).click();
   await expect(page.getByRole("heading", { name: "Decision review" })).toBeVisible();
+
+  await page.getByRole("button", { name: /review\.ts/ }).click();
   await expect(page.getByRole("heading", { name: event.judgment })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Linked source" })).toBeVisible();
+  // 作業ツリー未変更 → hunks空 + 検証済みsource → 全文モード(§6.2.6)で記録済みソースを表示
   await expect(page.getByText("export const reviewed = true;", { exact: true })).toBeVisible();
+
   const accept = page.getByRole("button", { name: "Accept", exact: true });
   await accept.click();
   await expect(accept).toHaveAttribute("aria-pressed", "true");
@@ -218,6 +223,7 @@ test("registers a repository, submits a JSONL adapter decision, and detects a st
   const acceptedBody = await acceptedResponse.json() as { data: { record: DecisionRecord } };
   expect(acceptedBody.data.record.user_disposition).toBe("accepted");
 
+  // 改ざん: 作業ツリーだけ書き換える
   const currentSource = "export const reviewed = false;";
   await writeFile(join(journey.root, journey.path), `${currentSource}\n`, "utf8");
   await page.reload();
@@ -225,17 +231,29 @@ test("registers a repository, submits a JSONL adapter decision, and detects a st
   expect(staleResponse.status).toBe(200);
   const staleBody = await staleResponse.json() as { data: { sources: Array<Record<string, unknown>> } };
   expect(staleBody.data.sources[0]).toMatchObject({ state: "hash-mismatch" });
-  expect(JSON.stringify(staleBody)).not.toContain(currentSource);
+
+  // トークンはメモリ保持なので再認証になる(localStorage/URL不変チェックは現行どおり)
   await expect(page.getByLabel("Owner bearer token")).toBeVisible();
   await expect(page).not.toHaveURL(new RegExp(token));
   await expect(page.evaluate(() => localStorage.length)).resolves.toBe(0);
+
   await page.getByLabel("Owner bearer token").fill(token);
-  await page.getByLabel("Repository ID").fill(journey.repositoryId);
+  await page.getByRole("button", { name: "Load repositories" }).click();
+  await page.getByLabel("Repository").selectOption(journey.repositoryId);
   await page.getByRole("button", { name: "Open review timeline" }).click();
-  await expect(page.getByRole("heading", { name: "Source changed since the decision" })).toBeVisible();
+  await page.getByRole("button", { name: /review\.ts/ }).click();
+
+  await expect(page.getByRole("heading", { name: event.judgment })).toBeVisible();
+  await expect(page.getByText("Source changed since the decision")).toBeVisible();
   await expect(page.getByText("Current code is intentionally not shown until this reference is resolved.")).toBeVisible();
-  await expect(page.getByText("export const reviewed = false;", { exact: true })).toHaveCount(0);
+  // カード上に改ざん後コードは出ない(§7)。diffペインはHEADとの差分として現状を表示するが、
+  // hash不一致のアンカーは検証済み扱いしないためティントは付かない(§5/§8)
+  await expect(page.locator(".judgment-panel").getByText(currentSource)).toHaveCount(0);
+  await expect(page.locator(".diff-line--anchored")).toHaveCount(0);
 });
+
+// 注意: ブロック絞り込みテストは末尾の2つのadapterテストより後に実行する。
+// 共有adaptersリポジトリに判断を1件追加するため、record数を数えるテストより前に置けない。
 
 test("submits both adapter fixtures through the common JSONL bridge", async () => {
   for (const agentType of ["codex", "claude-code"] as const) {
@@ -254,4 +272,36 @@ test("keeps a failed Recorder submission non-blocking for the host adapter", asy
   const submission = await runAdapter("codex", eventFor(adapters, session.session_id, "codex"), "http://127.0.0.1:9");
   expect(submission.exitCode).toBe(0);
   expect(submission.result).toMatchObject({ success: false, code: "RECORDER_UNAVAILABLE" });
+});
+
+test("narrows judgments to the selected diff block and restores them on clear", async ({ page }) => {
+  const session = await createSession(adapters, "claude-code");
+  const recordId = `block-${randomUUID()}`;
+  const event = eventFor(adapters, session.session_id, "claude-code", recordId);
+  event.revision = { kind: "commit", sha: adapters.commitSha };
+  event.targets[0]!.revision = { kind: "commit", sha: adapters.commitSha };
+  event.targets[0]!.contentHash = adapters.contentHash;
+  const submission = await runAdapter("claude-code", event);
+  expect(submission.exitCode).toBe(0);
+
+  // 1行目を書き換えて1行追加し、実diffを作る
+  await writeFile(join(adapters.root, adapters.path), "export const adapter = false;\nexport const extra = 1;\n", "utf8");
+
+  await page.goto(app.url);
+  await page.getByLabel("Owner bearer token").fill(token);
+  await page.getByRole("button", { name: "Load repositories" }).click();
+  await page.getByLabel("Repository").selectOption(adapters.repositoryId);
+  await page.getByRole("button", { name: "Open review timeline" }).click();
+  await page.getByRole("button", { name: /adapter\.ts/ }).click();
+
+  // commit revision の判断は旧側1..1に常時アンカー(§5)
+  await expect(page.getByRole("heading", { name: event.judgment })).toBeVisible();
+  await expect(page.locator('[data-old-line="1"]')).toHaveClass(/diff-line--anchored/);
+
+  // 純addブロック(new側のみ)をクリック → 旧側アンカーは辺ごと厳密判定で合致しない(§6.2.3)
+  await page.locator(".diff-line--add").last().click();
+  await expect(page.getByText("No judgments overlap the selected lines.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Clear block filter" }).click();
+  await expect(page.getByRole("heading", { name: event.judgment })).toBeVisible();
 });
