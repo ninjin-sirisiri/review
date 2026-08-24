@@ -51,6 +51,9 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [fileIsLoading, setFileIsLoading] = useState(false);
   const [fileError, setFileError] = useState<ReviewApiError | Error | null>(null);
+  // spec §4.3-3: base=HEADのREVISION_NOT_FOUNDは未誕生HEAD(コミットゼロ)を意味する。エラーではなく
+  // 「比較対象なし」状態として別扱いする。baseが記録済みSHAのときは従来どおりfileErrorになる。
+  const [fileBaseMissing, setFileBaseMissing] = useState(false);
   const [diff, setDiff] = useState<FileDiff | null>(null);
   const [fullText, setFullText] = useState<{ content: string; anchors: DecisionAnchor[] } | null>(null);
   const [recordStates, setRecordStates] = useState<Record<string, JudgmentEntry>>({});
@@ -144,6 +147,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     const base = diffBaseFor(related);
     setFileIsLoading(true);
     setFileError(null);
+    setFileBaseMissing(false);
     setDiff(null);
     setFullText(null);
     setAnchors([]);
@@ -168,6 +172,14 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
     if (diffResult.ok) {
       setDiff(diffResult.value);
+    } else if (
+      base === "HEAD" &&
+      diffResult.error instanceof ReviewApiError &&
+      diffResult.error.code === "REVISION_NOT_FOUND"
+    ) {
+      // base=HEADのREVISION_NOT_FOUNDは未誕生HEADのみで起こる。記録済みSHAが消えた場合とは
+      // 区別し、DiffViewには「比較対象なし」の空状態(または解決済み全文)を表示する(spec §4.3-3)。
+      setFileBaseMissing(true);
     } else {
       setFileError(diffResult.error instanceof ReviewApiError || diffResult.error instanceof Error
         ? diffResult.error
@@ -246,6 +258,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     setExplorerError(null);
     setSelectedPath(null);
     setFileError(null);
+    setFileBaseMissing(false);
     setDiff(null);
     setFullText(null);
     setRecordStates({});
@@ -282,7 +295,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
         <button type="button" className="button-secondary" onClick={resetSession}>Clear session</button>
       </header>
       {error !== null && <p className="inline-error" role="alert">{error}</p>}
-      <Workspace key={workspaceKey} tree={tree} selectedPath={selectedPath} explorerIsLoading={explorerIsLoading} explorerError={explorerError} onExplorerRetry={() => api !== null && repositoryId !== null ? void loadFiles(api, repositoryId) : undefined} onOpenFile={(path) => void openFile(path)} fileIsLoading={fileIsLoading} fileError={fileError} diff={diff} fullText={fullText} onFileRetry={() => selectedPath !== null && void openFile(selectedPath)} judgments={judgments} anchors={anchors} onDispositionChange={(recordId, disposition) => handleDisposition(recordId, disposition)} onJudgmentRetry={(recordId) => void retryJudgment(recordId)} />
+      <Workspace key={workspaceKey} tree={tree} selectedPath={selectedPath} explorerIsLoading={explorerIsLoading} explorerError={explorerError} onExplorerRetry={() => api !== null && repositoryId !== null ? void loadFiles(api, repositoryId) : undefined} onOpenFile={(path) => void openFile(path)} fileIsLoading={fileIsLoading} fileError={fileError} fileBaseMissing={fileBaseMissing} diff={diff} fullText={fullText} onFileRetry={() => selectedPath !== null && void openFile(selectedPath)} judgments={judgments} anchors={anchors} onDispositionChange={(recordId, disposition) => handleDisposition(recordId, disposition)} onJudgmentRetry={(recordId) => void retryJudgment(recordId)} />
     </main>
   );
 }

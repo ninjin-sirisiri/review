@@ -7,6 +7,8 @@ export interface DiffViewProps {
   path: string | null;
   isLoading: boolean;
   error: ReviewApiError | Error | null;
+  /** spec §4.3-3: diff baseが解決不能(未誕生HEAD)。errorではなく空状態/全文表示へ分岐する。 */
+  baseMissing: boolean;
   diff: FileDiff | null;
   anchors: DecisionAnchor[];
   selectedBlock: BlockSelection | null;
@@ -61,6 +63,34 @@ function errorCardMessage(error: ReviewApiError | Error): string {
   return error.message;
 }
 
+/** 新側行番号付きの全文表示。hunkが空のときと、diff baseが存在しないとき(spec §4.3-3)に使う。 */
+function FullTextLines(props: { content: string; anchors: DecisionAnchor[] }) {
+  const contents = props.content.split("\n");
+  return (
+    <ol className="diff-lines">
+      {contents.map((content, index) => {
+        const lineNumber = index + 1;
+        const anchored = props.anchors.some(
+          (anchor) => anchor.side === "new" && anchor.start <= lineNumber && lineNumber <= anchor.end,
+        );
+        return (
+          <li
+            key={lineNumber}
+            className={`diff-line diff-line--context${anchored ? " diff-line--anchored" : ""}`}
+            data-new-line={lineNumber}
+          >
+            <span className="diff-line__static" aria-hidden="true">
+              <span className="line-number">{lineNumber}</span>
+              <span className="line-sign">{" "}</span>
+            </span>
+            <code>{content}</code>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 function LineRow(props: {
   row: DiffLine;
   anchored: boolean;
@@ -101,6 +131,7 @@ export function DiffView({
   path,
   isLoading,
   error,
+  baseMissing,
   diff,
   anchors,
   selectedBlock,
@@ -148,6 +179,16 @@ export function DiffView({
       false,
     );
   }
+  // spec §4.3-3: コミットが一つもないリポジトリではdiff baseが存在しない。これはエラーではなく、
+  // 解決済みソースの全文(なければ専用の空状態)を示す。Retryは状況が変わらないため出さない。
+  if (baseMissing && fullText !== null) {
+    return shell(<FullTextLines content={fullText.content} anchors={fullText.anchors} />);
+  }
+  if (baseMissing) {
+    return shell(
+      <p className="empty-state">This repository has no commits yet, so there is nothing to compare against.</p>,
+    );
+  }
   if (error !== null) {
     return shell(
       <div className="inline-error" role="alert">
@@ -171,30 +212,7 @@ export function DiffView({
   }
 
   if (diff.hunks.length === 0 && fullText !== null) {
-    const contents = fullText.content.split("\n");
-    return shell(
-      <ol className="diff-lines">
-        {contents.map((content, index) => {
-          const lineNumber = index + 1;
-          const anchored = fullText.anchors.some(
-            (anchor) => anchor.side === "new" && anchor.start <= lineNumber && lineNumber <= anchor.end,
-          );
-          return (
-            <li
-              key={lineNumber}
-              className={`diff-line diff-line--context${anchored ? " diff-line--anchored" : ""}`}
-              data-new-line={lineNumber}
-            >
-              <span className="diff-line__static" aria-hidden="true">
-                <span className="line-number">{lineNumber}</span>
-                <span className="line-sign">{" "}</span>
-              </span>
-              <code>{content}</code>
-            </li>
-          );
-        })}
-      </ol>,
-    );
+    return shell(<FullTextLines content={fullText.content} anchors={fullText.anchors} />);
   }
 
   return shell(

@@ -17,6 +17,8 @@ export interface WorkspaceProps {
   onOpenFile: (path: string) => void;
   fileIsLoading: boolean;
   fileError: ReviewApiError | Error | null;
+  /** spec §4.3-3: 選択ファイルのdiff baseが解決不能(未誕生HEAD)。 */
+  fileBaseMissing: boolean;
   diff: FileDiff | null;
   fullText: { content: string; anchors: DecisionAnchor[] } | null;
   onFileRetry: () => void;
@@ -36,6 +38,7 @@ export function Workspace(props: WorkspaceProps) {
     onOpenFile,
     fileIsLoading,
     fileError,
+    fileBaseMissing,
     diff,
     fullText,
     onFileRetry,
@@ -73,6 +76,7 @@ export function Workspace(props: WorkspaceProps) {
         path={selectedPath}
         isLoading={fileIsLoading}
         error={fileError}
+        baseMissing={fileBaseMissing}
         diff={diff}
         anchors={anchors}
         selectedBlock={selectedBlock}

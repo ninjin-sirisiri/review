@@ -36,6 +36,7 @@ const baseProps = {
   path: "src/a.ts",
   isLoading: false,
   error: null,
+  baseMissing: false,
   diff: fileDiff(),
   anchors: [
     { side: "old", start: 1, end: 1 },
@@ -153,6 +154,34 @@ describe("DiffView", () => {
     expect(
       screen.getByText("No changes between the recorded revision and the working tree."),
     ).toBeTruthy();
+  });
+
+  // spec §4.3-3: コミットが一つもないリポジトリではdiff baseが存在しない。エラーカードではなく
+  // 解決済みソースの全文(または専用の空状態)を表示する。
+  it("shows full text when the diff base is missing but a verified source exists", () => {
+    render(
+      <DiffView
+        {...baseProps}
+        diff={null}
+        baseMissing
+        fullText={{
+          content: "alpha\nbeta\ngamma",
+          anchors: [{ side: "new", start: 2, end: 2 }],
+        }}
+      />,
+    );
+
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("beta")).toBeTruthy();
+    expect(document.querySelector('[data-new-line="2"]')?.className).toContain("diff-line--anchored");
+  });
+
+  it("explains the absent commits when the diff base is missing and no source resolved", () => {
+    render(<DiffView {...baseProps} diff={null} baseMissing />);
+    expect(
+      screen.getByText("This repository has no commits yet, so there is nothing to compare against."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
   it.each([

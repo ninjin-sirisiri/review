@@ -211,6 +211,42 @@ describe("App", () => {
     });
   });
 
+  it("treats an unresolvable HEAD as a no-base state instead of a recorded-revision error", async () => {
+    // コミットが一つもないリポジトリ(spec §4.3-3)。判断はすべてworking-treeなのでbase=HEADになり、
+    // Recorderは未誕生HEADに対して404 REVISION_NOT_FOUNDを返す。
+    const workingTreeSummary: DecisionRecordSummary = {
+      ...summaryFixture(),
+      revision: { kind: "working-tree", contentHash: "hash-a" },
+      targets: [
+        { ...summaryFixture().targets[0]!, revision: { kind: "working-tree", contentHash: "hash-a" } },
+      ],
+    };
+    const route = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/v1/repositories")) return json({ success: true, data: [repository] });
+      if (url.includes("/v1/decision-records?repository_id=")) return json({ success: true, data: [workingTreeSummary] });
+      if (url.endsWith("/v1/repositories/repo-1/files")) return json({ success: true, data: { repository_id: "repo-1", paths: ["src/a.ts"] } });
+      if (url.startsWith("/v1/repositories/repo-1/diff?")) {
+        return json({ success: false, error: { code: "REVISION_NOT_FOUND", message: "revision was not found" } }, 404);
+      }
+      if (url.endsWith("/v1/decision-records/rec-1")) return json({ success: true, data: detailFixture() });
+      throw new Error(`unexpected request: ${url}`);
+    };
+    const fetchImpl = vi.fn(route);
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `/v1/repositories/repo-1/diff?${new URLSearchParams({ path: "src/a.ts", base: "HEAD" })}`,
+      expect.anything(),
+    );
+    // エラーカードではなく、解決済みworking-treeソースの全文が見えていること。
+    expect(await screen.findByText("const value = input ?? {};")).toBeTruthy();
+    expect(screen.queryByText("The recorded revision could not be found.")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
   it("updates a disposition from the judgment card", async () => {
     const fetchImpl = createFetch();
     await openWorkspace(fetchImpl);
