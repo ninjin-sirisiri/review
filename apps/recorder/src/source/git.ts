@@ -369,6 +369,7 @@ export class GitReader {
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
     const treePaths = new Set(await this.listTreePaths(root, sha));
+    // A missing base side stays "" here; the guarded split below maps it to ZERO lines on purpose.
     let previous = "";
     let oldMissing = true;
     if (treePaths.has(normalizedPath)) {
@@ -382,12 +383,14 @@ export class GitReader {
       newMissing = false;
     } catch (error) {
       if (!(error instanceof WorkingTreePathMissingError)) throw error;
+      // Same convention: a missing working-tree side stays "" and becomes ZERO lines below.
       current = "";
     }
     const binary = previous.includes("\0") || current.includes("\0");
     if (binary) {
       return { path: normalizedPath, base_sha: sha, hunks: [], old_missing: oldMissing, new_missing: newMissing, binary: true };
     }
+    // Deliberate convention (T1-b): an empty side is ZERO lines; a plain split would add a phantom [""] line.
     const previousLines = previous === "" ? [] : previous.split("\n");
     const currentLines = current === "" ? [] : current.split("\n");
     const operations = lineDiff(previousLines, currentLines, this.maxDiffWork);

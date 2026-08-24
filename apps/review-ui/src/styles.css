@@ -34,32 +34,16 @@ strong { color: #f0f5fa; }
 .app-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding-bottom: 1.8rem; border-bottom: 1px solid #293646; }
 .app-header__repo { margin: 0; }
 .app-header__repo code { color: #9ed7ca; }
-.decision-list, .decision-detail, .detail-pane { min-width: 0; }
-.decision-list { position: sticky; top: 1rem; max-height: calc(100vh - 2rem); overflow: auto; padding: 1rem; border: 1px solid #293646; border-radius: 0.8rem; background: #151d27; }
-.section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.8rem; }
 .section-heading h2 { margin: 0; font-size: 1rem; }
 .section-heading span { color: #8ea1b3; font-size: 0.8rem; }
-.decision-list ol { display: grid; gap: 0.55rem; margin: 0; padding: 0; list-style: none; }
-.decision-list-item { display: grid; width: 100%; gap: 0.25rem; padding: 0.85rem; border: 1px solid transparent; border-radius: 0.55rem; color: inherit; text-align: left; background: #1b2633; }
-.decision-list-item:hover { border-color: #52718d; background: #213244; }
-.decision-list-item--selected { border-color: #77c4b5; background: #203a3c; }
-.decision-list-item__time, .decision-list-item__meta { color: #98aabd; font-size: 0.76rem; }
-.decision-list-item strong { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
-
-.detail-pane { padding: clamp(1rem, 3vw, 2rem); border: 1px solid #293646; border-radius: 0.8rem; background: #151d27; }
-.decision-detail__header { display: flex; justify-content: space-between; gap: 1.5rem; align-items: flex-start; padding-bottom: 1.25rem; border-bottom: 1px solid #293646; }
-.decision-detail__meta { margin-bottom: 0; color: #8ea1b3; font-size: 0.8rem; }
 .disposition-controls { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.35rem; min-width: 250px; border: 0; padding: 0; }
 .disposition-controls legend { width: 100%; margin-bottom: 0.25rem; color: #99adbd; font-size: 0.76rem; text-align: right; }
 .disposition-controls button, button { padding: 0.6rem 0.85rem; border: 1px solid #4a6278; border-radius: 0.45rem; color: #f4f8fb; background: #263748; }
 .disposition-controls button[aria-pressed="true"] { border-color: #9ed7ca; color: #10221f; background: #9ed7ca; }
 .disposition-controls button:disabled { cursor: wait; opacity: 0.6; }
 .button-secondary { color: #bed0df; background: transparent; }
-.decision-detail__grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; margin: 1.25rem 0; }
-.decision-detail section { margin-top: 1.3rem; }
-.decision-detail__grid section { margin-top: 0; padding: 1rem; border: 1px solid #293646; border-radius: 0.6rem; background: #18222d; }
 .preserve-text { white-space: pre-wrap; }
-.target-list, .check-list, .decision-detail section > ul { margin: 0; padding-left: 1.2rem; }
+.target-list, .check-list { margin: 0; padding-left: 1.2rem; }
 .target-list { display: grid; gap: 0.6rem; }
 .target-list li { display: grid; gap: 0.2rem; color: #b7c5d3; }
 .target-list li span, .check-list li span:last-child { color: #8ea1b3; font-size: 0.8rem; }
@@ -71,21 +55,10 @@ strong { color: #f0f5fa; }
 .check-status--failed { color: #ffc0bb; background: #502b30; }
 .check-status--not-run { color: #e0d0a4; background: #493d26; }
 
-.source-stack { display: grid; gap: 1rem; }
-.source-reference { overflow: hidden; border: 1px solid #334557; border-radius: 0.6rem; background: #101820; }
-.source-header { display: flex; justify-content: space-between; gap: 1rem; padding: 0.85rem 1rem; border-bottom: 1px solid #334557; }
-.source-header h3 { margin: 0 0 0.2rem; font-family: "SFMono-Regular", Consolas, monospace; }
-.source-header p { margin: 0; color: #8ea1b3; font-size: 0.78rem; }
-.source-state { align-self: flex-start; padding: 0.2rem 0.45rem; border: 1px solid #4e8e81; border-radius: 0.3rem; color: #9ed7ca; font-size: 0.72rem; font-weight: 700; }
 .source-metadata { display: flex; flex-wrap: wrap; gap: 0.7rem 1.2rem; margin: 0; padding: 0.8rem 1rem; border-bottom: 1px solid #293646; }
 .source-metadata div { display: flex; gap: 0.4rem; align-items: baseline; }
 .source-metadata dt { color: #8195a8; font-size: 0.72rem; }
 .source-metadata dd { margin: 0; color: #bcd0df; font-size: 0.77rem; }
-.source-lines { overflow: auto; max-height: 30rem; margin: 0; padding: 0.65rem 0; list-style: none; counter-reset: source-line; }
-.source-lines li { display: grid; grid-template-columns: 4.2rem minmax(0, 1fr); min-width: max-content; padding-right: 1rem; color: #dbe6ef; white-space: pre; }
-.source-lines li:hover { background: #1b2a38; }
-.source-lines li.source-line--target { background: #193b35; box-shadow: inset 3px 0 #7bd8b6; }
-.line-number { padding-right: 1rem; color: #627b8f; text-align: right; user-select: none; }
 .source-warning { padding: 1rem; border: 2px solid #b57a49; border-radius: 0.5rem; color: #ffe8c9; background: #3f2b1f; }
 .source-warning h3 { color: #ffe8c9; }
 .source-warning p { color: #f1d1ac; }
@@ -94,9 +67,6 @@ strong { color: #f0f5fa; }
 .empty-state, .muted { color: #8ea1b3; }
 
 @media (max-width: 850px) {
-  .decision-list { position: static; max-height: none; }
-  .decision-list ol { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
-  .decision-detail__header { flex-direction: column; }
   .disposition-controls { justify-content: flex-start; min-width: 0; }
   .disposition-controls legend { text-align: left; }
 }
@@ -104,8 +74,6 @@ strong { color: #f0f5fa; }
 @media (max-width: 600px) {
   .app-shell { padding: 1rem 0.8rem 3rem; }
   .app-header { flex-direction: column; }
-  .decision-detail__grid { grid-template-columns: 1fr; }
-  .detail-pane { padding: 0.8rem; }
 }
 
 /* ---- Two-pane workspace (spec §6) ---- */
@@ -223,8 +191,11 @@ strong { color: #f0f5fa; }
 }
 .line-number {
   min-width: 3ch;
+  padding-right: 1rem;
   text-align: right;
+  color: #627b8f;
   opacity: 0.5;
+  user-select: none;
 }
 .line-sign {
   min-width: 1ch;
@@ -264,6 +235,7 @@ strong { color: #f0f5fa; }
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  margin-bottom: 0.8rem;
 }
 .section-heading h2 {
   margin: 0;
