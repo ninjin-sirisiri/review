@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   ReviewApi,
   ReviewApiError,
@@ -12,7 +12,6 @@ import { BootstrapScreen } from "./components/BootstrapScreen";
 import { Workspace } from "./components/Workspace";
 import type { JudgmentEntry } from "./components/JudgmentPanel";
 import type { DecisionAnchor } from "./lib/decision-index";
-import type { FileTreeNode } from "./lib/file-tree";
 import { buildDecisionIndex, decisionAnchors, diffBaseFor } from "./lib/decision-index";
 import { buildFileTree } from "./lib/file-tree";
 import "./styles.css";
@@ -57,6 +56,9 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [recordStates, setRecordStates] = useState<Record<string, JudgmentEntry>>({});
   const [anchors, setAnchors] = useState<DecisionAnchor[]>([]);
   const [workspaceKey, setWorkspaceKey] = useState(0);
+  // M31: openFileが進める単調トークン。後発のファイル選択は先行ロードの非同期完了を無効化し、
+  // 遅れて着いた応答が新しい選択の状態を上書きしないようにする。
+  const requestTokenRef = useRef(0);
 
   const decisionIndex = useMemo(() => buildDecisionIndex(decisions), [decisions]);
   const tree = useMemo(() => {
@@ -134,6 +136,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
   async function openFile(path: string) {
     if (api === null || repositoryId === null) return;
+    const token = ++requestTokenRef.current;
     setSelectedPath(path);
     setSelectedBlockReset();
 
@@ -159,6 +162,9 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
       ),
     );
     const [diffResult, details] = await Promise.all([diffAttempt, Promise.all(detailAttempts)]);
+
+    // トークンが進んでいれば、この完了は後発のファイル選択に負けている。何も状態を触らず破棄する。
+    if (requestTokenRef.current !== token) return;
 
     if (diffResult.ok) {
       setDiff(diffResult.value);
@@ -213,11 +219,16 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
   async function retryJudgment(recordId: string) {
     if (api === null) return;
+    // 再試行はトークンを進めない(進めると実行中のファイルロードまで無効化する)。
+    // 後発のopenFileがrecordStatesを丸ごと置き換えた後の遅着き完了は、ここで破棄する。
+    const token = requestTokenRef.current;
     setRecordStates((current) => ({ ...current, [recordId]: { recordId, status: "loading" } }));
     try {
       const detail = await api.getDecision(recordId);
+      if (requestTokenRef.current !== token) return;
       setRecordStates((current) => ({ ...current, [recordId]: { recordId, status: "ready", detail } }));
     } catch (requestError) {
+      if (requestTokenRef.current !== token) return;
       setRecordStates((current) => ({
         ...current,
         [recordId]: { recordId, status: "error", message: apiMessage(requestError) },

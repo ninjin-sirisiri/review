@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App";
 import { ReviewApi, type DecisionRecordDetail, type DecisionRecordSummary } from "./api";
 
@@ -83,24 +83,88 @@ const fileDiff = {
   ],
 };
 
-function createFetch() {
+const fileBDiff = {
+  path: "src/b.ts",
+  base_sha: "abc123def4567890",
+  old_missing: false,
+  new_missing: false,
+  binary: false,
+  hunks: [
+    {
+      oldStart: 1,
+      newStart: 3,
+      lines: [{ type: "add", oldLine: null, newLine: 3, content: "const beta = parse(x);" }],
+    },
+  ],
+};
+
+function summaryFixtureB(): DecisionRecordSummary {
+  const base = summaryFixture();
+  const target = { ...base.targets[0]!, path: "src/b.ts", content_hash: "hash-b" };
+  return { ...base, record_id: "rec-2", session_id: "session-rec-2", targets: [target], judgment: "Cover the parse failure" };
+}
+
+function detailFixtureB(): DecisionRecordDetail {
+  const summary = summaryFixtureB();
+  const target = summary.targets[0]!;
+  return {
+    record: {
+      ...detailFixture().record,
+      record_id: "rec-2",
+      session_id: "session-rec-2",
+      targets: [target],
+      judgment: "Cover the parse failure",
+    },
+    sources: [
+      {
+        state: "resolved",
+        repository_id: "repo-1",
+        path: "src/b.ts",
+        revision: { kind: "working-tree", contentHash: "hash-b" },
+        target,
+        content: "const beta = parse(x);",
+        content_hash: "hash-b",
+      },
+    ],
+  };
+}
+
+function createFetch(hold?: (url: string) => boolean, fail?: (url: string) => boolean) {
   // Recorderと同じく、PATCHで保存されたuser_dispositionを以後のGETが返す。
   // DecisionCardは「サーバー応答を表示してから更新する」契約(Task 6)であり楽順更新を持たないため、
   // 常に古いunreviewedを返すモックではaria-pressedは決してtrueにならない。
   let userDisposition: DecisionRecordDetail["record"]["user_disposition"] = "unreviewed";
-  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  const route = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input);
+    if (fail?.(url)) return json({ success: false, error: { code: "UNKNOWN", message: "mock failure" } }, 500);
     if (url.endsWith("/v1/repositories")) return json({ success: true, data: [repository] });
-    if (url.includes("/v1/decision-records?repository_id=")) return json({ success: true, data: [summaryFixture()] });
+    if (url.includes("/v1/decision-records?repository_id=")) return json({ success: true, data: [summaryFixture(), summaryFixtureB()] });
     if (url.endsWith("/v1/repositories/repo-1/files")) return json({ success: true, data: { repository_id: "repo-1", paths: ["src/a.ts", "src/b.ts"] } });
-    if (url.startsWith("/v1/repositories/repo-1/diff?")) return json({ success: true, data: fileDiff });
+    if (url.startsWith("/v1/repositories/repo-1/diff?")) {
+      return url.includes("path=src%2Fb.ts") ? json({ success: true, data: fileBDiff }) : json({ success: true, data: fileDiff });
+    }
     if (init?.method === "PATCH") {
       const body = JSON.parse(String(init.body)) as { user_disposition: typeof userDisposition };
       userDisposition = body.user_disposition;
       return json({ success: true, data: detailFixture(userDisposition).record });
     }
+    if (url.endsWith("/v1/decision-records/rec-2")) return json({ success: true, data: detailFixtureB() });
     if (url.endsWith("/v1/decision-records/rec-1")) return json({ success: true, data: detailFixture(userDisposition) });
     throw new Error(`unexpected request: ${url}`);
+  };
+  if (hold === undefined) return vi.fn(route);
+  // M31レースのピン留め用:hold(url)が真の間リクエストを保留し、テストが任意のタイミングで解放する。
+  const held: Array<{ url: string; response: Response; resolve: (response: Response) => void }> = [];
+  const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (!hold(url)) return route(input, init);
+    const response = await route(input, init);
+    return new Promise<Response>((resolve) => held.push({ url, response, resolve }));
+  });
+  return Object.assign(fetchImpl, {
+    releaseAll(respond?: (url: string) => Response | undefined) {
+      for (const request of held.splice(0)) request.resolve(respond?.(request.url) ?? request.response);
+    },
   });
 }
 
@@ -164,5 +228,72 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Clear session" }));
     expect(screen.getByLabelText("Owner bearer token")).toBeTruthy();
+  });
+
+  it("discards a slow previous file load whose responses land after another file was opened", async () => {
+    let holdFileALoad = false;
+    const fetchImpl = createFetch((url) => holdFileALoad && (url.includes("/diff?") || url.includes("/decision-records/")));
+    await openWorkspace(fetchImpl);
+
+    holdFileALoad = true;
+    fireEvent.click(screen.getByText("a.ts"));
+    holdFileALoad = false;
+
+    fireEvent.click(screen.getByText("b.ts"));
+    expect(await screen.findByRole("heading", { name: "Cover the parse failure" })).toBeTruthy();
+
+    // Aの応答をBの描画完了後に解放する。先行ロードの完了がBの状態を上書きしてはならない。
+    fetchImpl.releaseAll();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(screen.getByRole("heading", { name: "src/b.ts" })).toBeTruthy();
+    expect(screen.getByText("const beta = parse(x);")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Cover the parse failure" })).toBeTruthy();
+    expect(screen.queryByText("const value = input ?? {};")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Guard the empty input" })).toBeNull();
+    expect(screen.queryByText("No decisions have been recorded for this file.")).toBeNull();
+  });
+
+  it("discards a stale judgment retry that fails after the file was reopened and reloaded", async () => {
+    let failRec1Detail = false;
+    let holdRec1Detail = false;
+    const fetchImpl = createFetch(
+      (url) => holdRec1Detail && url.endsWith("/v1/decision-records/rec-1"),
+      (url) => failRec1Detail && url.endsWith("/v1/decision-records/rec-1"),
+    );
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    await screen.findByRole("heading", { name: "Guard the empty input" });
+
+    failRec1Detail = true;
+    fireEvent.click(screen.getByText("a.ts"));
+    const retry = await screen.findByRole("button", { name: "Retry rec-1" });
+
+    failRec1Detail = false;
+    holdRec1Detail = true;
+    fireEvent.click(retry);
+    holdRec1Detail = false;
+
+    fireEvent.click(screen.getByText("b.ts"));
+    await screen.findByRole("heading", { name: "Cover the parse failure" });
+    fireEvent.click(screen.getByText("a.ts"));
+    await screen.findByRole("heading", { name: "Guard the empty input" });
+
+    // 再試行の失敗を、再オープン後の正常ロード完了より遅れて届かせる。
+    fetchImpl.releaseAll((url) =>
+      url.endsWith("/v1/decision-records/rec-1")
+        ? json({ success: false, error: { code: "UNKNOWN", message: "late boom" } }, 503)
+        : undefined,
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(screen.getByRole("heading", { name: "Guard the empty input" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry rec-1" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });
