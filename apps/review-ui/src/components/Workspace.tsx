@@ -1,0 +1,95 @@
+import { useEffect, useRef, useState } from "react";
+import type { FileDiff } from "../../../../packages/contracts/src/index";
+import type { ReviewApiError, DecisionRecordDetail, UserDisposition } from "../api";
+import type { FileTreeNode } from "../lib/file-tree";
+import type { DecisionAnchor, BlockSelection } from "../lib/decision-index";
+import type { JudgmentEntry } from "./JudgmentPanel";
+import { Explorer } from "./Explorer";
+import { DiffView } from "./DiffView";
+import { JudgmentPanel } from "./JudgmentPanel";
+
+export interface WorkspaceProps {
+  tree: FileTreeNode;
+  selectedPath: string | null;
+  explorerIsLoading: boolean;
+  explorerError: Error | null;
+  onExplorerRetry: () => void;
+  onOpenFile: (path: string) => void;
+  fileIsLoading: boolean;
+  fileError: ReviewApiError | Error | null;
+  diff: FileDiff | null;
+  fullText: { content: string; anchors: DecisionAnchor[] } | null;
+  onFileRetry: () => void;
+  judgments: JudgmentEntry[];
+  anchors: DecisionAnchor[];
+  onDispositionChange: (recordId: string, disposition: UserDisposition) => Promise<DecisionRecordDetail>;
+  onJudgmentRetry: (recordId: string) => void;
+}
+
+export function Workspace(props: WorkspaceProps) {
+  const {
+    tree,
+    selectedPath,
+    explorerIsLoading,
+    explorerError,
+    onExplorerRetry,
+    onOpenFile,
+    fileIsLoading,
+    fileError,
+    diff,
+    fullText,
+    onFileRetry,
+    judgments,
+    anchors,
+    onDispositionChange,
+    onJudgmentRetry,
+  } = props;
+
+  const [selectedBlock, setSelectedBlock] = useState<BlockSelection | null>(null);
+  const [navigateTo, setNavigateTo] = useState<{ line: number; token: number } | null>(null);
+  const navigationToken = useRef(0);
+
+  useEffect(() => {
+    setSelectedBlock(null);
+  }, [selectedPath]);
+
+  function handleTargetClick(path: string, line: number) {
+    if (path !== selectedPath) return;
+    navigationToken.current += 1;
+    setNavigateTo({ line, token: navigationToken.current });
+  }
+
+  return (
+    <div className="workspace">
+      <Explorer
+        tree={tree}
+        selectedPath={selectedPath}
+        isLoading={explorerIsLoading}
+        error={explorerError}
+        onRetry={onExplorerRetry}
+        onOpenFile={onOpenFile}
+      />
+      <DiffView
+        path={selectedPath}
+        isLoading={fileIsLoading}
+        error={fileError}
+        diff={diff}
+        anchors={anchors}
+        selectedBlock={selectedBlock}
+        onSelectBlock={setSelectedBlock}
+        fullText={fullText}
+        navigateTo={navigateTo}
+        onRetry={onFileRetry}
+      />
+      <JudgmentPanel
+        path={selectedPath}
+        entries={judgments}
+        selectedBlock={selectedBlock}
+        onSelectBlock={setSelectedBlock}
+        onDispositionChange={onDispositionChange}
+        onRetry={onJudgmentRetry}
+        onTargetClick={handleTargetClick}
+      />
+    </div>
+  );
+}

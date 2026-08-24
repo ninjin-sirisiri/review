@@ -1,15 +1,20 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   ReviewApi,
   ReviewApiError,
   type DecisionRecordDetail,
   type DecisionRecordSummary,
+  type FileDiff,
   type RegisteredRepositorySummary,
   type UserDisposition,
 } from "./api";
 import { BootstrapScreen } from "./components/BootstrapScreen";
-import { DecisionDetail } from "./components/DecisionDetail";
-import { DecisionList } from "./components/DecisionList";
+import { Workspace } from "./components/Workspace";
+import type { JudgmentEntry } from "./components/JudgmentPanel";
+import type { DecisionAnchor } from "./lib/decision-index";
+import type { FileTreeNode } from "./lib/file-tree";
+import { buildDecisionIndex, decisionAnchors, diffBaseFor } from "./lib/decision-index";
+import { buildFileTree } from "./lib/file-tree";
 import "./styles.css";
 
 export interface AppProps {
@@ -24,6 +29,10 @@ function apiMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Recorder request failed";
 }
 
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(apiMessage(error));
+}
+
 export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) {
   const [tokenInput, setTokenInput] = useState("");
   const [repositories, setRepositories] = useState<RegisteredRepositorySummary[] | null>(null);
@@ -31,11 +40,42 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [api, setApi] = useState<ReviewApi | null>(null);
   const [repositoryId, setRepositoryId] = useState<string | null>(null);
   const [decisions, setDecisions] = useState<DecisionRecordSummary[]>([]);
-  const [selectedRecordId, setSelectedRecordId] = useState<string | undefined>();
-  const [detail, setDetail] = useState<DecisionRecordDetail | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Explorer state
+  const [filePaths, setFilePaths] = useState<string[]>([]);
+  const [explorerIsLoading, setExplorerIsLoading] = useState(false);
+  const [explorerError, setExplorerError] = useState<Error | null>(null);
+
+  // Open-file state
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [fileIsLoading, setFileIsLoading] = useState(false);
+  const [fileError, setFileError] = useState<ReviewApiError | Error | null>(null);
+  const [diff, setDiff] = useState<FileDiff | null>(null);
+  const [fullText, setFullText] = useState<{ content: string; anchors: DecisionAnchor[] } | null>(null);
+  const [recordStates, setRecordStates] = useState<Record<string, JudgmentEntry>>({});
+  const [anchors, setAnchors] = useState<DecisionAnchor[]>([]);
+  const [workspaceKey, setWorkspaceKey] = useState(0);
+
+  const decisionIndex = useMemo(() => buildDecisionIndex(decisions), [decisions]);
+  const tree = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const [path, list] of decisionIndex) counts.set(path, list.length);
+    const known = new Set<string>(filePaths);
+    for (const path of decisionIndex.keys()) known.add(path);
+    return buildFileTree([...known].sort((a, b) => a.localeCompare(b)), counts);
+  }, [filePaths, decisionIndex]);
+
+  // JudgmentPanelのブロック絞り込みはside/linesのみでパスを見ない(M19)。ほかのファイルの
+  // 意思決定が現在ファイルのブロック選択で消えないよう、ここで必ず選択ファイル分だけに限定する。
+  const judgments: JudgmentEntry[] = useMemo(() => {
+    if (selectedPath === null) return [];
+    return (decisionIndex.get(selectedPath) ?? []).flatMap((summary) => {
+      const entry = recordStates[summary.record_id];
+      return entry ? [entry] : [];
+    });
+  }, [selectedPath, decisionIndex, recordStates]);
 
   async function handleSubmit() {
     setError(null);
@@ -46,7 +86,6 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     }
 
     setIsLoading(true);
-    setError(null);
     try {
       if (repositories === null) {
         const client = apiFactory(token);
@@ -63,12 +102,12 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
         return;
       }
 
-      const client = api ?? apiFactory(token);
+      const client = api ?? apiFactory(tokenInput.trim());
       const records = await client.listDecisions(repository);
+      setApi(client);
       setRepositoryId(repository);
       setDecisions(records);
-      const first = records[0];
-      if (first !== undefined) await selectDecision(client, first.record_id);
+      await loadFiles(client, repository);
     } catch (requestError) {
       if (repositories === null) {
         setApi(null);
@@ -80,35 +119,110 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     }
   }
 
-  async function selectDecision(client: ReviewApi, recordId: string) {
-    setSelectedRecordId(recordId);
-    setDetail(null);
-    setIsLoadingDetail(true);
-    setError(null);
+  async function loadFiles(client: ReviewApi, repository: string) {
+    setExplorerIsLoading(true);
+    setExplorerError(null);
     try {
-      setDetail(await client.getDecision(recordId));
+      const data = await client.listRepositoryFiles(repository);
+      setFilePaths(data.paths);
     } catch (requestError) {
-      setError(apiMessage(requestError));
+      setExplorerError(asError(requestError));
     } finally {
-      setIsLoadingDetail(false);
+      setExplorerIsLoading(false);
     }
   }
 
-  async function handleSelect(recordId: string) {
-    if (api === null) return;
-    await selectDecision(api, recordId);
+  async function openFile(path: string) {
+    if (api === null || repositoryId === null) return;
+    setSelectedPath(path);
+    setSelectedBlockReset();
+
+    const related = decisionIndex.get(path) ?? [];
+    const base = diffBaseFor(related);
+    setFileIsLoading(true);
+    setFileError(null);
+    setDiff(null);
+    setFullText(null);
+    setAnchors([]);
+    setRecordStates(Object.fromEntries(
+      related.map((summary) => [summary.record_id, { recordId: summary.record_id, status: "loading" as const }]),
+    ));
+
+    const diffAttempt = api.getFileDiff(repositoryId, path, base).then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    const detailAttempts = related.map((summary) =>
+      api.getDecision(summary.record_id).then(
+        (value) => ({ id: summary.record_id, ok: true as const, value }),
+        (error: unknown) => ({ id: summary.record_id, ok: false as const, error }),
+      ),
+    );
+    const [diffResult, details] = await Promise.all([diffAttempt, Promise.all(detailAttempts)]);
+
+    if (diffResult.ok) {
+      setDiff(diffResult.value);
+    } else {
+      setFileError(diffResult.error instanceof ReviewApiError || diffResult.error instanceof Error
+        ? diffResult.error
+        : asError(diffResult.error));
+    }
+
+    const nextStates: Record<string, JudgmentEntry> = {};
+    const nextAnchors: DecisionAnchor[] = [];
+    for (const attempt of details) {
+      if (attempt.ok) {
+        nextStates[attempt.id] = { recordId: attempt.id, status: "ready", detail: attempt.value };
+        nextAnchors.push(...decisionAnchors(attempt.value));
+      } else {
+        nextStates[attempt.id] = { recordId: attempt.id, status: "error", message: apiMessage(attempt.error) };
+      }
+    }
+    setRecordStates(nextStates);
+    setAnchors(nextAnchors);
+
+    for (const attempt of details) {
+      if (!attempt.ok) continue;
+      const source = attempt.value.sources.find((candidate) => candidate.state === "resolved" || candidate.state === "snapshot-resolved");
+      if (source !== undefined && "content" in source) {
+        setFullText({ content: source.content, anchors: decisionAnchors(attempt.value) });
+        break;
+      }
+    }
+
+    setFileIsLoading(false);
   }
 
-  async function handleDisposition(disposition: UserDisposition): Promise<DecisionRecordDetail> {
-    if (api === null || selectedRecordId === undefined) {
-      throw new ReviewApiError("Select a decision before changing its disposition", { code: "INVALID_RECORD", status: 422 });
-    }
-    const updated = await api.setDisposition(selectedRecordId, disposition);
-    setDetail(updated);
+  function setSelectedBlockReset() {
+    // ブロック選択はWorkspace内部state。ファイル切替時に解除してもらうためkeyでリセットする。
+    setWorkspaceKey((current) => current + 1);
+  }
+
+  async function handleDisposition(recordId: string, disposition: UserDisposition): Promise<DecisionRecordDetail> {
+    if (api === null) throw new ReviewApiError("Not connected to Recorder", { code: "UNKNOWN" });
+    const updated = await api.setDisposition(recordId, disposition);
     setDecisions((current) => current.map((decision) => (
       decision.record_id === updated.record.record_id ? updated.record : decision
     )));
+    setRecordStates((current) => ({
+      ...current,
+      [recordId]: { recordId, status: "ready", detail: updated },
+    }));
     return updated;
+  }
+
+  async function retryJudgment(recordId: string) {
+    if (api === null) return;
+    setRecordStates((current) => ({ ...current, [recordId]: { recordId, status: "loading" } }));
+    try {
+      const detail = await api.getDecision(recordId);
+      setRecordStates((current) => ({ ...current, [recordId]: { recordId, status: "ready", detail } }));
+    } catch (requestError) {
+      setRecordStates((current) => ({
+        ...current,
+        [recordId]: { recordId, status: "error", message: apiMessage(requestError) },
+      }));
+    }
   }
 
   function resetSession() {
@@ -117,8 +231,14 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     setRepositories(null);
     setSelectedRepositoryId("");
     setDecisions([]);
-    setSelectedRecordId(undefined);
-    setDetail(null);
+    setFilePaths([]);
+    setExplorerError(null);
+    setSelectedPath(null);
+    setFileError(null);
+    setDiff(null);
+    setFullText(null);
+    setRecordStates({});
+    setAnchors([]);
     setTokenInput("");
     setError(null);
   }
@@ -151,21 +271,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
         <button type="button" className="button-secondary" onClick={resetSession}>Clear session</button>
       </header>
       {error !== null && <p className="inline-error" role="alert">{error}</p>}
-      <div className="app-layout">
-        <DecisionList
-          decisions={decisions}
-          selectedRecordId={selectedRecordId}
-          onSelect={(recordId) => void handleSelect(recordId)}
-          isLoading={isLoading}
-        />
-        <section className="detail-pane" aria-live="polite">
-          {isLoadingDetail && <p role="status">Loading decision and linked source…</p>}
-          {!isLoadingDetail && detail === null && <p className="empty-state">Select a decision to inspect its evidence.</p>}
-          {!isLoadingDetail && detail !== null && (
-            <DecisionDetail detail={detail} onDispositionChange={handleDisposition} />
-          )}
-        </section>
-      </div>
+      <Workspace key={workspaceKey} tree={tree} selectedPath={selectedPath} explorerIsLoading={explorerIsLoading} explorerError={explorerError} onExplorerRetry={() => api !== null && repositoryId !== null ? void loadFiles(api, repositoryId) : undefined} onOpenFile={(path) => void openFile(path)} fileIsLoading={fileIsLoading} fileError={fileError} diff={diff} fullText={fullText} onFileRetry={() => selectedPath !== null && void openFile(selectedPath)} judgments={judgments} anchors={anchors} onDispositionChange={(recordId, disposition) => handleDisposition(recordId, disposition)} onJudgmentRetry={(recordId) => void retryJudgment(recordId)} />
     </main>
   );
 }
