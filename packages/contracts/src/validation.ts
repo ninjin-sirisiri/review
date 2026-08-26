@@ -39,6 +39,7 @@ const SESSION_STATUSES: Record<ReviewSession["status"], true> = {
 const SNAPSHOT_MODES: Record<SnapshotReference["mode"], true> = {
   "changed-files": true,
   patch: true,
+  git: true,
 };
 const ISO_UTC_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$/;
 
@@ -332,7 +333,7 @@ export function validateReviewSession(value: unknown): ValidationResult<ReviewSe
 }
 
 export function validateSnapshotReference(value: unknown): ValidationResult<SnapshotReference> {
-  if (!isRecord(value) || !hasOnlyKeys(value, ["snapshot_id", "record_id", "mode", "path", "content_hash", "created_at"])) {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["snapshot_id", "record_id", "mode", "path", "content_hash", "created_at", "base_sha", "source_path"])) {
     return invalid("snapshot reference has an unsupported field");
   }
   const requiredError = firstError(
@@ -342,13 +343,35 @@ export function validateSnapshotReference(value: unknown): ValidationResult<Snap
     timestamp(value.created_at, "created_at"),
   );
   if (requiredError) return requiredError;
+  if (typeof value.mode !== "string" || !hasOwnKey(SNAPSHOT_MODES, value.mode)) return invalid("mode is invalid", "mode");
+  const mode = value.mode as SnapshotReference["mode"];
+  if (mode === "git") {
+    if (typeof value.base_sha !== "string" || !/^[0-9a-f]{40}$/.test(value.base_sha)) {
+      return invalid("base_sha must be a lowercase 40-character commit SHA for git snapshots", "base_sha");
+    }
+    const sourcePathResult = normalizeRelativePath(value.source_path, "source_path");
+    if (!sourcePathResult.success) return sourcePathResult;
+    if (value.path !== "") return invalid("path must be empty for git-backed snapshots", "path");
+    return success({
+      snapshot_id: value.snapshot_id as string,
+      record_id: value.record_id as string,
+      mode,
+      path: "",
+      content_hash: value.content_hash as string,
+      created_at: value.created_at as string,
+      base_sha: value.base_sha,
+      source_path: sourcePathResult.data,
+    });
+  }
+  if (value.base_sha !== undefined || value.source_path !== undefined) {
+    return invalid("base_sha and source_path are only allowed on git-backed snapshots", "base_sha");
+  }
   const pathResult = normalizeRelativePath(value.path, "path");
   if (!pathResult.success) return pathResult;
-  if (typeof value.mode !== "string" || !hasOwnKey(SNAPSHOT_MODES, value.mode)) return invalid("mode is invalid", "mode");
   return success({
     snapshot_id: value.snapshot_id as string,
     record_id: value.record_id as string,
-    mode: value.mode as SnapshotReference["mode"],
+    mode,
     path: pathResult.data,
     content_hash: value.content_hash as string,
     created_at: value.created_at as string,

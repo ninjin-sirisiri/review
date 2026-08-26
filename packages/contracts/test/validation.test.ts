@@ -223,3 +223,41 @@ describe("decision input validation", () => {
     if (!result.success) expect(result.error.code).toBe(ERROR_CODES.INVALID_RECORD);
   });
 });
+
+const gitSnapshotBase = {
+  snapshot_id: "snapshot-git",
+  record_id: "record-001",
+  mode: "git" as const,
+  path: "",
+  content_hash: "b".repeat(64),
+  created_at: "2026-08-20T00:00:00.000Z",
+  base_sha: "a".repeat(40),
+  source_path: "src/example.ts",
+};
+
+test("accepts a git-backed snapshot reference", () => {
+  const result = validateSnapshotReference(gitSnapshotBase);
+  expect(result.success).toBe(true);
+  if (result.success) {
+    expect(result.data.mode).toBe("git");
+    expect(result.data.path).toBe("");
+    expect(result.data.base_sha).toBe("a".repeat(40));
+    expect(result.data.source_path).toBe("src/example.ts");
+  }
+});
+
+test.each([
+  ["missing base_sha", { ...gitSnapshotBase, base_sha: undefined }],
+  ["uppercase sha", { ...gitSnapshotBase, base_sha: "A".repeat(40) }],
+  ["short sha", { ...gitSnapshotBase, base_sha: "a".repeat(39) }],
+  ["non-hex sha", { ...gitSnapshotBase, base_sha: `${"g".repeat(39)}a` }],
+  ["missing source_path", { ...gitSnapshotBase, source_path: undefined }],
+  ["escaping source_path", { ...gitSnapshotBase, source_path: "../outside.ts" }],
+  ["non-empty storage path", { ...gitSnapshotBase, path: "snapshots/x.snapshot" }],
+])("rejects an invalid git snapshot: %s", (_label, value) => {
+  expect(validateSnapshotReference(value).success).toBe(false);
+});
+
+test("rejects base_sha/source_path on non-git snapshots", () => {
+  expect(validateSnapshotReference({ ...gitSnapshotBase, mode: "patch", path: "patch.diff" }).success).toBe(false);
+});

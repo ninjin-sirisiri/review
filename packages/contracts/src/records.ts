@@ -53,13 +53,18 @@ export interface ReviewSession {
   status: ReviewSessionStatus;
 }
 
-export type SnapshotMode = "changed-files" | "patch";
+export type SnapshotMode = "changed-files" | "patch" | "git";
 
 export interface SnapshotReference {
   snapshot_id: string;
   record_id: string;
   mode: SnapshotMode;
+  /** Storage-relative file path; empty string for git-backed snapshots (no stored file). */
   path: string;
   content_hash: string;
   created_at: string;
+  /** git mode only: concrete commit SHA captured at creation time. */
+  base_sha?: string;
+  /** git mode only: registered-root-relative source path. */
+  source_path?: string;
 }
