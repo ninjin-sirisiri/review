@@ -232,10 +232,13 @@ test("reviews a decision through the explorer, accepts it, and flags a tampered 
   const staleBody = await staleResponse.json() as { data: { sources: Array<Record<string, unknown>> } };
   expect(staleBody.data.sources[0]).toMatchObject({ state: "hash-mismatch" });
 
-  // トークンはメモリ保持なので再認証になる(localStorage/URL不変チェックは現行どおり)
+  // トークンはメモリ保持なので再認証になる。不変条件は「トークン非出力」:ストレージ/URLに現れないこと
   await expect(page.getByLabel("Owner bearer token")).toBeVisible();
   await expect(page).not.toHaveURL(new RegExp(token));
-  await expect(page.evaluate(() => localStorage.length)).resolves.toBe(0);
+  // トークンは一切ストレージに現れないこと(UI設定などの無害なキーは許容)
+  await expect(page.evaluate(() =>
+    Object.values(localStorage).some((value) => String(value).includes(token)),
+  )).resolves.toBe(false);
 
   await page.getByLabel("Owner bearer token").fill(token);
   await page.getByRole("button", { name: "Load repositories" }).click();
@@ -304,4 +307,24 @@ test("narrows judgments to the selected diff block and restores them on clear", 
 
   await page.getByRole("button", { name: "Clear block filter" }).click();
   await expect(page.getByRole("heading", { name: event.judgment })).toBeVisible();
+});
+
+test("switches the color scheme, persists it, and boots without flashing", async ({ page }) => {
+  await page.goto(app.url);
+  await expect(page.locator("html")).toHaveAttribute("data-theme", /light|dark/);
+
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect(page.evaluate(() => localStorage.getItem("review-ui-theme"))).resolves.toBeNull();
+
+  const toggle = page.getByRole("button", { name: "Color scheme" });
+  await toggle.click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect(page.evaluate(() => localStorage.getItem("review-ui-theme"))).resolves.toBe("light");
+
+  await toggle.click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 });
