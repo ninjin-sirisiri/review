@@ -22,6 +22,8 @@ describe("BootstrapScreen", () => {
     const onSubmit = vi.fn();
     render(<BootstrapScreen {...baseProps} onTokenChange={onTokenChange} onSubmit={onSubmit} />);
 
+    expect(screen.getByRole("button", { name: "Color scheme" })).toBeTruthy();
+
     fireEvent.change(screen.getByLabelText("Owner bearer token"), { target: { value: "owner-token" } });
     expect(onTokenChange).toHaveBeenCalledWith("owner-token");
 

@@ -5,6 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="Review AI decisions with linked source evidence" />
     <title>Review decisions</title>
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("review-ui-theme");
+          var mode = stored === "light" || stored === "dark"
+            ? stored
+            : typeof window.matchMedia === "function" && window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+          document.documentElement.dataset.theme = mode;
+        } catch (error) {
+          document.documentElement.dataset.theme = "dark";
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

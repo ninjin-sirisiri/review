@@ -192,6 +192,14 @@ describe("App", () => {
     expect(screen.getByText("/work/repo-one")).toBeTruthy();
   });
 
+  it("renders the color-scheme toggle in the connected workspace header", async () => {
+    const fetchImpl = createFetch();
+    await openWorkspace(fetchImpl);
+
+    expect(screen.getByRole("heading", { name: "Decision review" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Color scheme" })).toBeTruthy();
+  });
+
   it("fetches the diff and linked decisions together when a file is opened and anchors verified lines", async () => {
     const fetchImpl = createFetch();
     await openWorkspace(fetchImpl);

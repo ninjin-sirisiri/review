@@ -9,6 +9,7 @@ import {
   type UserDisposition,
 } from "./api";
 import { BootstrapScreen } from "./components/BootstrapScreen";
+import { ThemeToggle } from "./components/ThemeToggle";
 import { Workspace } from "./components/Workspace";
 import type { JudgmentEntry } from "./components/JudgmentPanel";
 import type { DecisionAnchor } from "./lib/decision-index";
@@ -292,7 +293,10 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
           <h1>Decision review</h1>
           <p className="app-header__repo">Repository <code>{activeRepository?.root ?? repositoryId}</code></p>
         </div>
-        <button type="button" className="button-secondary" onClick={resetSession}>Clear session</button>
+        <div className="app-header__actions">
+          <ThemeToggle />
+          <button type="button" className="button-secondary" onClick={resetSession}>Clear session</button>
+        </div>
       </header>
       {error !== null && <p className="inline-error" role="alert">{error}</p>}
       <Workspace key={workspaceKey} tree={tree} selectedPath={selectedPath} explorerIsLoading={explorerIsLoading} explorerError={explorerError} onExplorerRetry={() => api !== null && repositoryId !== null ? void loadFiles(api, repositoryId) : undefined} onOpenFile={(path) => void openFile(path)} fileIsLoading={fileIsLoading} fileError={fileError} fileBaseMissing={fileBaseMissing} diff={diff} fullText={fullText} onFileRetry={() => selectedPath !== null && void openFile(selectedPath)} judgments={judgments} anchors={anchors} onDispositionChange={(recordId, disposition) => handleDisposition(recordId, disposition)} onJudgmentRetry={(recordId) => void retryJudgment(recordId)} />

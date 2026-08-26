@@ -1,5 +1,6 @@
 import { FormEvent } from "react";
 import type { RegisteredRepositorySummary } from "../api";
+import { ThemeToggle } from "./ThemeToggle";
 
 export interface BootstrapScreenProps {
   tokenInput: string;
@@ -31,6 +32,9 @@ export function BootstrapScreen({
 
   return (
     <main className="app-shell app-shell--bootstrap">
+      <div className="bootstrap-theme">
+        <ThemeToggle />
+      </div>
       <section className="bootstrap-card" aria-labelledby="bootstrap-heading">
         <p className="eyebrow">Local review evidence</p>
         <h1 id="bootstrap-heading">Review decisions with their source</h1>
