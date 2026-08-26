@@ -287,7 +287,15 @@ test("renders source text as text and never evaluates markup", async ({ page }) 
   await page.getByRole("button", { name: /unsafe\.ts/ }).click();
   await expect(page.getByText(payload.trim(), { exact: true })).toBeVisible();
   expect(await page.evaluate(() => (window as Window & { __reviewXss?: boolean }).__reviewXss)).toBeUndefined();
-  expect(await page.locator("script").count()).toBe(1);
+  // ファーストパーティスクリプトのみ(Viteエントリ+テーマ初期化)。ルート相対パス以外の
+  // 外部srcを持つスクリプトの注入は禁止で、ソース本文も実行されない(直前の__reviewXss検査と併用)
+  expect(await page.locator("script").count()).toBe(2);
+  const sources = await page.locator("script[src]").evaluateAll((nodes) =>
+    nodes.map((node) => node.getAttribute("src") ?? ""),
+  );
+  for (const source of sources) {
+    expect(source.startsWith("/"), `unexpected script src: ${source}`).toBe(true);
+  }
 });
 
 test("does not disclose snapshots across decision records", async () => {
