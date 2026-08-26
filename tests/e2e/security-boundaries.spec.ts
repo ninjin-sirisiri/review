@@ -294,7 +294,7 @@ test("renders source text as text and never evaluates markup", async ({ page }) 
     nodes.map((node) => node.getAttribute("src") ?? ""),
   );
   for (const source of sources) {
-    expect(source.startsWith("/"), `unexpected script src: ${source}`).toBe(true);
+    expect(/^\/[^/]/.test(source), `unexpected script src: ${source}`).toBe(true);
   }
 });
 

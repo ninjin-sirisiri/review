@@ -44,7 +44,7 @@ export function ThemeToggle() {
         ? "Light"
         : "Dark";
   return (
-    <button type="button" className="theme-toggle" aria-label="Color scheme" onClick={() => setTheme(NEXT_SETTING[setting])}>
+    <button type="button" className="theme-toggle" aria-label={`Color scheme: ${label}`} onClick={() => setTheme(NEXT_SETTING[setting])}>
       <SettingIcon kind={setting} />
       <span className="theme-toggle__label">{label}</span>
     </button>

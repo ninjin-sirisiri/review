@@ -14,7 +14,7 @@ afterEach(() => {
 describe("ThemeToggle", () => {
   it("cycles System -> Light -> Dark -> System and applies each theme", () => {
     render(<ThemeToggle />);
-    const toggle = screen.getByRole("button", { name: "Color scheme" });
+    const toggle = screen.getByRole("button", { name: /Color scheme/ });
     expect(labelOf(toggle)).toMatch(/^System \((light|dark)\)$/);
     expect(toggle.querySelector("svg[aria-hidden='true']")).toBeTruthy();
 
@@ -35,7 +35,7 @@ describe("ThemeToggle", () => {
   it("starts from the persisted manual theme", () => {
     window.localStorage.setItem("review-ui-theme", "dark");
     render(<ThemeToggle />);
-    const toggle = screen.getByRole("button", { name: "Color scheme" });
+    const toggle = screen.getByRole("button", { name: /Color scheme/ });
     expect(labelOf(toggle)).toBe("Dark");
     expect(document.documentElement.dataset.theme).toBe("dark");
   });

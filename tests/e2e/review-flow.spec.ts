@@ -235,9 +235,9 @@ test("reviews a decision through the explorer, accepts it, and flags a tampered 
   // トークンはメモリ保持なので再認証になる。不変条件は「トークン非出力」:ストレージ/URLに現れないこと
   await expect(page.getByLabel("Owner bearer token")).toBeVisible();
   await expect(page).not.toHaveURL(new RegExp(token));
-  // トークンは一切ストレージに現れないこと(UI設定などの無害なキーは許容)
+  // トークンは一切ストレージに現れないこと(キーと値の両方を検査。UI設定などの無害なキーは許容)
   await expect(page.evaluate(() =>
-    Object.values(localStorage).some((value) => String(value).includes(token)),
+    [...Object.keys(localStorage), ...Object.values(localStorage)].some((value) => String(value).includes(token)),
   )).resolves.toBe(false);
 
   await page.getByLabel("Owner bearer token").fill(token);
@@ -318,7 +318,7 @@ test("switches the color scheme, persists it, and boots without flashing", async
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await expect(page.evaluate(() => localStorage.getItem("review-ui-theme"))).resolves.toBeNull();
 
-  const toggle = page.getByRole("button", { name: "Color scheme" });
+  const toggle = page.getByRole("button", { name: /Color scheme/ });
   await toggle.click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await expect(page.evaluate(() => localStorage.getItem("review-ui-theme"))).resolves.toBe("light");

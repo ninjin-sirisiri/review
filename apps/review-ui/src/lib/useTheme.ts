@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 
 export type ThemeSetting = "auto" | "light" | "dark";
 
-const STORAGE_KEY = "review-ui-theme";
+const STORAGE_KEY = "review-ui-theme"; // Keep in sync with the FOUC bootstrap script in index.html.
 
 type ResolvedTheme = "light" | "dark";
 
