@@ -31,7 +31,9 @@ function TreeItem(props: {
           onClick={() => onToggleDir(item.path)}
         >
           <span className="explorer__chevron" aria-hidden="true">
-            {isCollapsed ? "▸" : "▾"}
+            <svg viewBox="0 0 16 16" width="12" height="12" style={{ transform: isCollapsed ? "none" : "rotate(90deg)", transition: "transform 120ms ease" }}>
+              <path d="M6 3l5 5-5 5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
           </span>
           <span>{item.name}</span>
         </button>
