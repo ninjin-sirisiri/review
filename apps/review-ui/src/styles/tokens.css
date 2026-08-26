@@ -1,0 +1,85 @@
+:root {
+  --surface-base: #0f172a;
+  --surface-panel: #1e293b;
+  --surface-raised: #273449;
+  --surface-inset: #0b1222;
+
+  --text-primary: #f1f5f9;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
+
+  --border-subtle: rgb(148 163 184 / 16%);
+  --border-strong: rgb(148 163 184 / 32%);
+
+  --accent: #76b7ff;
+  --accent-soft: rgb(118 183 255 / 16%);
+  --on-accent: #0b1222;
+
+  --status-success: #4ade80;
+  --status-success-soft: rgb(74 222 128 / 14%);
+  --status-warning: #fbbf24;
+  --status-warning-soft: rgb(251 191 36 / 15%);
+  --status-danger: #f87171;
+  --status-danger-soft: rgb(248 113 113 / 14%);
+
+  --diff-add-text: #7ee787;
+  --diff-add-bg: rgb(46 160 67 / 15%);
+  --diff-del-text: #ffa198;
+  --diff-del-bg: rgb(248 81 73 / 15%);
+  --diff-anchor: #d29922;
+  --diff-anchor-soft: rgb(210 153 34 / 16%);
+
+  --focus-ring: #76b7ff;
+
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --surface-base: #f8fafc;
+  --surface-panel: #ffffff;
+  --surface-raised: #f1f5f9;
+  --surface-inset: #f6f8fa;
+
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+
+  --border-subtle: rgb(15 23 42 / 12%);
+  --border-strong: rgb(15 23 42 / 24%);
+
+  --accent: #0969da;
+  --accent-soft: rgb(9 105 218 / 10%);
+  --on-accent: #ffffff;
+
+  --status-success: #1a7f37;
+  --status-success-soft: rgb(26 127 55 / 12%);
+  --status-warning: #9a6700;
+  --status-warning-soft: rgb(154 103 0 / 12%);
+  --status-danger: #cf222e;
+  --status-danger-soft: rgb(207 34 46 / 10%);
+
+  --diff-add-text: #1a7f37;
+  --diff-add-bg: rgb(26 127 55 / 10%);
+  --diff-del-text: #cf222e;
+  --diff-del-bg: rgb(207 34 46 / 8%);
+  --diff-anchor: #9a6700;
+  --diff-anchor-soft: rgb(154 103 0 / 14%);
+
+  --focus-ring: #0969da;
+
+  color-scheme: light;
+}
