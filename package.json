@@ -20,6 +20,7 @@
     "e2e": "bun run --cwd apps/review-ui build && bunx playwright test"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.21",
     "@playwright/test": "^1.62.1",
     "@types/bun": "latest",
     "typescript": "latest"
