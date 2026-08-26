@@ -161,7 +161,7 @@ export class RecorderSetupClient {
     const data = await this.post("sessions", validation.data);
     const object = objectValue(data, "session");
     const agentType = requiredString(object.agent_type, "agent_type");
-    if (agentType !== "claude-code" && agentType !== "codex") throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", "Recorder response agent_type is invalid");
+    if (agentType !== "claude-code" && agentType !== "codex" && agentType !== "opencode") throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", "Recorder response agent_type is invalid");
     const status = requiredString(object.status, "status");
     if (status !== "active" && status !== "completed" && status !== "failed") throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", "Recorder response status is invalid");
     return {

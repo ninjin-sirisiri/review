@@ -35,7 +35,7 @@ Register the current repository and session with the local Recorder.
 Options:
   --root <path>       Repository root (default: current directory)
   --session-id <id>   Host session ID (default: AI_REVIEW_SESSION_ID or UUID)
-  --agent-type <type> claude-code or codex (default: claude-code)
+  --agent-type <type> claude-code, codex, or opencode (default: claude-code)
   --recorder-url <url> Loopback Recorder decision endpoint
   --token-path <path> Token file path
   -h, --help          Show this help
@@ -47,9 +47,12 @@ function optionValue(args: string[], index: number, flag: string): { value: stri
   return { value, nextIndex: index + 1 };
 }
 
+const AGENT_TYPES: readonly AgentType[] = ["claude-code", "codex", "opencode"];
+
 function agentType(value: string): AgentType {
-  if (value !== "claude-code" && value !== "codex") throw new Error("--agent-type must be claude-code or codex");
-  return value;
+  const match = AGENT_TYPES.find((type) => type === value);
+  if (match === undefined) throw new Error("--agent-type must be claude-code, codex, or opencode");
+  return match;
 }
 
 export function parseSetupCliArgs(args: string[]): SetupCliOptions {
@@ -117,7 +120,8 @@ export async function setupRecorder(options: SetupCliOptions = {}, client?: Setu
   const root = await realpath(resolve(options.root ?? process.cwd()));
   const sessionId = options.sessionId ?? process.env.AI_REVIEW_SESSION_ID ?? randomUUID();
   const sessionGenerated = options.sessionId === undefined && process.env.AI_REVIEW_SESSION_ID === undefined;
-  const type = options.agentType ?? (process.env.AI_REVIEW_AGENT_TYPE === "codex" ? "codex" : "claude-code");
+  const envAgentType = process.env.AI_REVIEW_AGENT_TYPE;
+  const type = options.agentType ?? (envAgentType === "codex" || envAgentType === "opencode" ? envAgentType : "claude-code");
   const setupClient = client ?? new RecorderSetupClient({
     ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
     ...(options.tokenPath === undefined ? {} : { tokenPath: options.tokenPath }),

@@ -26,7 +26,8 @@ var DISPOSITIONS = {
 };
 var AGENTS = {
   "claude-code": true,
-  codex: true
+  codex: true,
+  opencode: true
 };
 var CHECK_STATUSES = {
   passed: true,
@@ -218,7 +219,7 @@ function validateDecisionRecordInput(value) {
   if (requiredError)
     return requiredError;
   if (typeof value.agent_type !== "string" || !hasOwnKey(AGENTS, value.agent_type)) {
-    return invalid("agent_type must be claude-code or codex", "agent_type");
+    return invalid("agent_type must be claude-code, codex, or opencode", "agent_type");
   }
   const revisionResult = validateRevisionRef(value.revision);
   if (!revisionResult.success)
@@ -701,7 +702,7 @@ import { resolve as resolve2 } from "path";
 import { createHash as createHash2, randomUUID } from "crypto";
 import { lstat, mkdir, readFile as readFile2, readdir, realpath, rename, rm, stat, writeFile } from "fs/promises";
 import { homedir as homedir2 } from "os";
-import { isAbsolute as isAbsolute2, join as join2, relative, resolve, sep } from "path";
+import { basename, dirname, isAbsolute as isAbsolute2, join as join2, relative, resolve, sep } from "path";
 var DEFAULT_PERMIT_TTL_MS = 10 * 60 * 1000;
 var MAX_HASH_BYTES = 10 * 1024 * 1024;
 var PROPOSAL_KEYS = [
@@ -781,17 +782,36 @@ async function canonicalPath(root, filePath) {
   } catch (error) {
     if (error.code !== "ENOENT")
       return null;
-    try {
-      const parent = await realpath(resolve(filePath, ".."));
-      canonicalFile = resolve(parent, filePath.split(sep).pop() ?? "");
-    } catch {
+    const ancestor = await nearestExistingCanonicalPath(canonicalRoot, resolve(filePath));
+    if (ancestor === null)
       return null;
-    }
+    canonicalFile = ancestor;
   }
   const relativeFile = relative(canonicalRoot, canonicalFile);
   if (relativeFile === "" || relativeFile === ".." || relativeFile.startsWith(`..${sep}`) || isAbsolute2(relativeFile))
     return null;
   return { root: canonicalRoot, path: canonicalFile };
+}
+async function nearestExistingCanonicalPath(canonicalRoot, missingPath) {
+  const tail = [];
+  let candidate = missingPath;
+  for (;; ) {
+    const parent = dirname(candidate);
+    if (parent === candidate)
+      return null;
+    tail.push(basename(candidate));
+    candidate = parent;
+    try {
+      const resolved = await realpath(candidate);
+      const relativeAncestor = relative(canonicalRoot, resolved);
+      if (relativeAncestor === ".." || relativeAncestor.startsWith(`..${sep}`) || isAbsolute2(relativeAncestor))
+        return null;
+      return join2(resolved, ...tail.reverse());
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        return null;
+    }
+  }
 }
 async function hashExistingFile(path) {
   return hashText(await currentFileText(path));
@@ -927,16 +947,16 @@ async function claimPermit(path) {
     return null;
   }
 }
-async function consumeDecisionPermit(options) {
+async function findMatchingPermit(options) {
   const canonical = await canonicalPath(options.repositoryRoot, options.filePath);
   if (canonical === null)
-    return false;
+    return null;
   const directory = gateDirectory(canonical.root, options.sessionId, options.gateRoot === undefined ? {} : { gateRoot: options.gateRoot });
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
   } catch {
-    return false;
+    return null;
   }
   const relativeFile = relative(canonical.root, canonical.path).split(sep).join("/");
   for (const entry of entries) {
@@ -969,19 +989,102 @@ async function consumeDecisionPermit(options) {
     const actualHash = await hashExistingFile(canonical.path).catch(() => null);
     if (actualHash !== permit.contentHash)
       continue;
-    const claimed = await claimPermit(original);
-    if (claimed === null)
+    return { path: original };
+  }
+  return null;
+}
+async function peekDecisionPermit(options) {
+  return await findMatchingPermit(options) !== null;
+}
+async function consumeDecisionPermit(options) {
+  const found = await findMatchingPermit(options);
+  if (found === null)
+    return false;
+  const claimed = await claimPermit(found.path);
+  if (claimed === null)
+    return false;
+  await rm(claimed, { force: true }).catch(() => {
+    return;
+  });
+  return true;
+}
+var GIT_MUTATING_VERBS = new Set(["apply", "am", "restore", "reset", "rebase", "merge"]);
+var GIT_WORKTREE_METADATA_SUBCOMMANDS = new Set(["list", "prune", "lock", "unlock"]);
+function gitCheckoutMutates(tokens, from) {
+  let sawBranchCreation = false;
+  for (let index = from;index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined)
+      break;
+    if (token === "--")
+      return true;
+    if (token === "-b" || token === "-B" || token === "-q" || token === "--quiet" || token === "--no-guess" || token.startsWith("--branch")) {
+      if (token !== "-q" && token !== "--quiet" && token !== "--no-guess")
+        sawBranchCreation = true;
       continue;
-    await rm(claimed, { force: true }).catch(() => {
-      return;
-    });
+    }
+    if (token.startsWith("-"))
+      return true;
+    if (!sawBranchCreation)
+      return true;
+  }
+  return !sawBranchCreation && tokens.length > from;
+}
+function gitSwitchMutates(tokens, from) {
+  for (let index = from;index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined)
+      break;
+    if (token === "--")
+      return true;
+    if (token === "-c" || token === "-C" || token === "--create" || token === "-q" || token === "--quiet" || token === "--guess" || token === "--no-guess" || token === "-t" || token === "--track" || token === "--no-track" || token.startsWith("--create="))
+      continue;
+    if (token.startsWith("-"))
+      return true;
+  }
+  return false;
+}
+function gitWorktreeMutates(tokens, from) {
+  const subcommand = tokens[from];
+  if (subcommand === undefined || subcommand.startsWith("-"))
     return true;
+  if (GIT_WORKTREE_METADATA_SUBCOMMANDS.has(subcommand))
+    return false;
+  if (subcommand !== "add")
+    return true;
+  for (let index = from + 1;index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined)
+      break;
+    if (token === "-b" || token === "-B" || token === "--detach" || token === "-q" || token === "--quiet" || token === "--lock" || token === "--no-checkout" || token === "--checkout")
+      continue;
+    if (token.startsWith("-"))
+      return true;
+  }
+  return false;
+}
+function gitInvocationMutates(segment) {
+  const tokens = segment.trim().split(/\s+/).filter((token) => token.length > 0);
+  for (let index = 0;index < tokens.length; index += 1) {
+    if (tokens[index] !== "git")
+      continue;
+    const verb = tokens[index + 1];
+    if (verb === undefined)
+      continue;
+    if (GIT_MUTATING_VERBS.has(verb))
+      return true;
+    if (verb === "checkout" && gitCheckoutMutates(tokens, index + 2))
+      return true;
+    if (verb === "switch" && gitSwitchMutates(tokens, index + 2))
+      return true;
+    if (verb === "worktree" && gitWorktreeMutates(tokens, index + 2))
+      return true;
   }
   return false;
 }
 function likelyCodeMutation(command) {
   const normalized = command.replaceAll("\\", "/");
-  return /(?:^|[;&|]\s*)(?:apply_patch|patch)\b/i.test(normalized) || /\bgit\s+(?:apply|am|checkout|restore|reset|rebase|merge)\b/i.test(normalized) || /\b(?:sed|perl)\s+[^\n]*-i(?:\s|$)/i.test(normalized) || /\b(?:tee|install|cp|mv)\s+[^\n]*(?:>|$)/i.test(normalized) || /(?:^|\s)(?:>|>>|1>|2>)\s*[^\s|;&]+/.test(normalized) || /\b(?:python|python3|node|nodejs|bun)\s+[^\n]*(?:writeFile|appendFile|write_text|open\s*\([^)]*['"][wax+])/i.test(normalized);
+  return /(?:^|[;&|]\s*)(?:apply_patch|patch)\b/i.test(normalized) || normalized.split(/[;&|\n]+/).some(gitInvocationMutates) || /\b(?:sed|perl)\s+[^\n]*-i(?:\s|$)/i.test(normalized) || /\b(?:tee|install|cp|mv)\s+[^\n]*(?:>|$)/i.test(normalized) || /(?:^|\s)(?:>>|1>|2>|>)\s*(?!\/dev\/null(?:\s|$))(?![nN][uU][lL](?:\s|$))[^\s|;&<>]+/.test(normalized) || /\b(?:python|python3|node|nodejs|bun)\s+[^\n]*(?:writeFile|appendFile|write_text|open\s*\([^)]*['"][wax+])/i.test(normalized);
 }
 function defaultGateRoot() {
   return process.env.AI_REVIEW_GATE_ROOT ?? join2(homedir2(), ".ai-code-review-evidence", "gates");
@@ -1112,7 +1215,7 @@ class RecorderSetupClient {
     const data = await this.post("sessions", validation2.data);
     const object = objectValue(data, "session");
     const agentType = requiredString2(object.agent_type, "agent_type");
-    if (agentType !== "claude-code" && agentType !== "codex")
+    if (agentType !== "claude-code" && agentType !== "codex" && agentType !== "opencode")
       throw new RecorderSetupError("RECORDER_PROTOCOL_ERROR", "Recorder response agent_type is invalid");
     const status = requiredString2(object.status, "status");
     if (status !== "active" && status !== "completed" && status !== "failed")
@@ -1217,7 +1320,14 @@ function deny(reason) {
   };
 }
 function editReason(path) {
-  return `Code edit blocked for ${path}: record a structured judgment first with ai-review-record. The record must target this file at its current content hash; use the built-in Edit or Write tool after the command succeeds.`;
+  return [
+    `Code edit blocked for ${path}: record a structured judgment first, then retry this exact edit.`,
+    "Pipe this JSON to ai-review-record (inside Claude Code) or `bun <plugin>/bin/adapter.mjs record` from a plain shell:",
+    '{"targets":[{"path":"<repo-relative-path>","lineStart":1}],"judgment":"<decision>","rationale":"<why>"}',
+    "Required: targets[].path, targets[].lineStart, judgment, rationale; lineEnd is optional and contentHash is computed automatically.",
+    "The Recorder must be running locally first (ai-review --data-dir ./.ai-review --port 4318, i.e. http://127.0.0.1:4318).",
+    "See plugins/claude-code/skills/record-before-edit/SKILL.md."
+  ].join(" ");
 }
 async function checkPreToolUse(input, options = {}) {
   const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -1225,7 +1335,7 @@ async function checkPreToolUse(input, options = {}) {
     const command = shellCommandFromTool(input);
     if (command === null || !likelyCodeMutation(command))
       return null;
-    return deny("Shell command blocked because it may edit code. Record a judgment first, then use Edit or Write; arbitrary shell mutation is not accepted by the judgment gate.");
+    return deny("Shell command blocked because it may edit code. Record a judgment first with ai-review-record, then use Edit or Write; arbitrary shell mutation is not accepted by the judgment gate.");
   }
   if (toolName !== "Edit" && toolName !== "Write" && toolName !== "NotebookEdit" && toolName !== "MultiEdit")
     return null;
@@ -1239,13 +1349,33 @@ async function checkPreToolUse(input, options = {}) {
     return deny(error instanceof Error ? error.message : String(error));
   }
   const repositoryRoot = cwdFromInput(input);
-  const permitted = await consumeDecisionPermit({
+  const permitted = await peekDecisionPermit({
     sessionId,
     repositoryRoot,
     filePath,
     gateRoot: options.gateRoot ?? defaultGateRoot()
   });
   return permitted ? null : deny(editReason(filePath));
+}
+async function checkPostToolUse(input, options = {}) {
+  const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
+  if (toolName !== "Edit" && toolName !== "Write" && toolName !== "NotebookEdit" && toolName !== "MultiEdit")
+    return;
+  const filePath = filePathFromTool(input);
+  if (filePath === null)
+    return;
+  let sessionId;
+  try {
+    sessionId = sessionIdFromInput(input);
+  } catch {
+    return;
+  }
+  await consumeDecisionPermit({
+    sessionId,
+    repositoryRoot: cwdFromInput(input),
+    filePath,
+    gateRoot: options.gateRoot ?? defaultGateRoot()
+  });
 }
 function shellQuote(value) {
   return "'" + value.replaceAll("'", `'"'"'`) + "'";
@@ -1322,6 +1452,9 @@ async function runPreEditHook() {
     process.stdout.write(`${JSON.stringify(result)}
 `);
 }
+async function runPostEditHook() {
+  await checkPostToolUse(JSON.parse(await stdinText()));
+}
 async function runRecordCommand() {
   try {
     const result = await recordDecision(JSON.parse(await stdinText()));
@@ -1352,6 +1485,8 @@ if (import.meta.main) {
   const command = process.argv[2];
   if (command === "pre-edit") {
     await runPreEditHook();
+  } else if (command === "post-edit") {
+    await runPostEditHook();
   } else if (command === "record") {
     await runRecordCommand();
   } else if (command === "session-start") {
@@ -1361,10 +1496,11 @@ if (import.meta.main) {
   }
 }
 export {
-  runAdapter,
-  recordDecision,
-  mapHostEvent,
-  handleSessionStart,
+  RecorderBridge,
+  checkPostToolUse,
   checkPreToolUse,
-  RecorderBridge
+  handleSessionStart,
+  mapHostEvent,
+  recordDecision,
+  runAdapter
 };

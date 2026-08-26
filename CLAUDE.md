@@ -39,7 +39,7 @@ Test placement follows the runner: bun tests live in `packages/*/test`, `apps/re
 Bun workspaces monorepo (`packages/*`, `apps/*`, `plugins/*`). The pipeline:
 
 ```
-AI agent session (Claude Code / Codex)
+AI agent session (Claude Code / Codex / OpenCode)
   → adapter (plugins/claude-code | plugins/codex) reads JSONL judgment input on stdin
   → plugins/common maps it to contracts' DecisionRecordInput and POSTs to Recorder
   → Recorder validates via packages/contracts, persists to SQLite
@@ -52,7 +52,7 @@ AI agent session (Claude Code / Codex)
 - `apps/recorder` — the only stateful service: HTTP server (`src/http/server.ts`), owner-token auth, repository registration/validation, SQLite store (`src/store`), source resolution (`src/source`: git.ts read-only git access, worktree.ts working-tree reads, resolve.ts revision/hash matching).
 - `apps/review-ui` — two-pane workspace: Explorer file tree with per-file decision-count badges, plus judgment/detail panes. Talks to Recorder over fetch only.
 - `plugins/common` — JSONL mapping, Recorder bridge (loopback-only endpoints enforced, bounded in-memory retry queue), decision gate, `recorder-setup`.
-- `plugins/claude-code` / `plugins/codex` — thin adapters over common; claude-code also ships hooks + skills for edit gating. Plugin changes require `bun run build:claude-plugin` before reinstall.
+- `plugins/claude-code` / `plugins/codex` / `plugins/opencode` — thin adapters over common; claude-code ships hooks + skills for edit gating, opencode ships a native plugin (session auto-registration, edit gate via `tool.execute.before`, built-in `review_record_judgment` tool). Plugin changes require `bun run build:claude-plugin` before reinstall (claude-code only).
 - `docs/superpowers/{specs,plans}` — design specs and implementation plans.
 
 ### Core domain concepts

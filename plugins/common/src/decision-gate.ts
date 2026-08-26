@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   isRecord,
   type AgentType,
@@ -139,16 +139,35 @@ async function canonicalPath(root: string, filePath: string): Promise<{ root: st
     canonicalFile = await realpath(filePath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
-    try {
-      const parent = await realpath(resolve(filePath, ".."));
-      canonicalFile = resolve(parent, filePath.split(sep).pop() ?? "");
-    } catch {
-      return null;
-    }
+    // The file or one of its parents does not exist yet. Canonicalize the
+    // nearest existing ancestor instead: missing components cannot contain
+    // symlinks, so appending them lexically keeps the boundary check sound.
+    const ancestor = await nearestExistingCanonicalPath(canonicalRoot, resolve(filePath));
+    if (ancestor === null) return null;
+    canonicalFile = ancestor;
   }
   const relativeFile = relative(canonicalRoot, canonicalFile);
   if (relativeFile === "" || relativeFile === ".." || relativeFile.startsWith(`..${sep}`) || isAbsolute(relativeFile)) return null;
   return { root: canonicalRoot, path: canonicalFile };
+}
+
+async function nearestExistingCanonicalPath(canonicalRoot: string, missingPath: string): Promise<string | null> {
+  const tail: string[] = [];
+  let candidate = missingPath;
+  for (;;) {
+    const parent = dirname(candidate);
+    if (parent === candidate) return null;
+    tail.push(basename(candidate));
+    candidate = parent;
+    try {
+      const resolved = await realpath(candidate);
+      const relativeAncestor = relative(canonicalRoot, resolved);
+      if (relativeAncestor === ".." || relativeAncestor.startsWith(`..${sep}`) || isAbsolute(relativeAncestor)) return null;
+      return join(resolved, ...tail.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+    }
+  }
 }
 
 async function hashExistingFile(path: string): Promise<string> {
@@ -281,15 +300,15 @@ async function claimPermit(path: string): Promise<string | null> {
   }
 }
 
-export async function consumeDecisionPermit(options: ConsumeDecisionPermitOptions): Promise<boolean> {
+async function findMatchingPermit(options: ConsumeDecisionPermitOptions): Promise<{ path: string } | null> {
   const canonical = await canonicalPath(options.repositoryRoot, options.filePath);
-  if (canonical === null) return false;
+  if (canonical === null) return null;
   const directory = gateDirectory(canonical.root, options.sessionId, options.gateRoot === undefined ? {} : { gateRoot: options.gateRoot });
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
   } catch {
-    return false;
+    return null;
   }
   const relativeFile = relative(canonical.root, canonical.path).split(sep).join("/");
   for (const entry of entries) {
@@ -316,10 +335,78 @@ export async function consumeDecisionPermit(options: ConsumeDecisionPermitOption
     }
     const actualHash = await hashExistingFile(canonical.path).catch(() => null);
     if (actualHash !== permit.contentHash) continue;
-    const claimed = await claimPermit(original);
-    if (claimed === null) continue;
-    await rm(claimed, { force: true }).catch(() => undefined);
-    return true;
+    return { path: original };
+  }
+  return null;
+}
+
+export async function peekDecisionPermit(options: ConsumeDecisionPermitOptions): Promise<boolean> {
+  return (await findMatchingPermit(options)) !== null;
+}
+
+export async function consumeDecisionPermit(options: ConsumeDecisionPermitOptions): Promise<boolean> {
+  const found = await findMatchingPermit(options);
+  if (found === null) return false;
+  const claimed = await claimPermit(found.path);
+  if (claimed === null) return false;
+  await rm(claimed, { force: true }).catch(() => undefined);
+  return true;
+}
+
+const GIT_MUTATING_VERBS = new Set(["apply", "am", "restore", "reset", "rebase", "merge"]);
+const GIT_WORKTREE_METADATA_SUBCOMMANDS = new Set(["list", "prune", "lock", "unlock"]);
+
+function gitCheckoutMutates(tokens: string[], from: number): boolean {
+  let sawBranchCreation = false;
+  for (let index = from; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined) break;
+    if (token === "--") return true;
+    if (token === "-b" || token === "-B" || token === "-q" || token === "--quiet" || token === "--no-guess" || token.startsWith("--branch")) {
+      if (token !== "-q" && token !== "--quiet" && token !== "--no-guess") sawBranchCreation = true;
+      continue;
+    }
+    if (token.startsWith("-")) return true;
+    if (!sawBranchCreation) return true;
+  }
+  return !sawBranchCreation && tokens.length > from;
+}
+
+function gitSwitchMutates(tokens: string[], from: number): boolean {
+  for (let index = from; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined) break;
+    if (token === "--") return true;
+    if (token === "-c" || token === "-C" || token === "--create" || token === "-q" || token === "--quiet" || token === "--guess" || token === "--no-guess" || token === "-t" || token === "--track" || token === "--no-track" || token.startsWith("--create=")) continue;
+    if (token.startsWith("-")) return true;
+  }
+  return false;
+}
+
+function gitWorktreeMutates(tokens: string[], from: number): boolean {
+  const subcommand = tokens[from];
+  if (subcommand === undefined || subcommand.startsWith("-")) return true;
+  if (GIT_WORKTREE_METADATA_SUBCOMMANDS.has(subcommand)) return false;
+  if (subcommand !== "add") return true;
+  for (let index = from + 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined) break;
+    if (token === "-b" || token === "-B" || token === "--detach" || token === "-q" || token === "--quiet" || token === "--lock" || token === "--no-checkout" || token === "--checkout") continue;
+    if (token.startsWith("-")) return true;
+  }
+  return false;
+}
+
+function gitInvocationMutates(segment: string): boolean {
+  const tokens = segment.trim().split(/\s+/).filter((token) => token.length > 0);
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens[index] !== "git") continue;
+    const verb = tokens[index + 1];
+    if (verb === undefined) continue;
+    if (GIT_MUTATING_VERBS.has(verb)) return true;
+    if (verb === "checkout" && gitCheckoutMutates(tokens, index + 2)) return true;
+    if (verb === "switch" && gitSwitchMutates(tokens, index + 2)) return true;
+    if (verb === "worktree" && gitWorktreeMutates(tokens, index + 2)) return true;
   }
   return false;
 }
@@ -327,10 +414,10 @@ export async function consumeDecisionPermit(options: ConsumeDecisionPermitOption
 export function likelyCodeMutation(command: string): boolean {
   const normalized = command.replaceAll("\\", "/");
   return /(?:^|[;&|]\s*)(?:apply_patch|patch)\b/i.test(normalized)
-    || /\bgit\s+(?:apply|am|checkout|restore|reset|rebase|merge)\b/i.test(normalized)
+    || normalized.split(/[;&|\n]+/).some(gitInvocationMutates)
     || /\b(?:sed|perl)\s+[^\n]*-i(?:\s|$)/i.test(normalized)
     || /\b(?:tee|install|cp|mv)\s+[^\n]*(?:>|$)/i.test(normalized)
-    || /(?:^|\s)(?:>|>>|1>|2>)\s*[^\s|;&]+/.test(normalized)
+    || /(?:^|\s)(?:>>|1>|2>|>)\s*(?!\/dev\/null(?:\s|$))(?![nN][uU][lL](?:\s|$))[^\s|;&<>]+/.test(normalized)
     || /\b(?:python|python3|node|nodejs|bun)\s+[^\n]*(?:writeFile|appendFile|write_text|open\s*\([^)]*['"][wax+])/i.test(normalized);
 }
 

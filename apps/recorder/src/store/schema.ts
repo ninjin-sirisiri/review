@@ -1,9 +1,21 @@
 import { Database } from "bun:sqlite";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
-const MIGRATIONS: readonly string[] = [
-  `
+interface Migration {
+  readonly sql: string;
+  /**
+   * Set when a migration rebuilds tables that participate in foreign keys;
+   * referential checks are suspended for the duration of the migration only.
+   */
+  readonly withoutForeignKeys?: boolean;
+}
+
+const AGENT_CHECK = "agent_type TEXT NOT NULL CHECK (agent_type IN ('claude-code', 'codex', 'opencode'))";
+
+const MIGRATIONS: readonly Migration[] = [
+  {
+    sql: `
     CREATE TABLE IF NOT EXISTS repositories (
       repository_id TEXT PRIMARY KEY,
       root TEXT,
@@ -13,7 +25,7 @@ const MIGRATIONS: readonly string[] = [
     CREATE TABLE IF NOT EXISTS sessions (
       session_id TEXT PRIMARY KEY,
       repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
-      agent_type TEXT NOT NULL CHECK (agent_type IN ('claude-code', 'codex')),
+      ${AGENT_CHECK},
       started_at TEXT NOT NULL,
       ended_at TEXT,
       status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'failed'))
@@ -24,7 +36,7 @@ const MIGRATIONS: readonly string[] = [
       record_id TEXT NOT NULL UNIQUE,
       session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
       repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
-      agent_type TEXT NOT NULL CHECK (agent_type IN ('claude-code', 'codex')),
+      ${AGENT_CHECK},
       revision_kind TEXT NOT NULL CHECK (revision_kind IN ('commit', 'working-tree')),
       revision_value TEXT NOT NULL,
       judgment TEXT NOT NULL,
@@ -68,6 +80,55 @@ const MIGRATIONS: readonly string[] = [
       created_at TEXT NOT NULL
     );
   `,
+  },
+  {
+    // Rebuild the two tables carrying an agent_type CHECK constraint so databases
+    // created before opencode support accept the new value (SQLite cannot alter
+    // a CHECK constraint in place).
+    withoutForeignKeys: true,
+    sql: `
+      CREATE TABLE sessions_rebuilt (
+        session_id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        ${AGENT_CHECK},
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'failed'))
+      );
+      INSERT INTO sessions_rebuilt (session_id, repository_id, agent_type, started_at, ended_at, status)
+        SELECT session_id, repository_id, agent_type, started_at, ended_at, status FROM sessions;
+      DROP TABLE sessions;
+      ALTER TABLE sessions_rebuilt RENAME TO sessions;
+
+      CREATE TABLE decision_records_rebuilt (
+        decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_id TEXT NOT NULL UNIQUE,
+        session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+        repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        ${AGENT_CHECK},
+        revision_kind TEXT NOT NULL CHECK (revision_kind IN ('commit', 'working-tree')),
+        revision_value TEXT NOT NULL,
+        judgment TEXT NOT NULL,
+        rationale TEXT NOT NULL,
+        checks_json TEXT NOT NULL,
+        open_questions_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        user_disposition TEXT NOT NULL CHECK (user_disposition IN ('unreviewed', 'accepted', 'rejected'))
+      );
+      INSERT INTO decision_records_rebuilt (
+        decision_id, record_id, session_id, repository_id, agent_type, revision_kind,
+        revision_value, judgment, rationale, checks_json, open_questions_json, created_at, user_disposition
+      )
+        SELECT
+          decision_id, record_id, session_id, repository_id, agent_type, revision_kind,
+          revision_value, judgment, rationale, checks_json, open_questions_json, created_at, user_disposition
+        FROM decision_records;
+      DROP TABLE decision_records;
+      ALTER TABLE decision_records_rebuilt RENAME TO decision_records;
+
+      PRAGMA foreign_key_check;
+    `,
+  },
 ];
 
 export function migrateSchema(db: Database): void {
@@ -77,10 +138,22 @@ export function migrateSchema(db: Database): void {
   let version = row.version;
   while (version < MIGRATIONS.length) {
     const nextVersion = version + 1;
-    db.transaction(() => {
-      db.exec(MIGRATIONS[nextVersion - 1] as string);
+    const migration = MIGRATIONS[nextVersion - 1] as Migration;
+    const apply = (): void => {
+      db.exec(migration.sql);
       db.query("INSERT INTO schema_migrations (version) VALUES ($version)").run({ $version: nextVersion });
-    })();
+    };
+    if (migration.withoutForeignKeys === true) {
+      // PRAGMA foreign_keys is a no-op inside a transaction, so it is toggled around it.
+      db.exec("PRAGMA foreign_keys = OFF;");
+      try {
+        db.transaction(apply)();
+      } finally {
+        db.exec("PRAGMA foreign_keys = ON;");
+      }
+    } else {
+      db.transaction(apply)();
+    }
     version = nextVersion;
   }
 }

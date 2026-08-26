@@ -5,7 +5,7 @@ import { afterAll, beforeEach, expect, test } from "bun:test";
 import { grantDecisionPermits, normalizeDecisionProposal } from "../../common/src/decision-gate";
 import type { AdapterBridge, SubmitResult } from "../../common/src/adapter-contract";
 import type { RecorderSetupClient } from "../../common/src/recorder-setup";
-import { checkPreToolUse, handleSessionStart, recordDecision } from "../src/gate-command";
+import { checkPostToolUse, checkPreToolUse, handleSessionStart, recordDecision } from "../src/gate-command";
 
 const GATED_ENV_KEYS = ["AI_REVIEW_SESSION_ID", "AI_REVIEW_REPOSITORY_ROOT", "AI_REVIEW_AGENT_TYPE", "AI_REVIEW_GATE_ROOT"];
 const preservedEnv: Record<string, string | undefined> = {};
@@ -41,9 +41,11 @@ test("PreToolUse denies an Edit without a matching recorded judgment", async () 
   }, { gateRoot: current.gateRoot });
 
   expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+  expect(decision?.hookSpecificOutput.permissionDecisionReason).toContain('"targets":[{"path":');
+  expect(decision?.hookSpecificOutput.permissionDecisionReason).toContain("127.0.0.1:4318");
 });
 
-test("PreToolUse allows exactly one matching Edit after a judgment is recorded", async () => {
+test("PreToolUse peeks and PostToolUse consumes so only a completed edit spends the permit", async () => {
   const current = await fixture();
   const event = await normalizeDecisionProposal({
     repositoryRoot: current.root,
@@ -52,19 +54,40 @@ test("PreToolUse allows exactly one matching Edit after a judgment is recorded",
     rationale: "the focused branch keeps the existing guard",
   }, { sessionId: "session-allowed" });
   await grantDecisionPermits(event, { recordId: "record-allowed", gateRoot: current.gateRoot });
-
-  expect(await checkPreToolUse({
+  const editInput = {
     session_id: "session-allowed",
     cwd: current.root,
     tool_name: "Edit",
     tool_input: { file_path: current.file, old_string: "1", new_string: "2" },
-  }, { gateRoot: current.gateRoot })).toBeNull();
-  expect((await checkPreToolUse({
-    session_id: "session-allowed",
+  };
+
+  expect(await checkPreToolUse(editInput, { gateRoot: current.gateRoot })).toBeNull();
+
+  await checkPostToolUse(editInput, { gateRoot: current.gateRoot });
+  expect((await checkPreToolUse(editInput, { gateRoot: current.gateRoot }))?.hookSpecificOutput.permissionDecision).toBe("deny");
+});
+
+test("a denial by another hook leaves the permit intact until an edit actually succeeds", async () => {
+  const current = await fixture();
+  const event = await normalizeDecisionProposal({
+    repositoryRoot: current.root,
+    targets: [{ path: "src/change.ts", lineStart: 1, lineEnd: 1 }],
+    judgment: "the change preserves the invariant",
+    rationale: "the focused branch keeps the existing guard",
+  }, { sessionId: "session-external-deny" });
+  await grantDecisionPermits(event, { recordId: "record-external-deny", gateRoot: current.gateRoot });
+  const editInput = {
+    session_id: "session-external-deny",
     cwd: current.root,
     tool_name: "Edit",
-    tool_input: { file_path: current.file, old_string: "1", new_string: "3" },
-  }, { gateRoot: current.gateRoot }))?.hookSpecificOutput.permissionDecision).toBe("deny");
+    tool_input: { file_path: current.file, old_string: "1", new_string: "2" },
+  };
+
+  expect(await checkPreToolUse(editInput, { gateRoot: current.gateRoot })).toBeNull();
+  expect(await checkPreToolUse(editInput, { gateRoot: current.gateRoot })).toBeNull();
+
+  await checkPostToolUse(editInput, { gateRoot: current.gateRoot });
+  expect((await checkPreToolUse(editInput, { gateRoot: current.gateRoot }))?.hookSpecificOutput.permissionDecision).toBe("deny");
 });
 
 test("PreToolUse blocks shell mutation paths so agents cannot bypass the file gate", async () => {

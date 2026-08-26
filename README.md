@@ -193,7 +193,7 @@ curl -sS -X POST http://127.0.0.1:4318/v1/sessions \
   }"
 ```
 
-`agent_type`は`claude-code`または`codex`です。Recorderはsessionとrepositoryの整合性を判断記録の保存前に検証します。
+`agent_type`は`claude-code`、`codex`、`opencode`のいずれかです。Recorderはsessionとrepositoryの整合性を判断記録の保存前に検証します。
 
 ### 判断記録を保存
 
@@ -321,7 +321,7 @@ curl -sS -X DELETE \
 
 snapshotはowner-local data directory内に保存され、content hashとサイズが検証されます。
 
-## Claude Code／Codexアダプター
+## Claude Code／Codex／OpenCodeアダプター
 
 アダプターはJSONLを標準入力から受け取り、1行につき1件の結果を標準出力へ返します。
 
@@ -366,6 +366,29 @@ JSON
 
 現在のプラグインはClaude Codeの全会話を自動収集するhookではありません。下記のJSONL入力を`ai-review-claude-code`へ渡す既存のアダプター経路も利用できます。ただし、この経路は判断記録を保存しますが、編集permitは発行しません。編集前の操作には必ず`ai-review-record`を使用します。
 
+### OpenCodeプラグイン
+
+OpenCode用のプラグインは`plugins/opencode/src/index.ts`です。プロジェクトの`opencode.json`で読み込むか、`.opencode/plugins/`へ配置すると自動的に読み込まれます。
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["./plugins/opencode/src/index.ts"]
+}
+```
+
+設定変更後はOpenCodeを再起動してください。プラグインは次の動作をします。
+
+- `session.created`イベントと初回のgate対象tool呼び出し時に、worktreeをrepositoryとしてRecorderへ自動登録する（agent_typeは`opencode`）
+- `edit`／`write`／`patch`（およびノートブック編集）を、対象ファイルの現在hashに一致する判断記録が先に保存されていない限り拒否する
+- `bash`の明らかなファイル変更コマンド（リダイレクト、`sed -i`、`git checkout`等）も拒否し、組み込みの`edit`／`write`へ戻す
+- 組み込みtool `review_record_judgment` で判断を記録し、対象path・現在content hash・セッションに結び付いた1回使い切りのpermitを発行する
+- `shell.env`経由でシェルに`AI_REVIEW_SESSION_ID`、`AI_REVIEW_REPOSITORY_ROOT`、`AI_REVIEW_AGENT_TYPE=opencode`をエクスポートする
+
+編集の流れはClaude Codeプラグインと同じです。まず`review_record_judgment`を呼び、`"success":true`を受け取った後だけ同じ対象へ`edit`を呼びます。permitは一致する1回の編集で消費され、hash変化・別ファイル・期限切れの場合は再記録が必要です。
+
+Recorderが停止していてもゲートは閉じたまま fail-closed で動作し、登録や記録の失敗はOpenCodeのログに警告として出力されます。
+
 ### JSONL入力形式
 
 ```json
@@ -407,6 +430,12 @@ Claude Code:
 
 ```bash
 printf '%s\n' '<JSONL入力>' | ai-review-claude-code
+```
+
+OpenCode:
+
+```bash
+printf '%s\n' '<JSONL入力>' | bun plugins/opencode/src/index.ts
 ```
 
 プラグイン未インストールの開発時だけ、bundle生成前のsource entrypointを直接実行できます。
@@ -676,6 +705,7 @@ apps/review-ui/           Review UI、Vitest、Vite build
 plugins/common/           共通JSONL mapper／Recorder bridge
 plugins/claude-code/      Claude Code adapter
 plugins/codex/            Codex adapter
+plugins/opencode/         OpenCode plugin（判断ゲート＋record tool）
 tests/e2e/                 Playwright workflow／security tests
 docs/superpowers/         設計仕様と実装計画
 ```

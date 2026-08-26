@@ -37,7 +37,7 @@ Recorder options:
 Setup options:
   --root <path>       Repository root (default: current directory)
   --session-id <id>   Host session ID (default: AI_REVIEW_SESSION_ID or UUID)
-  --agent-type <type> claude-code or codex (default: claude-code)
+  --agent-type <type> claude-code, codex, or opencode (default: claude-code)
   --recorder-url <url> Loopback Recorder decision endpoint
   --token-path <path> Token file path
 

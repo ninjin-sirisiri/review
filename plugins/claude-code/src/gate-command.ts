@@ -7,6 +7,7 @@ import {
   grantDecisionPermits,
   likelyCodeMutation,
   normalizeDecisionProposal,
+  peekDecisionPermit,
   type GateStorageOptions,
 } from "../../common/src/decision-gate";
 import { mapHostEvent, type AdapterBridge } from "../../common/src/adapter-contract";
@@ -106,7 +107,14 @@ function deny(reason: string): PreToolUseDenyOutput {
 }
 
 function editReason(path: string): string {
-  return `Code edit blocked for ${path}: record a structured judgment first with ai-review-record. The record must target this file at its current content hash; use the built-in Edit or Write tool after the command succeeds.`;
+  return [
+    `Code edit blocked for ${path}: record a structured judgment first, then retry this exact edit.`,
+    'Pipe this JSON to ai-review-record (inside Claude Code) or `bun <plugin>/bin/adapter.mjs record` from a plain shell:',
+    '{"targets":[{"path":"<repo-relative-path>","lineStart":1}],"judgment":"<decision>","rationale":"<why>"}',
+    "Required: targets[].path, targets[].lineStart, judgment, rationale; lineEnd is optional and contentHash is computed automatically.",
+    "The Recorder must be running locally first (ai-review --data-dir ./.ai-review --port 4318, i.e. http://127.0.0.1:4318).",
+    "See plugins/claude-code/skills/record-before-edit/SKILL.md.",
+  ].join(" ");
 }
 
 export async function checkPreToolUse(input: PreToolUseInput, options: GateStorageOptions = {}): Promise<PreToolUseOutput | null> {
@@ -114,7 +122,7 @@ export async function checkPreToolUse(input: PreToolUseInput, options: GateStora
   if (toolName === "Bash" || toolName === "PowerShell") {
     const command = shellCommandFromTool(input);
     if (command === null || !likelyCodeMutation(command)) return null;
-    return deny("Shell command blocked because it may edit code. Record a judgment first, then use Edit or Write; arbitrary shell mutation is not accepted by the judgment gate.");
+    return deny("Shell command blocked because it may edit code. Record a judgment first with ai-review-record, then use Edit or Write; arbitrary shell mutation is not accepted by the judgment gate.");
   }
   if (toolName !== "Edit" && toolName !== "Write" && toolName !== "NotebookEdit" && toolName !== "MultiEdit") return null;
   const filePath = filePathFromTool(input);
@@ -126,13 +134,41 @@ export async function checkPreToolUse(input: PreToolUseInput, options: GateStora
     return deny(error instanceof Error ? error.message : String(error));
   }
   const repositoryRoot = cwdFromInput(input);
-  const permitted = await consumeDecisionPermit({
+  // Peek only: consumption happens in checkPostToolUse once the edit has
+  // actually run, so a denial by another PreToolUse hook does not waste it.
+  const permitted = await peekDecisionPermit({
     sessionId,
     repositoryRoot,
     filePath,
     gateRoot: options.gateRoot ?? defaultGateRoot(),
   });
   return permitted ? null : deny(editReason(filePath));
+}
+
+export interface PostToolUseInput {
+  session_id?: unknown;
+  cwd?: unknown;
+  tool_name?: unknown;
+  tool_input?: unknown;
+}
+
+export async function checkPostToolUse(input: PostToolUseInput, options: GateStorageOptions = {}): Promise<void> {
+  const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
+  if (toolName !== "Edit" && toolName !== "Write" && toolName !== "NotebookEdit" && toolName !== "MultiEdit") return;
+  const filePath = filePathFromTool(input);
+  if (filePath === null) return;
+  let sessionId: string;
+  try {
+    sessionId = sessionIdFromInput(input);
+  } catch {
+    return;
+  }
+  await consumeDecisionPermit({
+    sessionId,
+    repositoryRoot: cwdFromInput(input),
+    filePath,
+    gateRoot: options.gateRoot ?? defaultGateRoot(),
+  });
 }
 
 function shellQuote(value: string): string {
@@ -206,6 +242,10 @@ export async function recordDecision(value: unknown, options: RecordDecisionOpti
 export async function runPreEditHook(): Promise<void> {
   const result = await checkPreToolUse(JSON.parse(await stdinText()) as PreToolUseInput);
   if (result !== null) process.stdout.write(`${JSON.stringify(result)}\n`);
+}
+
+export async function runPostEditHook(): Promise<void> {
+  await checkPostToolUse(JSON.parse(await stdinText()) as PostToolUseInput);
 }
 
 export async function runRecordCommand(): Promise<void> {

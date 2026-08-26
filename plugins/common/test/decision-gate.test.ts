@@ -6,7 +6,9 @@ import { describe, expect, test } from "bun:test";
 import {
   consumeDecisionPermit,
   grantDecisionPermits,
+  likelyCodeMutation,
   normalizeDecisionProposal,
+  peekDecisionPermit,
   type DecisionProposal,
 } from "../src/decision-gate";
 
@@ -105,5 +107,112 @@ describe("decision gate", () => {
       rejected = true;
     }
     expect(rejected).toBe(true);
+  });
+
+  test("accepts a new file whose parent directories do not exist yet", async () => {
+    const current = await repository();
+    const normalized = await normalizeDecisionProposal({
+      repositoryRoot: current.root,
+      targets: [{ path: "docs/nested/README.md", lineStart: 1 }],
+      judgment: "documents the decision",
+      rationale: "the file will be created by the gated edit",
+    }, { sessionId: "session-new-dir" });
+
+    const emptyHash = createHash("sha256").update("", "utf8").digest("hex");
+    expect(normalized.targets[0]?.contentHash).toBe(emptyHash);
+
+    await grantDecisionPermits(normalized, { recordId: "record-new-dir", gateRoot: join(current.root, ".gate-state") });
+    const missingFile = join(current.root, "docs", "nested", "README.md");
+    expect(await peekDecisionPermit({
+      sessionId: "session-new-dir",
+      repositoryRoot: current.root,
+      filePath: missingFile,
+      gateRoot: join(current.root, ".gate-state"),
+    })).toBe(true);
+  });
+
+  test("still rejects paths that escape the repository through missing directories", async () => {
+    const current = await repository();
+    let rejected = false;
+    try {
+      await normalizeDecisionProposal({
+        repositoryRoot: current.root,
+        targets: [{ path: "../outside-new/README.md", lineStart: 1 }],
+        judgment: "judgment",
+        rationale: "rationale",
+      }, { sessionId: "session-escape" });
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+  });
+
+  test("peeks at a permit without consuming it", async () => {
+    const current = await repository();
+    const normalized = await normalizeDecisionProposal(proposal(current.root, current.hash), { sessionId: "session-peek" });
+    await grantDecisionPermits(normalized, { recordId: "record-peek", gateRoot: join(current.root, ".gate-state") });
+
+    expect(await peekDecisionPermit({
+      sessionId: "session-peek",
+      repositoryRoot: current.root,
+      filePath: current.file,
+      gateRoot: join(current.root, ".gate-state"),
+    })).toBe(true);
+    expect(await peekDecisionPermit({
+      sessionId: "session-peek",
+      repositoryRoot: current.root,
+      filePath: current.file,
+      gateRoot: join(current.root, ".gate-state"),
+    })).toBe(true);
+    expect(await consumeDecisionPermit({
+      sessionId: "session-peek",
+      repositoryRoot: current.root,
+      filePath: current.file,
+      gateRoot: join(current.root, ".gate-state"),
+    })).toBe(true);
+    expect(await consumeDecisionPermit({
+      sessionId: "session-peek",
+      repositoryRoot: current.root,
+      filePath: current.file,
+      gateRoot: join(current.root, ".gate-state"),
+    })).toBe(false);
+  });
+});
+
+describe("likelyCodeMutation", () => {
+  test("allows branch and worktree creation that does not rewrite history or files", () => {
+    expect(likelyCodeMutation("git checkout -b feature/x")).toBe(false);
+    expect(likelyCodeMutation("git checkout -B feature/x")).toBe(false);
+    expect(likelyCodeMutation("git checkout --quiet -b feature/x main")).toBe(false);
+    expect(likelyCodeMutation("git switch -c feature/x")).toBe(false);
+    expect(likelyCodeMutation("git switch main")).toBe(false);
+    expect(likelyCodeMutation("git worktree add ../review-wt main")).toBe(false);
+    expect(likelyCodeMutation("git worktree list")).toBe(false);
+    expect(likelyCodeMutation("git status && git checkout -b feature/y && bun test")).toBe(false);
+  });
+
+  test("still blocks file-restoring and history-rewriting git operations", () => {
+    expect(likelyCodeMutation("git checkout -- src/change.ts")).toBe(true);
+    expect(likelyCodeMutation("git checkout src/change.ts")).toBe(true);
+    expect(likelyCodeMutation("git restore src/change.ts")).toBe(true);
+    expect(likelyCodeMutation("git reset --hard HEAD~1")).toBe(true);
+    expect(likelyCodeMutation("git rebase main")).toBe(true);
+    expect(likelyCodeMutation("git merge feature/x")).toBe(true);
+    expect(likelyCodeMutation("git apply patch.diff")).toBe(true);
+    expect(likelyCodeMutation("git worktree remove ../review-wt")).toBe(true);
+    expect(likelyCodeMutation("git switch --discard-changes main")).toBe(true);
+    expect(likelyCodeMutation("git switch -f main")).toBe(true);
+    expect(likelyCodeMutation("git checkout -q main")).toBe(true);
+    expect(likelyCodeMutation("git checkout -b feature/z && echo done > src/change.ts")).toBe(true);
+  });
+
+  test("does not treat /dev/null redirects as mutations while real redirects stay blocked", () => {
+    expect(likelyCodeMutation("bun test 2>/dev/null")).toBe(false);
+    expect(likelyCodeMutation("grep pattern src/change.ts >/dev/null")).toBe(false);
+    expect(likelyCodeMutation("bun run build > /dev/null 2>&1")).toBe(false);
+    expect(likelyCodeMutation("echo hi >> /dev/null")).toBe(false);
+    expect(likelyCodeMutation("bun test > results.txt")).toBe(true);
+    expect(likelyCodeMutation("echo note 2> error.log")).toBe(true);
+    expect(likelyCodeMutation("cat input | tee copy.txt")).toBe(true);
   });
 });

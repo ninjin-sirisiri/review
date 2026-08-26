@@ -1,4 +1,4 @@
-export type AgentType = "claude-code" | "codex";
+export type AgentType = "claude-code" | "codex" | "opencode";
 
 export type RevisionRef =
   | { kind: "commit"; sha: string }

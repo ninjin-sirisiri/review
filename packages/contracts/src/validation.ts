@@ -24,6 +24,7 @@ const DISPOSITIONS: Record<UserDisposition, true> = {
 const AGENTS: Record<AgentType, true> = {
   "claude-code": true,
   codex: true,
+  opencode: true,
 };
 const CHECK_STATUSES: Record<CheckEvidence["status"], true> = {
   passed: true,
@@ -251,7 +252,7 @@ export function validateDecisionRecordInput(value: unknown): ValidationResult<De
   if (requiredError) return requiredError;
 
   if (typeof value.agent_type !== "string" || !hasOwnKey(AGENTS, value.agent_type)) {
-    return invalid("agent_type must be claude-code or codex", "agent_type");
+    return invalid("agent_type must be claude-code, codex, or opencode", "agent_type");
   }
   const revisionResult = validateRevisionRef(value.revision);
   if (!revisionResult.success) return revisionResult;

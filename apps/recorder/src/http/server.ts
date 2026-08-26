@@ -111,7 +111,15 @@ function statusForError(code: ErrorCode): number {
 
 function errorResponse(error: unknown): Response {
   if (error instanceof ContractValidationError || error instanceof PersistenceError || error instanceof SourceResolutionError) {
-    return failure(error.code, error.message, statusForError(error.code), error instanceof ContractValidationError ? error.field : undefined);
+    const payload = failure(error.code, error.message, statusForError(error.code), error instanceof ContractValidationError ? error.field : undefined);
+    if (error.code === ERROR_CODES.PAYLOAD_TOO_LARGE) {
+      // The rejected request body was never consumed, so the client's upload stalls
+      // on TCP backpressure and Bun's graceful stop() would wait on the unfinished
+      // request forever. Declaring Connection: close makes Bun drop the socket
+      // right after flushing this response.
+      payload.headers.set("Connection", "close");
+    }
+    return payload;
   }
   if (error instanceof SyntaxError) return failure(ERROR_CODES.INVALID_RECORD, "request body must contain valid JSON", 400);
   return failure(ERROR_CODES.SOURCE_UNAVAILABLE, "request could not be processed", 500);

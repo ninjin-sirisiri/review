@@ -32,6 +32,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/ai-review-post-edit",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
