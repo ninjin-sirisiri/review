@@ -1008,7 +1008,7 @@ async function consumeDecisionPermit(options) {
   });
   return true;
 }
-var GIT_MUTATING_VERBS = new Set(["apply", "am", "restore", "reset", "rebase", "merge"]);
+var GIT_MUTATING_VERBS = new Set(["apply", "am", "restore", "reset", "rebase", "merge-file", "merge-index", "merge-one-file", "mergetool"]);
 var GIT_WORKTREE_METADATA_SUBCOMMANDS = new Set(["list", "prune", "lock", "unlock"]);
 function gitCheckoutMutates(tokens, from) {
   let sawBranchCreation = false;
@@ -1084,7 +1084,7 @@ function gitInvocationMutates(segment) {
 }
 function likelyCodeMutation(command) {
   const normalized = command.replaceAll("\\", "/");
-  return /(?:^|[;&|]\s*)(?:apply_patch|patch)\b/i.test(normalized) || normalized.split(/[;&|\n]+/).some(gitInvocationMutates) || /\b(?:sed|perl)\s+[^\n]*-i(?:\s|$)/i.test(normalized) || /\b(?:tee|install|cp|mv)\s+[^\n]*(?:>|$)/i.test(normalized) || /(?:^|\s)(?:>>|1>|2>|>)\s*(?!\/dev\/null(?:\s|$))(?![nN][uU][lL](?:\s|$))[^\s|;&<>]+/.test(normalized) || /\b(?:python|python3|node|nodejs|bun)\s+[^\n]*(?:writeFile|appendFile|write_text|open\s*\([^)]*['"][wax+])/i.test(normalized);
+  return /(?:^|[;&|]\s*)(?:apply_patch|patch)\b/i.test(normalized) || normalized.split(/[;&|\n]+/).some(gitInvocationMutates) || /\b(?:sed|perl)\s+[^\n]*-i(?:\s|$)/i.test(normalized) || /\b(?:tee|install|cp|mv)\s+[^\n]*(?:>|$)/i.test(normalized) || /(?:^|\s)(?:>>|1>|2>|>)\s*(?!\/dev\/null(?:\s|$))(?![nN][uU][lL](?:\s|$))(?!(?:\/private)?\/tmp\/)(?!\$\{?TMPDIR\}?\/)[^\s|;&<>]+/.test(normalized) || /\b(?:python|python3|node|nodejs|bun)\s+[^\n]*(?:writeFile|appendFile|write_text|open\s*\([^)]*['"][wax+])/i.test(normalized);
 }
 function defaultGateRoot() {
   return process.env.AI_REVIEW_GATE_ROOT ?? join2(homedir2(), ".ai-code-review-evidence", "gates");

@@ -353,7 +353,7 @@ export async function consumeDecisionPermit(options: ConsumeDecisionPermitOption
   return true;
 }
 
-const GIT_MUTATING_VERBS = new Set(["apply", "am", "restore", "reset", "rebase", "merge"]);
+const GIT_MUTATING_VERBS = new Set(["apply", "am", "restore", "reset", "rebase", "merge-file", "merge-index", "merge-one-file", "mergetool"]);
 const GIT_WORKTREE_METADATA_SUBCOMMANDS = new Set(["list", "prune", "lock", "unlock"]);
 
 function gitCheckoutMutates(tokens: string[], from: number): boolean {
@@ -417,7 +417,7 @@ export function likelyCodeMutation(command: string): boolean {
     || normalized.split(/[;&|\n]+/).some(gitInvocationMutates)
     || /\b(?:sed|perl)\s+[^\n]*-i(?:\s|$)/i.test(normalized)
     || /\b(?:tee|install|cp|mv)\s+[^\n]*(?:>|$)/i.test(normalized)
-    || /(?:^|\s)(?:>>|1>|2>|>)\s*(?!\/dev\/null(?:\s|$))(?![nN][uU][lL](?:\s|$))[^\s|;&<>]+/.test(normalized)
+    || /(?:^|\s)(?:>>|1>|2>|>)\s*(?!\/dev\/null(?:\s|$))(?![nN][uU][lL](?:\s|$))(?!(?:\/private)?\/tmp\/)(?!\$\{?TMPDIR\}?\/)[^\s|;&<>]+/.test(normalized)
     || /\b(?:python|python3|node|nodejs|bun)\s+[^\n]*(?:writeFile|appendFile|write_text|open\s*\([^)]*['"][wax+])/i.test(normalized);
 }
 

@@ -180,7 +180,7 @@ describe("decision gate", () => {
 });
 
 describe("likelyCodeMutation", () => {
-  test("allows branch and worktree creation that does not rewrite history or files", () => {
+  test("allows branch creation, worktrees, and merges that do not rewrite history", () => {
     expect(likelyCodeMutation("git checkout -b feature/x")).toBe(false);
     expect(likelyCodeMutation("git checkout -B feature/x")).toBe(false);
     expect(likelyCodeMutation("git checkout --quiet -b feature/x main")).toBe(false);
@@ -189,6 +189,11 @@ describe("likelyCodeMutation", () => {
     expect(likelyCodeMutation("git worktree add ../review-wt main")).toBe(false);
     expect(likelyCodeMutation("git worktree list")).toBe(false);
     expect(likelyCodeMutation("git status && git checkout -b feature/y && bun test")).toBe(false);
+    expect(likelyCodeMutation("git merge feature/x")).toBe(false);
+    expect(likelyCodeMutation("git merge --ff-only main")).toBe(false);
+    expect(likelyCodeMutation("git merge --no-ff feature/x")).toBe(false);
+    expect(likelyCodeMutation("git merge --squash feature/x")).toBe(false);
+    expect(likelyCodeMutation("git merge --abort")).toBe(false);
   });
 
   test("still blocks file-restoring and history-rewriting git operations", () => {
@@ -197,7 +202,8 @@ describe("likelyCodeMutation", () => {
     expect(likelyCodeMutation("git restore src/change.ts")).toBe(true);
     expect(likelyCodeMutation("git reset --hard HEAD~1")).toBe(true);
     expect(likelyCodeMutation("git rebase main")).toBe(true);
-    expect(likelyCodeMutation("git merge feature/x")).toBe(true);
+    expect(likelyCodeMutation("git merge-file current base other")).toBe(true);
+    expect(likelyCodeMutation("git mergetool")).toBe(true);
     expect(likelyCodeMutation("git apply patch.diff")).toBe(true);
     expect(likelyCodeMutation("git worktree remove ../review-wt")).toBe(true);
     expect(likelyCodeMutation("git switch --discard-changes main")).toBe(true);
@@ -206,13 +212,18 @@ describe("likelyCodeMutation", () => {
     expect(likelyCodeMutation("git checkout -b feature/z && echo done > src/change.ts")).toBe(true);
   });
 
-  test("does not treat /dev/null redirects as mutations while real redirects stay blocked", () => {
+  test("does not treat /dev/null and system-temporary redirects as mutations while repository writes stay blocked", () => {
     expect(likelyCodeMutation("bun test 2>/dev/null")).toBe(false);
     expect(likelyCodeMutation("grep pattern src/change.ts >/dev/null")).toBe(false);
     expect(likelyCodeMutation("bun run build > /dev/null 2>&1")).toBe(false);
     expect(likelyCodeMutation("echo hi >> /dev/null")).toBe(false);
+    expect(likelyCodeMutation("ls > /tmp/log")).toBe(false);
+    expect(likelyCodeMutation("bun run preview >/tmp/preview.log 2>&1 &")).toBe(false);
+    expect(likelyCodeMutation("bun test >> /private/tmp/e2e.log 2>&1")).toBe(false);
+    expect(likelyCodeMutation("bun test 2> $TMPDIR/err.log")).toBe(false);
     expect(likelyCodeMutation("bun test > results.txt")).toBe(true);
     expect(likelyCodeMutation("echo note 2> error.log")).toBe(true);
+    expect(likelyCodeMutation("bun run preview > log 2>&1 &")).toBe(true);
     expect(likelyCodeMutation("cat input | tee copy.txt")).toBe(true);
   });
 });
