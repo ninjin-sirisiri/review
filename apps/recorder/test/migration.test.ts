@@ -126,7 +126,7 @@ test("fresh databases accept every supported agent type", () => {
   try {
     migrateSchema(db);
     const version = db.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
-    expect(version.version).toBe(2);
+    expect(version.version).toBe(3);
 
     db.exec("INSERT INTO repositories (repository_id, root, created_at) VALUES ('repo-1', '/tmp/repo-1', '2026-08-24T00:00:00.000Z')");
     for (const agentType of ["claude-code", "codex", "opencode"] as const) {
@@ -158,7 +158,7 @@ test("migrating a legacy database preserves rows and unlocks the opencode agent 
     migrateSchema(migrated);
 
     const version = migrated.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
-    expect(version.version).toBe(2);
+    expect(version.version).toBe(3);
 
     const legacySession = migrated.query("SELECT agent_type FROM sessions WHERE session_id = 'session-legacy'").get() as { agent_type: string };
     expect(legacySession.agent_type).toBe("codex");
@@ -213,5 +213,70 @@ test("legacy databases still reject unsupported agent types after migration", as
     expect(rejected).toBe(true);
   } finally {
     migrated.close();
+  }
+});
+
+test("migrating a legacy database rebuilds snapshots for git-backed rows", async () => {
+  const file = await databaseFile();
+  const seeded = new Database(file);
+  try {
+    seedLegacyData(seeded);
+    seeded.exec(`
+      INSERT INTO decision_records (
+        record_id, session_id, repository_id, agent_type, revision_kind, revision_value,
+        judgment, rationale, checks_json, open_questions_json, created_at, user_disposition
+      ) VALUES (
+        'legacy-record', 'session-legacy', 'repo-1', 'codex', 'working-tree', 'hash',
+        'snapshot judgment', 'snapshot rationale', '[]', '[]', '2026-08-01T00:00:00.000Z', 'unreviewed'
+      );
+      INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at)
+        VALUES ('legacy-snapshot', 'legacy-record', 'patch', 'legacy.snapshot', 'legacy-hash', '2026-08-01T00:00:00.000Z');
+    `);
+  } finally {
+    seeded.close();
+  }
+
+  const db = new Database(file);
+  try {
+    migrateSchema(db);
+
+    const version = db.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
+    expect(version.version).toBe(3);
+
+    const row = db.query("SELECT snapshot_id FROM snapshots").get() as { snapshot_id: string } | null;
+    expect(row?.snapshot_id).toBe("legacy-snapshot");
+
+    const columns = (db.query("PRAGMA table_info(snapshots)").all() as Array<{ name: string }>).map((column) => column.name);
+    expect(columns).toContain("base_sha");
+    expect(columns).toContain("source_path");
+    const preserved = db.query("SELECT base_sha, source_path FROM snapshots WHERE snapshot_id = 'legacy-snapshot'").get() as { base_sha: string | null; source_path: string | null };
+    expect(preserved.base_sha).toBeNull();
+    expect(preserved.source_path).toBeNull();
+
+    const indexes = (db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'snapshots'").all() as Array<{ name: string }>).map((index) => index.name);
+    expect(indexes).toContain("snapshots_storage_path_unique");
+
+    // Two git rows may share path=''.
+    db.query(
+      "INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path) VALUES ($id, 'legacy-record', 'git', '', 'h1', '2026-08-26T00:00:00Z', $sha, 'src/a.ts')",
+    ).run({ $id: "git-1", $sha: "a".repeat(40) });
+    db.query(
+      "INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path) VALUES ($id, 'legacy-record', 'git', '', 'h2', '2026-08-26T00:00:00Z', $sha, 'src/b.ts')",
+    ).run({ $id: "git-2", $sha: "b".repeat(40) });
+
+    // Constraint matrix.
+    expect(() =>
+      db.query("INSERT INTO snapshots VALUES ('bad-sha', 'legacy-record', 'git', '', 'h', '2026-08-26T00:00:00Z', 'zz', 'src/c.ts')").run(),
+    ).toThrow();
+    expect(() =>
+      db.query(`INSERT INTO snapshots VALUES ('file-with-sha', 'legacy-record', 'patch', 'p.snapshot', 'h', '2026-08-26T00:00:00Z', '${"a".repeat(40)}', null)`).run(),
+    ).toThrow();
+    // Duplicate real storage paths still collide through the partial index; a second distinct path is fine.
+    db.query("INSERT INTO snapshots VALUES ('dup-path', 'legacy-record', 'patch', 'same.snapshot', 'h', '2026-08-26T00:00:00Z', null, null)").run();
+    expect(() =>
+      db.query("INSERT INTO snapshots VALUES ('dup-path-2', 'legacy-record', 'patch', 'same.snapshot', 'h', '2026-08-26T00:00:00Z', null, null)").run(),
+    ).toThrow();
+  } finally {
+    db.close();
   }
 });

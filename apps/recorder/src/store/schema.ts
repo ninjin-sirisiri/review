@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 interface Migration {
   readonly sql: string;
@@ -126,6 +126,32 @@ const MIGRATIONS: readonly Migration[] = [
       DROP TABLE decision_records;
       ALTER TABLE decision_records_rebuilt RENAME TO decision_records;
 
+      PRAGMA foreign_key_check;
+    `,
+  },
+  {
+    // Rebuild snapshots: allow mode='git' rows carrying base_sha/source_path instead of a
+    // stored file; UNIQUE(path) becomes a partial index so git rows can share ''.
+    withoutForeignKeys: true,
+    sql: `
+      CREATE TABLE snapshots_rebuilt (
+        snapshot_id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES decision_records(record_id) ON DELETE CASCADE,
+        mode TEXT NOT NULL CHECK (mode IN ('changed-files', 'patch', 'git')),
+        path TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        base_sha TEXT,
+        source_path TEXT,
+        CHECK (mode = 'git' OR (base_sha IS NULL AND source_path IS NULL)),
+        CHECK (mode <> 'git' OR (base_sha IS NOT NULL AND source_path IS NOT NULL AND path = '')),
+        CHECK (base_sha IS NULL OR (length(base_sha) = 40 AND base_sha NOT GLOB '*[^0-9a-f]*'))
+      );
+      INSERT INTO snapshots_rebuilt (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path)
+        SELECT snapshot_id, record_id, mode, path, content_hash, created_at, NULL, NULL FROM snapshots;
+      DROP TABLE snapshots;
+      ALTER TABLE snapshots_rebuilt RENAME TO snapshots;
+      CREATE UNIQUE INDEX snapshots_storage_path_unique ON snapshots(path) WHERE path <> '';
       PRAGMA foreign_key_check;
     `,
   },
