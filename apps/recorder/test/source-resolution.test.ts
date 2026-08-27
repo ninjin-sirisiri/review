@@ -374,6 +374,40 @@ describe("source resolution", () => {
     context.store.close();
   });
 
+  test("reports revision-not-found when a git-backed snapshot commit is unavailable", async () => {
+    const context = await createResolverFixture();
+    const reference = await context.snapshots.createGitBacked(
+      "source-resolution-record",
+      "0".repeat(40),
+      context.fixture.path,
+      hash(context.fixture.committed),
+    );
+    const commitTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.committed) }, context.fixture.committed);
+    commitTarget.repository_id = context.repositoryId;
+
+    const resolved = await context.resolver.resolve(commitTarget, { snapshotId: reference.snapshot_id });
+
+    expect(resolved.state).toBe("revision-not-found");
+    context.store.close();
+  });
+
+  test("reports source-unavailable when a git-backed snapshot hash does not match its commit", async () => {
+    const context = await createResolverFixture();
+    const reference = await context.snapshots.createGitBacked(
+      "source-resolution-record",
+      context.fixture.commitSha,
+      context.fixture.path,
+      hash("not the committed content"),
+    );
+    const commitTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.committed) }, context.fixture.committed);
+    commitTarget.repository_id = context.repositoryId;
+
+    const resolved = await context.resolver.resolve(commitTarget, { snapshotId: reference.snapshot_id });
+
+    expect(resolved.state).toBe("source-unavailable");
+    context.store.close();
+  });
+
   test("returns source-unavailable when a registered live root disappears", async () => {
     const context = await createResolverFixture();
     const workingTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.working) }, context.fixture.working);
