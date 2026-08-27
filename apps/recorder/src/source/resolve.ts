@@ -6,7 +6,7 @@ import {
   type TargetReference,
 } from "../../../../packages/contracts/src/index";
 import { RepositoryRegistry, SourceResolutionError } from "../repositories/registry";
-import { GitReader } from "./git";
+import { GitReader, GitReaderError } from "./git";
 import { WorkingTreeReader } from "./worktree";
 import type { SnapshotStore } from "../store/snapshots";
 
@@ -81,6 +81,14 @@ export class SourceResolver {
     if (this.snapshots === undefined) return this.unavailable(target, target.path, "snapshot storage is unavailable");
     let stored: LoadedSnapshot | null;
     try {
+      const reference = await this.snapshots.getReference(snapshotId);
+      if (reference === null) return this.unavailable(target, target.path, "snapshot is unavailable or has been tampered with");
+      if (reference.mode === "git") {
+        if (typeof reference.base_sha !== "string" || typeof reference.source_path !== "string") {
+          return this.unavailable(target, target.path, "snapshot is unavailable or has been tampered with");
+        }
+        return this.resolveGitBackedSnapshot(target, reference.base_sha, reference.source_path, reference);
+      }
       stored = await this.snapshots.get(snapshotId);
     } catch {
       stored = null;
@@ -95,6 +103,39 @@ export class SourceResolver {
       content: stored.content,
       contentHash: stored.reference.content_hash,
       snapshot: stored.reference,
+    };
+  }
+
+  private async resolveGitBackedSnapshot(
+    target: TargetReference,
+    baseSha: string,
+    sourcePath: string,
+    reference: SnapshotReference,
+  ): Promise<ResolvedSource | UnresolvedSource> {
+    const repository = await this.registry.get(target.repository_id);
+    if (repository === null) return this.unavailable(target, target.path, "repository is unavailable");
+    let content: string;
+    try {
+      content = await this.git.readCommitFile(repository.root, baseSha, sourcePath);
+    } catch (error) {
+      if (error instanceof GitReaderError && error.code === ERROR_CODES.REVISION_NOT_FOUND) {
+        return this.unavailable(target, target.path, "snapshotted revision was not found", "revision-not-found");
+      }
+      return this.unavailable(target, target.path, "snapshot is unavailable or has been tampered with");
+    }
+    const contentHash = createHash("sha256").update(content, "utf8").digest("hex");
+    if (contentHash !== reference.content_hash) {
+      return this.unavailable(target, target.path, "snapshot is unavailable or has been tampered with");
+    }
+    return {
+      state: "snapshot-resolved",
+      repositoryId: target.repository_id,
+      path: target.path,
+      revision: target.revision,
+      target,
+      content,
+      contentHash,
+      snapshot: reference,
     };
   }
   private async resolveCommit(target: TargetReference & { revision: { kind: "commit"; sha: string } }, canonicalPath: string): Promise<ResolvedSource | UnresolvedSource> {

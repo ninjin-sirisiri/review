@@ -410,6 +410,73 @@ describe("authenticated local Recorder HTTP API", () => {
     expect(await json<{ success: false; error: { code: string } }>(unregistered)).toMatchObject({ success: false, error: { code: "REPOSITORY_NOT_REGISTERED" } });
   });
 
+  test("stores a git-backed reference when snapshot content matches HEAD and serves it back", async () => {
+    await runGit(["init"]);
+    await runGit(["config", "user.email", "fixture@example.test"]);
+    await runGit(["config", "user.name", "Fixture"]);
+    await writeFile(join(root, "src", "example.ts"), "export const answer = 42;\n", "utf8");
+    await runGit(["add", "--", "src/example.ts"]);
+    await runGit(["commit", "-m", "fixture"]);
+    await request("/v1/repositories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, repository_id: "repo-1" }),
+    });
+    await request("/v1/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repository_id: "repo-1", agent_type: "codex", session_id: "session-1", started_at: "2026-08-20T00:00:00Z", status: "active" }),
+    });
+    await request("/v1/decision-records", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body()),
+    });
+
+    const stored = await request("/v1/decision-records/record-1/snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "patch", content: "export const answer = 42;\n" }),
+    });
+    expect(stored.status).toBe(201);
+    const payload = await json<{ success: true; data: { mode: string; path: string; base_sha?: string; snapshot_id: string } }>(stored);
+    expect(payload.data.mode).toBe("git");
+    expect(payload.data.path).toBe("");
+    expect(payload.data.base_sha).toMatch(/^[0-9a-f]{40}$/);
+
+    const source = await request("/v1/decision-records/record-1/source?source=snapshot:" + payload.data.snapshot_id);
+    expect(await json<{ success: true; data: { state: string; content: string } }>(source)).toMatchObject({
+      success: true,
+      data: { state: "snapshot-resolved", content: "export const answer = 42;\n" },
+    });
+  });
+
+  test("stores a regular snapshot when content does not match any HEAD blob", async () => {
+    await request("/v1/repositories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, repository_id: "repo-1" }),
+    });
+    await request("/v1/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repository_id: "repo-1", agent_type: "codex", session_id: "session-1", started_at: "2026-08-20T00:00:00Z", status: "active" }),
+    });
+    await request("/v1/decision-records", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body()),
+    });
+    const stored = await request("/v1/decision-records/record-1/snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "patch", content: "unmatchable text\n" }),
+    });
+    expect(stored.status).toBe(201);
+    const payload = await json<{ success: true; data: { mode: string } }>(stored);
+    expect(payload.data.mode).toBe("patch");
+  });
+
   test("returns a structured path diff against the recorded revision or HEAD", async () => {
     await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root, repository_id: "repo-1" }) });
     await writeFile(join(root, "src", "example.ts"), "first source\nsecond line\n", "utf8");

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { access, lstat, realpath, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -19,6 +20,7 @@ import { RepositoryRegistry, SourceResolutionError } from "../repositories/regis
 import { RecordService } from "../records/service";
 import { SnapshotStore } from "../store/snapshots";
 import { PersistenceError, RecordStore } from "../store/records";
+import { detectGitBackable } from "../source/gitbacked";
 import { SourceResolver, type ResolvedSource, type UnresolvedSource } from "../source/resolve";
 
 export const DEFAULT_MAX_JSON_BYTES = 1_000_000;
@@ -248,9 +250,9 @@ function unavailableSnapshotSource(record: DecisionRecord, message: string): Arr
 
 async function resolveRecordSources(record: DecisionRecord, resolver: SourceResolver, selection: SourceSelection = "repository"): Promise<Array<Record<string, unknown>>> {
   if (typeof selection === "object") {
-    const snapshot = await resolver.snapshots?.get(selection.snapshotId);
+    const snapshot = await resolver.snapshots?.getReference(selection.snapshotId);
     if (snapshot === null || snapshot === undefined) return unavailableSnapshotSource(record, "snapshot is unavailable or has been tampered with");
-    if (snapshot.reference.record_id !== record.record_id) return unavailableSnapshotSource(record, "snapshot does not belong to this decision record");
+    if (snapshot.record_id !== record.record_id) return unavailableSnapshotSource(record, "snapshot does not belong to this decision record");
   }
   const sources: Array<Record<string, unknown>> = [];
   for (const target of record.targets) {
@@ -497,7 +499,18 @@ async function handleRequest(
       const content = input.content;
       if (mode !== "changed-files" && mode !== "patch") throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "mode must be changed-files or patch");
       if (typeof content !== "string") throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "content must be a string");
-      const reference = await service.createSnapshot(parts[1] ?? "", mode as SnapshotMode, content);
+      const recordId = parts[1] ?? "";
+      const contentHash = createHash("sha256").update(content, "utf8").digest("hex");
+      const record = await service.getDecision(recordId);
+      let reference;
+      if (record !== null) {
+        const eligible = await detectGitBackable(registry, resolver.git, record, contentHash);
+        reference = eligible !== null && new TextEncoder().encode(content).byteLength <= snapshots.config.maxSnapshotContentLength
+          ? await snapshots.createGitBacked(recordId, eligible.baseSha, eligible.sourcePath, contentHash)
+          : await service.createSnapshot(recordId, mode as SnapshotMode, content);
+      } else {
+        reference = await service.createSnapshot(recordId, mode as SnapshotMode, content);
+      }
       return success(reference, 201);
     }
 
@@ -558,4 +571,3 @@ export async function createRecorderServerFromConfig(config: RecorderConfig): Pr
 export async function getRecorderToken(config: RecorderConfig): Promise<string> {
   return readOwnerToken(config);
 }
-

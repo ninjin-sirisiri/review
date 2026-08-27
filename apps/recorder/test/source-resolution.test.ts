@@ -345,6 +345,35 @@ describe("source resolution", () => {
     context.store.close();
   });
 
+  test("resolves a git-backed snapshot through read-only history and reports dangling references", async () => {
+    const context = await createResolverFixture();
+    const headSha = context.resolver.git.resolveRevision
+      ? await context.resolver.git.resolveRevision(context.fixture.root, "HEAD")
+      : await (async () => {
+          const process = Bun.spawn({ cmd: ["git", "rev-parse", "HEAD"], cwd: context.fixture.root, stdout: "pipe", stderr: "pipe" });
+          return (await new Response(process.stdout).text()).trim();
+        })();
+    const reference = await context.snapshots.createGitBacked(
+      "source-resolution-record",
+      headSha,
+      context.fixture.path,
+      hash(context.fixture.committed),
+    );
+    const commitTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.committed) }, context.fixture.committed);
+    commitTarget.repository_id = context.repositoryId;
+
+    const resolved = await context.resolver.resolve(commitTarget, { snapshotId: reference.snapshot_id });
+    expect(resolved.state).toBe("snapshot-resolved");
+    if (resolved.state === "snapshot-resolved") {
+      expect(resolved.content).toBe(context.fixture.committed);
+      expect(resolved.snapshot?.base_sha).toBe(headSha);
+    }
+    await rm(context.fixture.root, { recursive: true, force: true });
+    const unavailable = await context.resolver.resolve(commitTarget, { snapshotId: reference.snapshot_id });
+    expect(unavailable.state).toBe("source-unavailable");
+    context.store.close();
+  });
+
   test("returns source-unavailable when a registered live root disappears", async () => {
     const context = await createResolverFixture();
     const workingTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.working) }, context.fixture.working);
