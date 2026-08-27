@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -401,6 +401,73 @@ describe("source resolution", () => {
     );
     const commitTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.committed) }, context.fixture.committed);
     commitTarget.repository_id = context.repositoryId;
+
+    const resolved = await context.resolver.resolve(commitTarget, { snapshotId: reference.snapshot_id });
+
+    expect(resolved.state).toBe("source-unavailable");
+    context.store.close();
+  });
+
+  test("does not resolve a git-backed snapshot from a replaced registered root", async () => {
+    const context = await createResolverFixture();
+    const reference = await context.snapshots.createGitBacked(
+      "source-resolution-record",
+      context.fixture.commitSha,
+      context.fixture.path,
+      hash(context.fixture.committed),
+    );
+    const commitTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.committed) }, context.fixture.committed);
+    commitTarget.repository_id = context.repositoryId;
+    const replacementParent = await mkdtemp(join(tmpdir(), "ai-review-source-replacement-"));
+    temporaryDirectories.push(replacementParent);
+    const replacementRoot = join(replacementParent, "repository");
+
+    await rename(context.fixture.root, replacementRoot);
+    await symlink(replacementRoot, context.fixture.root, "dir");
+
+    const resolved = await context.resolver.resolve(commitTarget, { snapshotId: reference.snapshot_id });
+
+    expect(resolved.state).toBe("source-unavailable");
+    context.store.close();
+  });
+
+  test("does not resolve a git-backed snapshot from an invalid UTF-8 blob", async () => {
+    const context = await createResolverFixture();
+    const invalidBytes = Uint8Array.from([0xff, 0xfe, 0x69, 0x6e, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x0a]);
+    const replacementText = "\uFFFD\uFFFDinvalid\n";
+    await writeFile(join(context.fixture.root, context.fixture.path), invalidBytes);
+    await runGit(context.fixture.root, ["add", "--", context.fixture.path]);
+    await runGit(context.fixture.root, ["commit", "--quiet", "--no-verify", "-m", "invalid-utf8"]);
+    const invalidSha = await runGit(context.fixture.root, ["rev-parse", "HEAD"]);
+    const reference = await context.snapshots.createGitBacked(
+      "source-resolution-record",
+      invalidSha,
+      context.fixture.path,
+      hash(replacementText),
+    );
+    const commitTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(replacementText) }, replacementText);
+    commitTarget.repository_id = context.repositoryId;
+
+    const resolved = await context.resolver.resolve(commitTarget, { snapshotId: reference.snapshot_id });
+
+    expect(resolved.state).toBe("source-unavailable");
+    context.store.close();
+  });
+
+  test("contains an unexpected git-backed resolution rejection as source-unavailable", async () => {
+    const context = await createResolverFixture();
+    const reference = await context.snapshots.createGitBacked(
+      "source-resolution-record",
+      context.fixture.commitSha,
+      context.fixture.path,
+      hash(context.fixture.committed),
+    );
+    const commitTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.committed) }, context.fixture.committed);
+    commitTarget.repository_id = context.repositoryId;
+    context.registry.assertTarget = async () => join(context.fixture.root, context.fixture.path);
+    context.registry.get = async () => {
+      throw new Error("unexpected registry failure");
+    };
 
     const resolved = await context.resolver.resolve(commitTarget, { snapshotId: reference.snapshot_id });
 

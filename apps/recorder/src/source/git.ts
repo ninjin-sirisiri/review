@@ -22,7 +22,12 @@ interface BoundedOutput {
   oversized: boolean;
 }
 
-async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<BoundedOutput> {
+interface DecoderOptions {
+  fatal?: boolean;
+  ignoreBOM?: boolean;
+}
+
+async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number, decoderOptions: DecoderOptions = {}): Promise<BoundedOutput> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let totalBytes = 0;
@@ -45,7 +50,7 @@ async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number)
     content.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return { text: new TextDecoder().decode(content), oversized: false };
+  return { text: new TextDecoder("utf-8", decoderOptions).decode(content), oversized: false };
 }
 
 function isSafeRevision(revision: string): boolean {
@@ -238,7 +243,7 @@ export class GitReader {
     this.maxDiffWork = diffWorkBudget(maxBytes);
   }
 
-  private async execute(root: string, args: string[]): Promise<GitResult> {
+  private async execute(root: string, args: string[], stdoutDecoderOptions?: DecoderOptions): Promise<GitResult> {
     let canonicalRoot: string;
     try {
       canonicalRoot = await realpath(root);
@@ -269,7 +274,7 @@ export class GitReader {
       },
     });
     const [stdout, stderr, exitCode] = await Promise.all([
-      readBounded(child.stdout, this.maxBytes),
+      readBounded(child.stdout, this.maxBytes, stdoutDecoderOptions),
       readBounded(child.stderr, this.maxBytes),
       child.exited,
     ]);
@@ -337,8 +342,18 @@ export class GitReader {
       .map((path) => validateEnumeratedPath(root, path));
   }
 
-  private async readCommitBlob(root: string, sha: string, path: string): Promise<string> {
-    const result = await this.execute(root, ["show", "--no-ext-diff", "--no-textconv", "--format=", `${sha}:${path}`]);
+  private async readCommitBlob(root: string, sha: string, path: string, strictUtf8 = false): Promise<string> {
+    let result: GitResult;
+    try {
+      result = await this.execute(
+        root,
+        ["show", "--no-ext-diff", "--no-textconv", "--format=", `${sha}:${path}`],
+        strictUtf8 ? { fatal: true, ignoreBOM: true } : undefined,
+      );
+    } catch (error) {
+      if (strictUtf8) throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git source blob is unavailable");
+      throw error;
+    }
     if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git source exceeds the configured source limit");
     if (result.exitCode !== 0) {
       throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git source blob is unavailable");
@@ -350,7 +365,7 @@ export class GitReader {
     const normalizedPath = normalizeSourcePath(relativePath);
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
-    return this.readCommitBlob(root, sha, normalizedPath);
+    return this.readCommitBlob(root, sha, normalizedPath, true);
   }
 
   async resolveRevision(root: string, base: string): Promise<string> {

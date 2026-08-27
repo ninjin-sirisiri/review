@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -41,6 +41,29 @@ async function createFixture(): Promise<Fixture> {
   const commitSha = await runGit(root, ["rev-parse", "HEAD"]);
   await writeFile(join(root, path), working, "utf8");
   return { root, path, commitSha, committed, working };
+}
+
+async function createBomFixture(): Promise<Fixture> {
+  const fixture = await createFixture();
+  const committed = `\uFEFF${fixture.committed}`;
+  await writeFile(join(fixture.root, fixture.path), committed, "utf8");
+  await runGit(fixture.root, ["add", "--", fixture.path]);
+  await runGit(fixture.root, ["commit", "--quiet", "-m", "bom"]);
+  const commitSha = await runGit(fixture.root, ["rev-parse", "HEAD"]);
+  await writeFile(join(fixture.root, fixture.path), fixture.working, "utf8");
+  return { ...fixture, commitSha, committed };
+}
+
+async function createInvalidUtf8Fixture(): Promise<Fixture> {
+  const fixture = await createFixture();
+  const invalidBytes = Uint8Array.from([0xff, 0xfe, 0x69, 0x6e, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x0a]);
+  const replacementText = "\uFFFD\uFFFDinvalid\n";
+  await writeFile(join(fixture.root, fixture.path), invalidBytes);
+  await runGit(fixture.root, ["add", "--", fixture.path]);
+  await runGit(fixture.root, ["commit", "--quiet", "--no-verify", "-m", "invalid-utf8"]);
+  const commitSha = await runGit(fixture.root, ["rev-parse", "HEAD"]);
+  await writeFile(join(fixture.root, fixture.path), fixture.working, "utf8");
+  return { ...fixture, commitSha, committed: replacementText };
 }
 
 async function registeredRecord(fixture: Fixture, repositoryId: string, registry: RepositoryRegistry): Promise<DecisionRecordInput> {
@@ -105,5 +128,69 @@ describe("detectGitBackable", () => {
     const unbornRegistered = await registry.register(emptyRoot);
     const unbornRecord = await registeredRecord({ ...fixture, path: "src/example.ts" }, unbornRegistered.repository_id, registry);
     expect(await detectGitBackable(registry, new GitReader(10_000), unbornRecord as never, hash(fixture.committed))).toBeNull();
+  });
+
+  test("does not read from a registered root after it is replaced by a symlink", async () => {
+    const fixture = await createFixture();
+    const store = new RecordStore(new Database(":memory:"));
+    const registry = new RepositoryRegistry(store);
+    const registered = await registry.register(fixture.root);
+    const record = await registeredRecord(fixture, registered.repository_id, registry);
+    const replacementParent = await mkdtemp(join(tmpdir(), "ai-review-gitbacked-replacement-"));
+    temporaryDirectories.push(replacementParent);
+    const replacementRoot = join(replacementParent, "repository");
+
+    await rename(fixture.root, replacementRoot);
+    await symlink(replacementRoot, fixture.root, "dir");
+
+    await expect(detectGitBackable(registry, new GitReader(10_000), record as never, hash(fixture.committed))).resolves.toBeNull();
+    store.close();
+  });
+
+  test("preserves a committed BOM and does not match content without it", async () => {
+    const fixture = await createBomFixture();
+    const store = new RecordStore(new Database(":memory:"));
+    const registry = new RepositoryRegistry(store);
+    const registered = await registry.register(fixture.root);
+    const record = await registeredRecord(fixture, registered.repository_id, registry);
+
+    await expect(detectGitBackable(registry, new GitReader(10_000), record as never, hash(fixture.committed))).resolves.toEqual({
+      baseSha: fixture.commitSha,
+      sourcePath: fixture.path,
+    });
+    await expect(detectGitBackable(registry, new GitReader(10_000), record as never, hash(fixture.committed.slice(1)))).resolves.toBeNull();
+    store.close();
+  });
+
+  test("does not match replacement text for an invalid UTF-8 committed blob", async () => {
+    const fixture = await createInvalidUtf8Fixture();
+    const store = new RecordStore(new Database(":memory:"));
+    const registry = new RepositoryRegistry(store);
+    const registered = await registry.register(fixture.root);
+    const record = await registeredRecord(fixture, registered.repository_id, registry);
+
+    await expect(new GitReader(10_000).readCommitFile(fixture.root, fixture.commitSha, fixture.path)).rejects.toMatchObject({ code: "SOURCE_UNAVAILABLE" });
+    await expect(detectGitBackable(registry, new GitReader(10_000), record as never, hash(fixture.committed))).resolves.toBeNull();
+    store.close();
+  });
+
+  test("does not make a git-backed reference for a SHA-256 HEAD", async () => {
+    const fixture = await createFixture();
+    const store = new RecordStore(new Database(":memory:"));
+    const registry = new RepositoryRegistry(store);
+    const registered = await registry.register(fixture.root);
+    const record = await registeredRecord(fixture, registered.repository_id, registry);
+    let readCalled = false;
+    const git = {
+      resolveRevision: async () => "a".repeat(64),
+      readCommitFile: async () => {
+        readCalled = true;
+        return fixture.committed;
+      },
+    } as unknown as GitReader;
+
+    await expect(detectGitBackable(registry, git, record as never, hash(fixture.committed))).resolves.toBeNull();
+    expect(readCalled).toBe(false);
+    store.close();
   });
 });

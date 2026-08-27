@@ -87,7 +87,7 @@ export class SourceResolver {
         if (typeof reference.base_sha !== "string" || typeof reference.source_path !== "string") {
           return this.unavailable(target, target.path, "snapshot is unavailable or has been tampered with");
         }
-        return this.resolveGitBackedSnapshot(target, reference.base_sha, reference.source_path, reference);
+        return await this.resolveGitBackedSnapshot(target, reference.base_sha, reference.source_path, reference);
       }
       stored = await this.snapshots.get(snapshotId);
     } catch {
@@ -112,6 +112,14 @@ export class SourceResolver {
     sourcePath: string,
     reference: SnapshotReference,
   ): Promise<ResolvedSource | UnresolvedSource> {
+    try {
+      await this.registry.assertTarget(target.repository_id, sourcePath);
+    } catch (error) {
+      if (error instanceof SourceResolutionError) {
+        return this.unavailable(target, target.path, "repository source is unavailable");
+      }
+      throw error;
+    }
     const repository = await this.registry.get(target.repository_id);
     if (repository === null) return this.unavailable(target, target.path, "repository is unavailable");
     let content: string;

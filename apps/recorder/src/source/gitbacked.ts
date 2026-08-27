@@ -23,7 +23,13 @@ export async function detectGitBackable(
     const repository = await registry.get(record.repository_id);
     if (repository === null) return null;
     const headSha = await git.resolveRevision(repository.root, "HEAD");
+    if (!/^[0-9a-f]{40}$/.test(headSha)) return null;
     for (const target of record.targets) {
+      try {
+        await registry.assertTarget(record.repository_id, target.path);
+      } catch {
+        return null;
+      }
       try {
         const blob = await git.readCommitFile(repository.root, headSha, target.path);
         const blobHash = createHash("sha256").update(blob, "utf8").digest("hex");

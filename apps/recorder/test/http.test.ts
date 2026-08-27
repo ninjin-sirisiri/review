@@ -451,6 +451,50 @@ describe("authenticated local Recorder HTTP API", () => {
     });
   });
 
+  test("falls back to a file-backed snapshot for a SHA-256 repository", async () => {
+    await runGit(["init", "--quiet", "--object-format=sha256"]);
+    await runGit(["config", "user.email", "fixture@example.test"]);
+    await runGit(["config", "user.name", "Fixture"]);
+    await writeFile(join(root, "src", "example.ts"), "export const answer = 42;\n", "utf8");
+    await runGit(["add", "--", "src/example.ts"]);
+    await runGit(["commit", "--quiet", "-m", "fixture"]);
+
+    const repository = await request("/v1/repositories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, repository_id: "repo-1" }),
+    });
+    expect(repository.status).toBe(201);
+    const session = await request("/v1/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repository_id: "repo-1", agent_type: "codex", session_id: "session-1", started_at: "2026-08-20T00:00:00Z", status: "active" }),
+    });
+    expect(session.status).toBe(201);
+    const record = await request("/v1/decision-records", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body()),
+    });
+    expect(record.status).toBe(201);
+
+    const stored = await request("/v1/decision-records/record-1/snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "patch", content: "export const answer = 42;\n" }),
+    });
+    expect(stored.status).toBe(201);
+    const payload = await json<{ success: true; data: { mode: string; base_sha?: string; snapshot_id: string } }>(stored);
+    expect(payload.data.mode).toBe("patch");
+    expect(payload.data.base_sha).toBeUndefined();
+
+    const source = await request(`/v1/decision-records/record-1/source?source=snapshot:${payload.data.snapshot_id}`);
+    expect(await json<{ success: true; data: { state: string; content: string } }>(source)).toMatchObject({
+      success: true,
+      data: { state: "snapshot-resolved", content: "export const answer = 42;\n" },
+    });
+  });
+
   test("stores a regular snapshot when content does not match any HEAD blob", async () => {
     await request("/v1/repositories", {
       method: "POST",
