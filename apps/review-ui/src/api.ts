@@ -39,10 +39,12 @@ export interface ResolvedSourceReference {
   snapshot?: {
     snapshot_id: string;
     record_id: string;
-    mode: "changed-files" | "patch";
+    mode: "changed-files" | "patch" | "git";
     path: string;
     content_hash: string;
     created_at: string;
+    base_sha?: string;
+    source_path?: string;
   };
 }
 

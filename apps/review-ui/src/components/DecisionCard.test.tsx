@@ -60,6 +60,24 @@ describe("DecisionCard", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("shows git provenance for snapshot-resolved sources", () => {
+    render(<DecisionCard detail={detailWithSnapshot("git", "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0")} />);
+
+    expect(screen.getByText(/snapshot @a1b2c3d4/)).toBeTruthy();
+  });
+
+  it("hides provenance when a git snapshot has no base SHA", () => {
+    render(<DecisionCard detail={detailWithSnapshot("git")} />);
+
+    expect(screen.queryByText(/snapshot @/)).toBeNull();
+  });
+
+  it.each(["changed-files", "patch"] as const)("hides provenance for %s snapshots", (mode) => {
+    render(<DecisionCard detail={detailWithSnapshot(mode, "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0")} />);
+
+    expect(screen.queryByText(/snapshot @/)).toBeNull();
+  });
+
   it("confirms a disposition before updating the displayed state", async () => {
     const onDispositionChange = vi.fn(async () => ({ ...detail, record: { ...detail.record, user_disposition: "accepted" as const } }));
     render(<DecisionCard detail={detail} onDispositionChange={onDispositionChange} />);
@@ -109,3 +127,25 @@ describe("DecisionCard", () => {
     expect(screen.queryByText(/const value/)).toBeNull();
   });
 });
+
+function detailWithSnapshot(mode: "changed-files" | "patch" | "git", baseSha?: string): DecisionRecordDetail {
+  const source = detail.sources[0];
+  if (source === undefined || source.state !== "resolved") throw new Error("The fixture must contain a resolved source");
+
+  return {
+    ...detail,
+    sources: [{
+      ...source,
+      state: "snapshot-resolved",
+      snapshot: {
+        snapshot_id: "snapshot-1",
+        record_id: detail.record.record_id,
+        mode,
+        path: "snapshot",
+        content_hash: source.content_hash,
+        created_at: "2026-08-20T10:00:00.000Z",
+        ...(baseSha === undefined ? {} : { base_sha: baseSha }),
+      },
+    }],
+  };
+}

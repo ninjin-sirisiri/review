@@ -63,6 +63,13 @@ export function DecisionCard({ detail, onDispositionChange, onTargetClick }: Dec
   }
 
   const warnings = unresolvedSources(detail);
+  const gitSnapshot = detail.sources.find(
+    (source): source is Extract<SourceReferenceData, { state: "resolved" | "snapshot-resolved" }> =>
+      (source.state === "resolved" || source.state === "snapshot-resolved") &&
+      source.snapshot?.mode === "git" &&
+      typeof source.snapshot.base_sha === "string",
+  );
+  const provenance = gitSnapshot?.snapshot?.base_sha?.slice(0, 8);
 
   return (
     <article className="decision-card" aria-labelledby={`decision-${displayedRecord.record_id}`}>
@@ -72,6 +79,11 @@ export function DecisionCard({ detail, onDispositionChange, onTargetClick }: Dec
           <h3 id={`decision-${displayedRecord.record_id}`}>{displayedRecord.judgment}</h3>
           <p className="decision-card__meta">
             {displayedRecord.agent_type} · {new Date(displayedRecord.created_at).toLocaleString()} · revision {revisionText(displayedRecord.revision)}
+            {provenance !== undefined && (
+              <span className="snapshot-provenance" title="Snapshot stored as a git reference">
+                {" · "}snapshot @{provenance}
+              </span>
+            )}
           </p>
         </div>
         <fieldset className="disposition-controls" disabled={isUpdating || onDispositionChange === undefined}>

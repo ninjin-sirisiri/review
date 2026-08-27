@@ -115,6 +115,7 @@ h4 { color: var(--text-primary); font-size: 0.85rem; margin-bottom: var(--space-
 }
 .decision-card__header h3 { margin: 0; font-size: 0.95rem; color: var(--text-primary); }
 .decision-card__meta { margin: var(--space-1) 0 0; font-size: 0.78rem; color: var(--text-muted); }
+.snapshot-provenance { color: var(--text-muted); font-family: var(--font-mono); white-space: nowrap; }
 .decision-card__warnings { display: grid; gap: var(--space-2); }
 .decision-card__targets { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .decision-card__targets h4 { width: 100%; margin: 0; font-size: 0.78rem; color: var(--text-muted); }
