@@ -192,7 +192,6 @@ export class SnapshotStore {
     if (!validation.success) {
       throw new PersistenceError(validation.error.code, validation.error.message);
     }
-    await mkdir(this.snapshotRoot, { recursive: true, mode: 0o700 });
     this.db.transaction(() => {
       this.db.query(
         `INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path)

@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { readdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -124,12 +124,13 @@ describe("SnapshotStore", () => {
 
   test("creates git-backed references without writing files", async () => {
     const { dataDir, db, snapshots } = await gitFixture();
+    expect(existsSync(join(dataDir, "snapshots"))).toBe(false);
     const reference = await snapshots.createGitBacked(decision.record_id, sha40, "changed.ts", "hash-1");
     expect(reference.mode).toBe("git");
     expect(reference.path).toBe("");
     expect(reference.base_sha).toBe(sha40);
     expect(reference.source_path).toBe("changed.ts");
-    expect(readdirSync(join(dataDir, "snapshots")).length).toBe(0);
+    expect(existsSync(join(dataDir, "snapshots"))).toBe(false);
 
     expect(await snapshots.get(reference.snapshot_id)).toBeNull();
     expect(await snapshots.getReference(reference.snapshot_id)).toEqual(reference);
