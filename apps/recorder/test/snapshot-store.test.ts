@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { readdirSync } from "node:fs";
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -106,6 +107,51 @@ describe("SnapshotStore", () => {
     const reference = await snapshots.create(decision.record_id, "patch", "small");
     await writeFile(join(dataDir, reference.path), "0123456789", "utf8");
     expect(await snapshots.get(reference.snapshot_id)).toBeNull();
+    db.close();
+  });
+
+  const sha40 = "a".repeat(40);
+
+  async function gitFixture() {
+    const dataDir = await mkdtemp(join(tmpdir(), "ai-review-snapshot-git-"));
+    temporaryDirectories.push(dataDir);
+    const db = new Database(":memory:");
+    const store = new RecordStore(db);
+    await store.createSession(session);
+    await store.insertDecision(decision);
+    return { dataDir, db, snapshots: new SnapshotStore(db, createRecorderConfig({ dataDir })) };
+  }
+
+  test("creates git-backed references without writing files", async () => {
+    const { dataDir, db, snapshots } = await gitFixture();
+    const reference = await snapshots.createGitBacked(decision.record_id, sha40, "changed.ts", "hash-1");
+    expect(reference.mode).toBe("git");
+    expect(reference.path).toBe("");
+    expect(reference.base_sha).toBe(sha40);
+    expect(reference.source_path).toBe("changed.ts");
+    expect(readdirSync(join(dataDir, "snapshots")).length).toBe(0);
+
+    expect(await snapshots.get(reference.snapshot_id)).toBeNull();
+    expect(await snapshots.getReference(reference.snapshot_id)).toEqual(reference);
+
+    const second = await snapshots.createGitBacked(decision.record_id, sha40, "other.ts", "hash-2");
+    expect(second.snapshot_id).not.toBe(reference.snapshot_id);
+    db.close();
+  });
+
+  test("rejects git-backed creation with an unknown record or malformed fields", async () => {
+    const { db, snapshots } = await gitFixture();
+    await expect(snapshots.createGitBacked("missing-record", sha40, "a.ts", "h")).rejects.toThrow(/does not exist/);
+    await expect(snapshots.createGitBacked(decision.record_id, "ZZ", "a.ts", "h")).rejects.toThrow();
+    await expect(snapshots.createGitBacked(decision.record_id, sha40, "../escape.ts", "h")).rejects.toThrow();
+    db.close();
+  });
+
+  test("deletes git-backed rows without touching disk", async () => {
+    const { db, snapshots } = await gitFixture();
+    const reference = await snapshots.createGitBacked(decision.record_id, sha40, "changed.ts", "hash-1");
+    await snapshots.delete(reference.snapshot_id);
+    expect(await snapshots.getReference(reference.snapshot_id)).toBeNull();
     db.close();
   });
 });

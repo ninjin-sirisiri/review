@@ -17,10 +17,24 @@ import { PersistenceError } from "./records";
 interface SnapshotRow {
   snapshot_id: string;
   record_id: string;
-  mode: SnapshotMode;
+  mode: string;
   path: string;
   content_hash: string;
   created_at: string;
+  base_sha: string | null;
+  source_path: string | null;
+}
+
+function referenceFromRow(row: SnapshotRow): SnapshotReference {
+  return {
+    snapshot_id: row.snapshot_id,
+    record_id: row.record_id,
+    mode: row.mode as SnapshotReference["mode"],
+    path: row.path,
+    content_hash: row.content_hash,
+    created_at: row.created_at,
+    ...(row.base_sha === null || row.source_path === null ? {} : { base_sha: row.base_sha, source_path: row.source_path }),
+  };
 }
 
 type ConfigInput = RecorderConfig | RecorderConfigOverrides;
@@ -95,6 +109,7 @@ export class SnapshotStore {
     if (!snapshotMode(mode)) {
       throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "snapshot mode must be changed-files or patch");
     }
+    if (mode === "git") throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "use createGitBacked for git-backed snapshots");
     if (typeof content !== "string") {
       throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "snapshot content must be a string");
     }
@@ -155,15 +170,62 @@ export class SnapshotStore {
     }
   }
 
-  async get(snapshotId: string): Promise<{ reference: SnapshotReference; content: string } | null> {
+  async createGitBacked(recordId: string, baseSha: string, sourcePath: string, contentHash: string): Promise<SnapshotReference> {
+    if (typeof recordId !== "string" || recordId.trim().length === 0) {
+      throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "recordId must be a non-empty string");
+    }
+    const decision = this.db.query("SELECT 1 AS present FROM decision_records WHERE record_id = $record_id").get({ $record_id: recordId }) as { present: number } | null;
+    if (decision === null) {
+      throw new PersistenceError(ERROR_CODES.INVALID_RECORD, `decision ${recordId} does not exist`);
+    }
+    const reference: SnapshotReference = {
+      snapshot_id: crypto.randomUUID(),
+      record_id: recordId,
+      mode: "git",
+      path: "",
+      content_hash: contentHash,
+      created_at: now(),
+      base_sha: baseSha,
+      source_path: sourcePath,
+    };
+    const validation = validateSnapshotReference(reference);
+    if (!validation.success) {
+      throw new PersistenceError(validation.error.code, validation.error.message);
+    }
+    await mkdir(this.snapshotRoot, { recursive: true, mode: 0o700 });
+    this.db.transaction(() => {
+      this.db.query(
+        `INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path)
+         VALUES ($snapshot_id, $record_id, $mode, $path, $content_hash, $created_at, $base_sha, $source_path)`,
+      ).run({
+        $snapshot_id: reference.snapshot_id,
+        $record_id: reference.record_id,
+        $mode: reference.mode,
+        $path: "",
+        $content_hash: reference.content_hash,
+        $created_at: reference.created_at,
+        $base_sha: reference.base_sha ?? null,
+        $source_path: reference.source_path ?? null,
+      });
+    })();
+    return validation.data;
+  }
+
+  async getReference(snapshotId: string): Promise<SnapshotReference | null> {
     const row = this.db.query(
-      `SELECT snapshot_id, record_id, mode, path, content_hash, created_at
+      `SELECT snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path
        FROM snapshots WHERE snapshot_id = $snapshot_id`,
     ).get({ $snapshot_id: snapshotId }) as SnapshotRow | null;
     if (row === null) return null;
-    const validation = validateSnapshotReference(row);
-    if (!validation.success) return null;
-    const filePath = this.resolveStoredPath(row.path);
+    const validation = validateSnapshotReference(referenceFromRow(row));
+    return validation.success ? validation.data : null;
+  }
+
+  async get(snapshotId: string): Promise<{ reference: SnapshotReference; content: string } | null> {
+    const reference = await this.getReference(snapshotId);
+    if (reference === null) return null;
+    if (reference.mode === "git") return null; // git-backed rows have no stored file
+    const filePath = this.resolveStoredPath(reference.path);
     if (filePath === null) return null;
     let content: string;
     try {
@@ -177,20 +239,22 @@ export class SnapshotStore {
     } catch {
       return null;
     }
-    if (hashContent(content) !== row.content_hash) return null;
-    return { reference: validation.data, content };
+    if (hashContent(content) !== reference.content_hash) return null;
+    return { reference, content };
   }
 
   async delete(snapshotId: string): Promise<void> {
-    const row = this.db.query("SELECT path FROM snapshots WHERE snapshot_id = $snapshot_id").get({ $snapshot_id: snapshotId }) as { path: string } | null;
-    if (row === null) return;
-    const filePath = this.resolveStoredPath(row.path);
-    if (filePath === null) throw new PersistenceError(ERROR_CODES.PATH_OUTSIDE_ROOT, "stored snapshot path is outside the local snapshot directory");
-    try {
-      await unlink(filePath);
-    } catch (error) {
-      const code = error as NodeJS.ErrnoException;
-      if (code.code !== "ENOENT") throw error;
+    const reference = await this.getReference(snapshotId);
+    if (reference === null) return;
+    if (reference.mode !== "git") {
+      const filePath = this.resolveStoredPath(reference.path);
+      if (filePath === null) throw new PersistenceError(ERROR_CODES.PATH_OUTSIDE_ROOT, "stored snapshot path is outside the local snapshot directory");
+      try {
+        await unlink(filePath);
+      } catch (error) {
+        const code = error as NodeJS.ErrnoException;
+        if (code.code !== "ENOENT") throw error;
+      }
     }
     this.db.query("DELETE FROM snapshots WHERE snapshot_id = $snapshot_id").run({ $snapshot_id: snapshotId });
   }
