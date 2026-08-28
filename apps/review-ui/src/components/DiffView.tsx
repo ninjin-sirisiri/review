@@ -1,5 +1,5 @@
 import { useEffect, useRef, type ReactNode } from "react";
-import type { DiffLine, FileDiff } from "../../../../packages/contracts/src/index";
+import type { DiffHunk, DiffLine, FileDiff, SnapshotDiff } from "../../../../packages/contracts/src/index";
 import { ReviewApiError } from "../api";
 import type { BlockSelection, DecisionAnchor } from "../lib/decision-index";
 
@@ -11,12 +11,16 @@ export interface DiffViewProps {
   baseMissing: boolean;
   diff: FileDiff | null;
   anchors: DecisionAnchor[];
+  transitionAnchors?: DecisionAnchor[];
   selectedBlock: BlockSelection | null;
   onSelectBlock: (block: BlockSelection | null) => void;
   fullText: { content: string; anchors: DecisionAnchor[] } | null;
   /** カードからの逆ナビゲーション(§6.2.4)。tokenが変わるたびに再スクロールする。 */
   navigateTo: { line: number; token: number } | null;
   onRetry: () => void;
+  snapshotDiff?: SnapshotDiff | null;
+  snapshotDiffLoading?: boolean;
+  snapshotDiffError?: ReviewApiError | Error | null;
 }
 
 function lineAnchored(row: DiffLine, anchors: DecisionAnchor[]): boolean {
@@ -25,6 +29,12 @@ function lineAnchored(row: DiffLine, anchors: DecisionAnchor[]): boolean {
       ? row.oldLine !== null && anchor.start <= row.oldLine && row.oldLine <= anchor.end
       : row.newLine !== null && anchor.start <= row.newLine && row.newLine <= anchor.end,
   );
+}
+
+function transitionDestinationLabel(to: SnapshotDiff["to"]): string {
+  if (to.kind === "working-tree") return "after: working tree";
+  const sha = to.base_sha === undefined ? "" : ` @${to.base_sha.slice(0, 8)}`;
+  return `next snapshot${sha} · ${new Date(to.created_at).toLocaleString()}`;
 }
 
 /** クリック行を含むmaximal run(§6.2.3)。context行ならnull。 */
@@ -71,7 +81,7 @@ function FullTextLines(props: { content: string; anchors: DecisionAnchor[] }) {
       {contents.map((content, index) => {
         const lineNumber = index + 1;
         const anchored = props.anchors.some(
-          (anchor) => anchor.side === "new" && anchor.start <= lineNumber && lineNumber <= anchor.end,
+          (anchor) => anchor.start <= lineNumber && lineNumber <= anchor.end,
         );
         return (
           <li
@@ -101,6 +111,17 @@ function LineRow(props: {
   const tone =
     row.type === "add" ? "diff-line--add" : row.type === "del" ? "diff-line--del" : "diff-line--context";
   const gutter = row.type === "del" ? row.oldLine : row.newLine;
+  const operation = row.type === "add" ? "Added" : row.type === "del" ? "Deleted" : "Context";
+  const lineNumbers = [
+    row.oldLine === null ? null : `old line ${row.oldLine}`,
+    row.newLine === null ? null : `new line ${row.newLine}`,
+  ]
+    .filter((lineNumber): lineNumber is string => lineNumber !== null)
+    .join(", ");
+  const content = row.content.length > 0 ? row.content : "blank line";
+  const label = row.type === "context"
+    ? `Clear selected block from context line${lineNumbers.length > 0 ? `, ${lineNumbers}` : ""}: ${content}`
+    : `${operation} line${lineNumbers.length > 0 ? `, ${lineNumbers}` : ""}: ${content}`;
   return (
     <li
       className={[
@@ -114,7 +135,13 @@ function LineRow(props: {
       data-old-line={row.oldLine ?? undefined}
       data-new-line={row.newLine ?? undefined}
     >
-      <button type="button" className="diff-line__body" onClick={onSelect}>
+      <button
+        type="button"
+        className="diff-line__body"
+        aria-label={label}
+        aria-pressed={row.type === "context" ? undefined : selected}
+        onClick={onSelect}
+      >
         <span className="line-number" aria-hidden="true">
           {gutter ?? ""}
         </span>
@@ -127,6 +154,35 @@ function LineRow(props: {
   );
 }
 
+function HunkLines(props: {
+  hunks: DiffHunk[];
+  anchors: DecisionAnchor[];
+  selectedBlock: BlockSelection | null;
+  onSelectBlock: (block: BlockSelection | null) => void;
+}) {
+  return (
+    <>
+      {props.hunks.map((hunk, hunkIndex) => (
+        <ol className="diff-lines" key={`${hunk.oldStart}:${hunk.newStart}:${hunkIndex}`}>
+          {hunk.lines.map((row, index) => {
+            const run = blockRun(hunk.lines, index);
+            const selected = sameBlock(run, props.selectedBlock);
+            return (
+              <LineRow
+                key={`${index}-${row.content}`}
+                row={row}
+                anchored={lineAnchored(row, props.anchors)}
+                selected={selected}
+                onSelect={() => props.onSelectBlock(run === null || selected ? null : run)}
+              />
+            );
+          })}
+        </ol>
+      ))}
+    </>
+  );
+}
+
 export function DiffView({
   path,
   isLoading,
@@ -134,34 +190,58 @@ export function DiffView({
   baseMissing,
   diff,
   anchors,
+  transitionAnchors = [],
   selectedBlock,
   onSelectBlock,
   fullText,
   navigateTo,
   onRetry,
+  snapshotDiff = null,
+  snapshotDiffLoading = false,
+  snapshotDiffError = null,
 }: DiffViewProps) {
   const rootRef = useRef<HTMLElement | null>(null);
+  const transitionActive = snapshotDiff !== null || snapshotDiffLoading || snapshotDiffError !== null;
 
   useEffect(() => {
     if (navigateTo === null || rootRef.current === null) return;
-    // 新側の行番号を優先して解決する(旧新で同じ番号が衝突するときは作業木側の行へ飛ぶ)。
+    // Snapshot transitions anchor judgments to the recorded old side; ordinary diffs keep the new-side preference.
     const target =
-      rootRef.current.querySelector(`[data-new-line="${navigateTo.line}"]`) ??
-      rootRef.current.querySelector(`[data-old-line="${navigateTo.line}"]`);
+      transitionActive
+        ? rootRef.current.querySelector(`[data-old-line="${navigateTo.line}"]`) ??
+          rootRef.current.querySelector(`[data-new-line="${navigateTo.line}"]`)
+        : rootRef.current.querySelector(`[data-new-line="${navigateTo.line}"]`) ??
+          rootRef.current.querySelector(`[data-old-line="${navigateTo.line}"]`);
     if (!(target instanceof HTMLElement)) return;
     target.scrollIntoView({ block: "center" });
     target.classList.add("diff-line--pulse");
-    window.setTimeout(() => target.classList.remove("diff-line--pulse"), 1200);
-  }, [navigateTo]);
+    const pulseTimer = window.setTimeout(() => target.classList.remove("diff-line--pulse"), 1200);
+    return () => {
+      window.clearTimeout(pulseTimer);
+      target.classList.remove("diff-line--pulse");
+    };
+  }, [
+    navigateTo,
+    path,
+    isLoading,
+    error,
+    baseMissing,
+    diff,
+    fullText,
+    snapshotDiff,
+    snapshotDiffError,
+    snapshotDiffLoading,
+    transitionActive,
+  ]);
 
-  const shell = (children: ReactNode, heading = true) => (
+  const shell = (children: ReactNode, heading = true, metadata?: ReactNode) => (
     <section ref={rootRef} className="diff-view" aria-label="Source diff">
       {heading && (
         <header className="diff-view__header">
           <h2>{path}</h2>
-          {diff !== null && !diff.binary && diff.base_sha.length > 0 && (
+          {metadata ?? (diff !== null && !diff.binary && diff.base_sha.length > 0 && (
             <code className="diff-view__base">vs {diff.base_sha.slice(0, 12)}</code>
-          )}
+          ))}
         </header>
       )}
       {children}
@@ -170,6 +250,68 @@ export function DiffView({
 
   if (path === null) {
     return shell(<p className="empty-state">Select a file in the explorer to see its diff.</p>, false);
+  }
+  if (transitionActive) {
+    const retryTransition = () => {
+      if (!snapshotDiffLoading) onRetry();
+    };
+    if (snapshotDiffLoading) {
+      return shell(
+        <div className="empty-state">
+          <p role="status">Loading snapshot transition…</p>
+          <button type="button" aria-disabled="true" onClick={retryTransition}>Retry</button>
+        </div>,
+      );
+    }
+    if (snapshotDiffError !== null) {
+      return shell(
+        <div className="inline-error" role="alert">
+          <p>{errorCardMessage(snapshotDiffError)}</p>
+          <button type="button" aria-disabled="false" onClick={retryTransition}>Retry</button>
+        </div>,
+      );
+    }
+    if (snapshotDiff === null) {
+      return shell(<p className="empty-state">Snapshot transition is unavailable.</p>);
+    }
+    const metadata = (
+      <div className="diff-view__transition" aria-label="Snapshot transition">
+        <code>before snapshot</code>
+        <span aria-hidden="true">→</span>
+        <code>{transitionDestinationLabel(snapshotDiff.to)}</code>
+      </div>
+    );
+    if (snapshotDiff.binary) {
+      return shell(<p className="empty-state">Binary files cannot be shown in the diff view.</p>, true, metadata);
+    }
+    if (snapshotDiff.hunks.length === 0) {
+      if (snapshotDiff.old_missing !== snapshotDiff.new_missing) {
+        return shell(
+          <p role="status" className="empty-state">
+            {snapshotDiff.old_missing
+              ? "File was created after the selected judgment."
+              : "File was deleted after the selected judgment."}
+          </p>,
+          true,
+          metadata,
+        );
+      }
+      return shell(
+        <p className="empty-state">No changes between the selected judgment and the next state.</p>,
+        true,
+        metadata,
+      );
+    }
+    return shell(
+      <HunkLines
+        hunks={snapshotDiff.hunks}
+        anchors={transitionAnchors}
+        selectedBlock={selectedBlock}
+        onSelectBlock={onSelectBlock}
+      />,
+      true,
+      metadata,
+    );
   }
   if (isLoading) {
     return shell(
@@ -216,24 +358,6 @@ export function DiffView({
   }
 
   return shell(
-    <>
-      {diff.hunks.map((hunk, hunkIndex) => (
-        <ol className="diff-lines" key={`${hunk.oldStart}:${hunk.newStart}:${hunkIndex}`}>
-          {hunk.lines.map((row, index) => {
-            const run = blockRun(hunk.lines, index);
-            const selected = sameBlock(run, selectedBlock);
-            return (
-              <LineRow
-                key={`${index}-${row.content}`}
-                row={row}
-                anchored={lineAnchored(row, anchors)}
-                selected={selected}
-                onSelect={() => onSelectBlock(run === null || selected ? null : run)}
-              />
-            );
-          })}
-        </ol>
-      ))}
-    </>,
+    <HunkLines hunks={diff.hunks} anchors={anchors} selectedBlock={selectedBlock} onSelectBlock={onSelectBlock} />,
   );
 }

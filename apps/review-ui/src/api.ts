@@ -1,10 +1,12 @@
-import { isRecord } from "../../../packages/contracts/src/index";
+import { ContractValidationError, isRecord, parseSnapshotDiffResponse } from "../../../packages/contracts/src/index";
 import type {
   ApiResponse,
   CheckEvidence,
   DecisionRecord,
   FileDiff,
   RevisionRef,
+  SnapshotDiff,
+  SnapshotDiffResponse,
   TargetReference,
   UserDisposition,
 } from "../../../packages/contracts/src/index";
@@ -172,7 +174,11 @@ export class ReviewApi {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private async request<T>(
+    path: string,
+    init: RequestInit = {},
+    parseData: (data: unknown, status: number) => T = (data) => data as T,
+  ): Promise<T> {
     let response: Response;
     try {
       response = await this.fetchImpl(joinUrl(this.baseUrl, path), {
@@ -200,7 +206,7 @@ export class ReviewApi {
       });
     }
     if (!response.ok) throw responseError(payload, response.status);
-    return apiData<T>(payload, response.status);
+    return parseData(apiData<unknown>(payload, response.status), response.status);
   }
 
   listDecisions(repositoryId: string): Promise<DecisionRecordSummary[]> {
@@ -244,6 +250,33 @@ export class ReviewApi {
     return this.request<DecisionRecordDetail>(`/v1/decision-records/${encodeURIComponent(normalizedRecordId)}`);
   }
 
+  getSnapshotDiff(recordId: string, path: string): Promise<SnapshotDiffResponse> {
+    const normalizedRecordId = recordId.trim();
+    if (normalizedRecordId.length === 0) {
+      return Promise.reject(new ReviewApiError("Decision record ID is required", { status: 422, code: "INVALID_RECORD" }));
+    }
+    return this.request<SnapshotDiffResponse>(
+      `/v1/decision-records/${encodeURIComponent(normalizedRecordId)}/snapshot-diff?path=${encodeURIComponent(path)}`,
+      {},
+      (data, status) => {
+        try {
+          return parseSnapshotDiffResponse(data);
+        } catch (error) {
+          const message = error instanceof ContractValidationError
+            ? `Recorder returned an invalid snapshot transition response: ${error.message}`
+            : "Recorder returned an invalid snapshot transition response";
+          throw new ReviewApiError(message, {
+            status,
+            code: "INVALID_RESPONSE",
+            details: error instanceof ContractValidationError && error.field !== undefined
+              ? [{ field: error.field, message: error.message }]
+              : undefined,
+          });
+        }
+      },
+    );
+  }
+
   async setDisposition(recordId: string, disposition: UserDisposition): Promise<DecisionRecordDetail> {
     if (disposition !== "unreviewed" && disposition !== "accepted" && disposition !== "rejected") {
       throw new ReviewApiError("Disposition must be unreviewed, accepted, or rejected", {
@@ -251,13 +284,14 @@ export class ReviewApi {
         code: "INVALID_RECORD",
       });
     }
-    await this.request<DecisionRecord>(`/v1/decision-records/${encodeURIComponent(recordId)}/disposition`, {
+    const normalizedRecordId = recordId.trim();
+    await this.request<DecisionRecord>(`/v1/decision-records/${encodeURIComponent(normalizedRecordId)}/disposition`, {
       method: "PATCH",
       body: JSON.stringify({ user_disposition: disposition }),
     });
-    return this.getDecision(recordId);
+    return this.getDecision(normalizedRecordId);
   }
 }
 
-export type { CheckEvidence, DecisionRecord, FileDiff, TargetReference, UserDisposition };
+export type { CheckEvidence, DecisionRecord, FileDiff, SnapshotDiff, SnapshotDiffResponse, TargetReference, UserDisposition };
 export type ApiEnvelope<T> = ApiResponse<T>;

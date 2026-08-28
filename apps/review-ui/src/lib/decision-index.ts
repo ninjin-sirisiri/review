@@ -46,6 +46,12 @@ export function decisionAnchors(detail: DecisionRecordDetail): DecisionAnchor[] 
     .filter((anchor): anchor is DecisionAnchor => anchor !== null);
 }
 
+export function transitionAnchors(detail: DecisionRecordDetail, path: string): DecisionAnchor[] {
+  return detail.record.targets
+    .filter((target) => target.path === path)
+    .map((target) => ({ side: "old" as const, start: target.line_start, end: target.line_end }));
+}
+
 export function overlapsBlock(anchor: DecisionAnchor, block: BlockSelection): boolean {
   if (anchor.side === "old") {
     return block.oldStart !== null && block.oldEnd !== null && block.oldStart <= anchor.end && anchor.start <= block.oldEnd;

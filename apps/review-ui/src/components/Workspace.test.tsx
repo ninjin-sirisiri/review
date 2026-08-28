@@ -111,6 +111,12 @@ const baseProps = {
   onFileRetry: vi.fn(),
   judgments: [{ recordId: "rec-1", status: "ready" as const, detail: detailFixture("rec-1") }],
   anchors: [{ side: "new" as const, start: 2, end: 2 }],
+  transitionAnchors: [],
+  selectedRecordId: null,
+  onSelectJudgment: vi.fn(),
+  snapshotDiff: null,
+  snapshotDiffLoading: false,
+  snapshotDiffError: null,
   onDispositionChange: vi.fn(async () => detailFixture("rec-1")),
   onJudgmentRetry: vi.fn(),
 };
@@ -132,6 +138,16 @@ describe("Workspace", () => {
     expect(onOpenFile).toHaveBeenCalledWith("src/util.ts");
   });
 
+  it("propagates judgment selection through the workspace", () => {
+    const onSelectJudgment = vi.fn();
+    render(<Workspace {...baseProps} selectedRecordId="rec-1" onSelectJudgment={onSelectJudgment} />);
+
+    const select = screen.getByRole("button", { name: "Viewing subsequent changes" });
+    expect(select.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(select);
+    expect(onSelectJudgment).toHaveBeenCalledWith("rec-1");
+  });
+
   it("keeps block selection local and lets the panel clear it", () => {
     render(<Workspace {...baseProps} />);
 
@@ -142,6 +158,17 @@ describe("Workspace", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Clear block filter" }));
     expect(delRow?.className).not.toContain("diff-line--selected");
+  });
+
+  it("clears a repository block selection when a judgment transition is selected", () => {
+    const { rerender } = render(<Workspace {...baseProps} />);
+
+    fireEvent.click(screen.getByText("const removed = 2;"));
+    expect(screen.getByRole("button", { name: "Clear block filter" })).toBeTruthy();
+
+    rerender(<Workspace {...baseProps} selectedRecordId="rec-1" snapshotDiffLoading />);
+
+    expect(screen.queryByRole("button", { name: "Clear block filter" })).toBeNull();
   });
 
   it("scrolls to a judgment target line when its card link is clicked", () => {

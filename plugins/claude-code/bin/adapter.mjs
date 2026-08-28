@@ -419,23 +419,49 @@ class RecorderBridge {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
   submit(record) {
-    const existing = this.pending.get(record.record_id);
+    const pendingKey = `record:${record.record_id}`;
+    const existing = this.pending.get(pendingKey);
     if (existing !== undefined)
       return existing;
     if (this.pending.size >= this.queueCapacity) {
       return Promise.resolve(responseFailure(record.record_id, "QUEUE_EXHAUSTED", "Recorder queue capacity is exhausted", 0));
     }
-    const operation = this.postWithRetry(record).finally(() => {
-      if (this.pending.get(record.record_id) === operation)
-        this.pending.delete(record.record_id);
+    const operation = this.postWithRetry(record.record_id, this.endpoint, record).finally(() => {
+      if (this.pending.get(pendingKey) === operation)
+        this.pending.delete(pendingKey);
     });
-    this.pending.set(record.record_id, operation);
+    this.pending.set(pendingKey, operation);
     return operation;
   }
-  async postWithRetry(record) {
+  captureAutomaticSnapshot(input) {
+    const pendingKey = `capture:${input.captureId}`;
+    const existing = this.pending.get(pendingKey);
+    if (existing !== undefined)
+      return existing;
+    if (this.pending.size >= this.queueCapacity) {
+      return Promise.resolve(responseFailure(input.recordId, "QUEUE_EXHAUSTED", "Recorder queue capacity is exhausted", 0));
+    }
+    const endpoint = new URL(this.endpoint);
+    endpoint.pathname = `${endpoint.pathname.replace(/\/$/, "")}/${encodeURIComponent(input.recordId)}/automatic-snapshot`;
+    endpoint.search = "";
+    endpoint.hash = "";
+    const operation = this.postWithRetry(input.recordId, endpoint.toString(), {
+      capture_id: input.captureId,
+      source_path: input.sourcePath,
+      content: input.content,
+      before_missing: input.beforeMissing
+    }, true).finally(() => {
+      if (this.pending.get(pendingKey) === operation)
+        this.pending.delete(pendingKey);
+    });
+    this.pending.set(pendingKey, operation);
+    return operation;
+  }
+  async postWithRetry(recordId, endpoint, body, preserveServerFailure = false) {
     const startedAt = Date.now();
     let attempts = 0;
     let lastFailure;
+    let lastServerFailure;
     while (attempts < this.maxAttempts && Date.now() - startedAt <= this.maxRetryDurationMs) {
       attempts += 1;
       try {
@@ -445,32 +471,37 @@ class RecorderBridge {
         const remaining = this.maxRetryDurationMs - (Date.now() - startedAt);
         if (remaining <= 0)
           break;
-        const { response, body } = await requestWithTimeout(this.fetchImpl, this.endpoint, {
+        const { response, body: responseBody } = await requestWithTimeout(this.fetchImpl, endpoint, {
           method: "POST",
           headers: {
             authorization: `Bearer ${token}`,
             "content-type": "application/json"
           },
-          body: JSON.stringify(record)
+          body: JSON.stringify(body)
         }, remaining);
         if (response.ok) {
-          if (typeof body !== "object" || body === null || Array.isArray(body) || body.success !== true) {
-            return responseFailure(record.record_id, "RECORDER_PROTOCOL_ERROR", "Recorder returned an invalid success envelope", attempts, response.status);
+          if (typeof responseBody !== "object" || responseBody === null || Array.isArray(responseBody) || responseBody.success !== true) {
+            const detail2 = responseErrorBody(responseBody);
+            if (preserveServerFailure && (detail2.code !== undefined || detail2.message !== undefined)) {
+              return responseFailure(recordId, detail2.code ?? "RECORDER_PROTOCOL_ERROR", detail2.message ?? "Recorder returned an invalid success envelope", attempts, response.status);
+            }
+            return responseFailure(recordId, "RECORDER_PROTOCOL_ERROR", "Recorder returned an invalid success envelope", attempts, response.status);
           }
           return {
             success: true,
             status: response.status,
             duplicate: response.status === 200,
-            recordId: record.record_id
+            recordId
           };
         }
-        const detail = responseErrorBody(body);
-        const failure2 = responseFailure(record.record_id, detail.code ?? (retryableStatus(response.status) ? "RECORDER_UNAVAILABLE" : "RECORDER_ERROR"), detail.message ?? `Recorder returned HTTP ${response.status}`, attempts, response.status);
+        const detail = responseErrorBody(responseBody);
+        const failure2 = responseFailure(recordId, detail.code ?? (retryableStatus(response.status) ? "RECORDER_UNAVAILABLE" : "RECORDER_ERROR"), detail.message ?? `Recorder returned HTTP ${response.status}`, attempts, response.status);
         lastFailure = failure2;
+        lastServerFailure = failure2;
         if (!retryableStatus(response.status))
           return failure2;
       } catch (error) {
-        lastFailure = responseFailure(record.record_id, "RECORDER_UNAVAILABLE", error instanceof Error ? error.message : String(error), attempts);
+        lastFailure = responseFailure(recordId, "RECORDER_UNAVAILABLE", error instanceof Error ? error.message : String(error), attempts);
       }
       const elapsed = Date.now() - startedAt;
       if (attempts >= this.maxAttempts || elapsed >= this.maxRetryDurationMs)
@@ -478,7 +509,10 @@ class RecorderBridge {
       const delay = Math.min(this.maxRetryDelayMs, this.retryBaseDelayMs * 2 ** (attempts - 1), this.maxRetryDurationMs - elapsed);
       await sleep(delay);
     }
-    return responseFailure(record.record_id, lastFailure?.code === "RECORDER_ERROR" ? "RECORDER_ERROR" : "RECORDER_UNAVAILABLE", "Recorder unavailable after bounded retries", attempts, lastFailure?.status);
+    if (preserveServerFailure && lastServerFailure !== undefined) {
+      return { ...lastServerFailure, attempts };
+    }
+    return responseFailure(recordId, lastFailure?.code === "RECORDER_ERROR" ? "RECORDER_ERROR" : "RECORDER_UNAVAILABLE", "Recorder unavailable after bounded retries", attempts, lastFailure?.status);
   }
 }
 
@@ -700,7 +734,7 @@ import { resolve as resolve2 } from "path";
 
 // plugins/common/src/decision-gate.ts
 import { createHash as createHash2, randomUUID } from "crypto";
-import { lstat, mkdir, readFile as readFile2, readdir, realpath, rename, rm, stat, writeFile } from "fs/promises";
+import { lstat, mkdir, readFile as readFile2, readdir, realpath, rename, rm, writeFile } from "fs/promises";
 import { homedir as homedir2 } from "os";
 import { basename, dirname, isAbsolute as isAbsolute2, join as join2, relative, resolve, sep } from "path";
 var DEFAULT_PERMIT_TTL_MS = 10 * 60 * 1000;
@@ -745,14 +779,27 @@ function normalizedRelativePath(root, candidate) {
   }
   return relativeCandidate.split(sep).join("/");
 }
+async function readRegularFile(path) {
+  const details = await lstat(path);
+  if (details.isSymbolicLink() || !details.isFile())
+    fail2(`target is not a regular file: ${path}`);
+  if (details.size > MAX_HASH_BYTES)
+    fail2(`target exceeds the hash size limit: ${path}`);
+  let bytes;
+  try {
+    bytes = await readFile2(path);
+  } catch {
+    throw new Error(`target could not be read: ${path}`);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(`target could not be read: ${path}`);
+  }
+}
 async function currentFileText(path) {
   try {
-    const details = await stat(path);
-    if (!details.isFile())
-      fail2(`target is not a regular file: ${path}`);
-    if (details.size > MAX_HASH_BYTES)
-      fail2(`target exceeds the hash size limit: ${path}`);
-    return await readFile2(path, "utf8");
+    return await readRegularFile(path);
   } catch (error) {
     const code = error.code;
     if (code === "ENOENT")
@@ -802,6 +849,14 @@ async function nearestExistingCanonicalPath(canonicalRoot, missingPath) {
     tail.push(basename(candidate));
     candidate = parent;
     try {
+      if ((await lstat(candidate)).isSymbolicLink())
+        return null;
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        return null;
+      continue;
+    }
+    try {
       const resolved = await realpath(candidate);
       const relativeAncestor = relative(canonicalRoot, resolved);
       if (relativeAncestor === ".." || relativeAncestor.startsWith(`..${sep}`) || isAbsolute2(relativeAncestor))
@@ -815,6 +870,21 @@ async function nearestExistingCanonicalPath(canonicalRoot, missingPath) {
 }
 async function hashExistingFile(path) {
   return hashText(await currentFileText(path));
+}
+async function readCurrentFileState(options) {
+  const canonical = await canonicalPath(options.repositoryRoot, options.filePath);
+  if (canonical === null)
+    throw new Error(`target could not be resolved: ${options.filePath}`);
+  try {
+    const content = await readRegularFile(canonical.path);
+    return { content, beforeMissing: false, contentHash: hashText(content) };
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return { content: "", beforeMissing: true, contentHash: hashText("") };
+    if (error instanceof Error)
+      throw error;
+    throw new Error(`target could not be read: ${options.filePath}`);
+  }
 }
 function gateBase(options) {
   return options.gateRoot ?? process.env.AI_REVIEW_GATE_ROOT ?? join2(homedir2(), ".ai-code-review-evidence", "gates");
@@ -932,7 +1002,7 @@ async function grantDecisionPermits(event, options) {
   await mkdir(directory, { recursive: true, mode: 448 });
   for (const target of event.targets) {
     const path = normalizedRelativePath(root, target.path);
-    const permit = { sessionId, repositoryRoot: root, recordId, path, contentHash: target.contentHash, expiresAt };
+    const permit = { sessionId, repositoryRoot: root, recordId, captureId: randomUUID(), path, contentHash: target.contentHash, expiresAt };
     await writeFile(permitPath(directory), `${JSON.stringify(permit)}
 `, { encoding: "utf8", mode: 384 });
   }
@@ -947,7 +1017,7 @@ async function claimPermit(path) {
     return null;
   }
 }
-async function findMatchingPermit(options) {
+async function findMatchingPermit(options, checkContentHash = true) {
   const canonical = await canonicalPath(options.repositoryRoot, options.filePath);
   if (canonical === null)
     return null;
@@ -974,30 +1044,47 @@ async function findMatchingPermit(options) {
       const value = JSON.parse(raw);
       if (typeof value.sessionId !== "string" || typeof value.repositoryRoot !== "string" || typeof value.recordId !== "string" || typeof value.path !== "string" || typeof value.contentHash !== "string" || typeof value.expiresAt !== "string")
         continue;
+      if (Date.parse(value.expiresAt) <= Date.now()) {
+        await rm(original, { force: true }).catch(() => {
+          return;
+        });
+        continue;
+      }
+      if (typeof value.captureId !== "string" || value.captureId.trim().length === 0)
+        continue;
       permit = value;
     } catch {
       continue;
     }
     if (permit.sessionId !== options.sessionId || permit.repositoryRoot !== canonical.root || permit.path !== relativeFile)
       continue;
-    if (Date.parse(permit.expiresAt) <= Date.now()) {
-      await rm(original, { force: true }).catch(() => {
-        return;
-      });
-      continue;
+    if (checkContentHash) {
+      const actualHash = await hashExistingFile(canonical.path).catch(() => null);
+      if (actualHash !== permit.contentHash)
+        continue;
     }
-    const actualHash = await hashExistingFile(canonical.path).catch(() => null);
-    if (actualHash !== permit.contentHash)
-      continue;
-    return { path: original };
+    return {
+      path: original,
+      permit: {
+        recordId: permit.recordId,
+        captureId: permit.captureId,
+        sessionId: permit.sessionId,
+        repositoryRoot: permit.repositoryRoot,
+        path: permit.path,
+        contentHash: permit.contentHash
+      }
+    };
   }
   return null;
 }
-async function peekDecisionPermit(options) {
-  return await findMatchingPermit(options) !== null;
+async function findDecisionPermit(options) {
+  return (await findMatchingPermit(options))?.permit ?? null;
 }
-async function consumeDecisionPermit(options) {
-  const found = await findMatchingPermit(options);
+async function consumeDecisionPermitAfterEdit(options) {
+  return consumeMatchingPermit(options, false);
+}
+async function consumeMatchingPermit(options, checkContentHash) {
+  const found = await findMatchingPermit(options, checkContentHash);
   if (found === null)
     return false;
   const claimed = await claimPermit(found.path);
@@ -1276,11 +1363,39 @@ function jsonRecord(value, field) {
     throw new Error(`${field} must be an object`);
   return value;
 }
+async function readBoundedStdin(stream, maxBytes = MAX_STDIN_BYTES) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
+    throw new RangeError("maxBytes must be a positive integer");
+  const reader = stream.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done)
+        break;
+      totalBytes += next.value.byteLength;
+      if (totalBytes > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {}
+        throw new Error("hook input exceeds the command limit");
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
 async function stdinText() {
-  const content = await new Response(Bun.stdin.stream()).text();
-  if (new TextEncoder().encode(content).byteLength > MAX_STDIN_BYTES)
-    throw new Error("hook input exceeds the command limit");
-  return content;
+  return readBoundedStdin(Bun.stdin.stream());
 }
 function sessionIdFromInput(input) {
   if (typeof input.session_id === "string" && input.session_id.trim().length > 0)
@@ -1349,13 +1464,32 @@ async function checkPreToolUse(input, options = {}) {
     return deny(error instanceof Error ? error.message : String(error));
   }
   const repositoryRoot = cwdFromInput(input);
-  const permitted = await peekDecisionPermit({
+  const permit = await findDecisionPermit({
     sessionId,
     repositoryRoot,
     filePath,
     gateRoot: options.gateRoot ?? defaultGateRoot()
   });
-  return permitted ? null : deny(editReason(filePath));
+  if (permit === null)
+    return deny(editReason(filePath));
+  try {
+    const state = await readCurrentFileState({ repositoryRoot: permit.repositoryRoot, filePath });
+    if (state.contentHash !== permit.contentHash)
+      return deny("Automatic snapshot failed before edit: target content changed since judgment");
+    const bridge = options.bridge ?? new RecorderBridge;
+    const captured = await bridge.captureAutomaticSnapshot({
+      recordId: permit.recordId,
+      captureId: permit.captureId,
+      sourcePath: permit.path,
+      content: state.content,
+      beforeMissing: state.beforeMissing
+    });
+    if (captured.success)
+      return null;
+    return deny(`Automatic snapshot failed before edit: ${captured.message}`);
+  } catch (error) {
+    return deny(`Automatic snapshot failed before edit: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 async function checkPostToolUse(input, options = {}) {
   const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -1370,7 +1504,7 @@ async function checkPostToolUse(input, options = {}) {
   } catch {
     return;
   }
-  await consumeDecisionPermit({
+  await consumeDecisionPermitAfterEdit({
     sessionId,
     repositoryRoot: cwdFromInput(input),
     filePath,

@@ -99,6 +99,8 @@ h4 { color: var(--text-primary); font-size: 0.85rem; margin-bottom: var(--space-
   border-radius: var(--radius-md);
   background: var(--surface-raised);
 }
+.decision-card--selected { border-color: var(--accent); background: var(--accent-soft); }
+.decision-card__select { min-height: 44px; margin-top: var(--space-2); }
 .decision-card__header {
   display: flex;
   justify-content: space-between;
@@ -328,6 +330,9 @@ button.button-secondary:hover, .button-secondary:hover { background: var(--surfa
 }
 .diff-line__body { cursor: pointer; border-radius: var(--radius-sm); }
 .diff-line__body:hover { background: var(--surface-raised); }
+@media (pointer: coarse), (any-pointer: coarse) {
+  .diff-line__body { min-height: 44px; }
+}
 .line-number {
   min-width: 3ch;
   padding-right: 1rem;

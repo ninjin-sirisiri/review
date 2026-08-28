@@ -16,12 +16,14 @@ import {
 } from "../../../../packages/contracts/src/index";
 import { createRecorderConfig, type RecorderConfig, type RecorderConfigOverrides } from "../config";
 import { ensureOwnerToken, readOwnerToken, validateOwnerBearerToken } from "../auth/token";
-import { RepositoryRegistry, SourceResolutionError } from "../repositories/registry";
+import { normalizeSourcePath, RepositoryRegistry, SourceResolutionError } from "../repositories/registry";
 import { RecordService } from "../records/service";
 import { SnapshotStore } from "../store/snapshots";
 import { PersistenceError, RecordStore } from "../store/records";
 import { detectGitBackable } from "../source/gitbacked";
 import { SourceResolver, type ResolvedSource, type UnresolvedSource } from "../source/resolve";
+import { resolveSnapshotDiff } from "../source/snapshot-diff";
+import { WorkingTreePathMissingError } from "../source/worktree";
 
 export const DEFAULT_MAX_JSON_BYTES = 1_000_000;
 export const LOOPBACK_ADDRESS = "127.0.0.1";
@@ -107,6 +109,7 @@ function statusForError(code: ErrorCode): number {
   if (code === ERROR_CODES.REPOSITORY_NOT_REGISTERED) return 404;
   if (code === ERROR_CODES.PATH_OUTSIDE_ROOT) return 422;
   if (code === ERROR_CODES.REVISION_NOT_FOUND) return 404;
+  if (code === ERROR_CODES.DUPLICATE_RECORD) return 409;
   if (code === ERROR_CODES.INVALID_RECORD) return 422;
   return 422;
 }
@@ -367,6 +370,16 @@ function requireObject(value: unknown, message: string): JsonRecord {
   return value;
 }
 
+function requireExactObject(value: unknown, keys: readonly string[], message: string): JsonRecord {
+  const object = requireObject(value, message);
+  const expected = new Set(keys);
+  const actualKeys = Object.keys(object);
+  if (actualKeys.length !== keys.length || actualKeys.some((key) => !expected.has(key))) {
+    throw new PersistenceError(ERROR_CODES.INVALID_RECORD, message);
+  }
+  return object;
+}
+
 function parseDisposition(value: unknown): UserDisposition {
   if (value !== "unreviewed" && value !== "accepted" && value !== "rejected") {
     throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "user_disposition must be unreviewed, accepted, or rejected");
@@ -427,8 +440,9 @@ async function handleRequest(
       return enqueueRecord(recordQueues, canonicalInput.record_id, async () => {
         const existing = await service.getDecision(canonicalInput.record_id);
         if (existing !== null) {
-          const sources = await resolveRecordSources(existing, resolver);
-          return success(recordView(existing, sources), 200);
+          const record = await service.record(canonicalInput);
+          const sources = await resolveRecordSources(record, resolver);
+          return success(recordView(record, sources), 200);
         }
         const candidate: DecisionRecord = { ...canonicalInput, user_disposition: canonicalInput.user_disposition ?? "unreviewed" };
         const sources = await resolveRecordSources(candidate, resolver);
@@ -489,6 +503,95 @@ async function handleRequest(
       const sources = await resolveRecordSources(record, resolver, selection);
       if (sources.length === 1) return success(sources[0]);
       return success(sources);
+    }
+
+    if (request.method === "GET" && parts.length === 3 && parts[0] === "decision-records" && parts[2] === "snapshot-diff") {
+      const path = url.searchParams.get("path");
+      if (path === null || path.trim().length === 0) return failure(ERROR_CODES.INVALID_RECORD, "path query parameter is required", 422, "path");
+      const normalizedPath = normalizeSourcePath(path);
+      const record = await service.getDecision(parts[1] ?? "");
+      if (record === null) return failure(ERROR_CODES.INVALID_RECORD, "decision record was not found", 404);
+      const result = await resolveSnapshotDiff(record, normalizedPath, { registry, snapshots, git: resolver.git, worktree: resolver.worktree });
+      return success(result);
+    }
+
+    if (request.method === "POST" && parts.length === 3 && parts[0] === "decision-records" && parts[2] === "automatic-snapshot") {
+      const contentError = requireJsonContentType(request);
+      if (contentError) return contentError;
+      const input = requireExactObject(
+        await parseJsonBody(request, maxJsonBytes),
+        ["capture_id", "source_path", "content", "before_missing"],
+        "automatic snapshot request must contain exactly capture_id, source_path, content, and before_missing",
+      );
+      const captureId = input.capture_id;
+      const sourcePath = input.source_path;
+      const content = input.content;
+      const beforeMissing = input.before_missing;
+      if (typeof captureId !== "string" || captureId.trim().length === 0) {
+        throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "capture_id must be a non-empty string");
+      }
+      if (typeof sourcePath !== "string" || sourcePath.trim().length === 0) {
+        throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "source_path must be a non-empty string");
+      }
+      if (typeof content !== "string") {
+        throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "content must be a string");
+      }
+      if (typeof beforeMissing !== "boolean") {
+        throw new PersistenceError(ERROR_CODES.INVALID_RECORD, "before_missing must be a boolean");
+      }
+      if (new TextEncoder().encode(content).byteLength > snapshots.config.maxSnapshotContentLength) {
+        throw new PersistenceError(ERROR_CODES.PAYLOAD_TOO_LARGE, "snapshot content exceeds the configured maximum length");
+      }
+
+      const recordId = parts[1] ?? "";
+      const normalizedSourcePath = normalizeSourcePath(sourcePath);
+      return enqueueRecord(recordQueues, recordId, async () => {
+        const record = await service.getDecision(recordId);
+        if (record === null) return failure(ERROR_CODES.INVALID_RECORD, "decision record was not found", 404);
+        const matchingTargets = record.targets.filter((target) => target.repository_id === record.repository_id && target.path === normalizedSourcePath);
+        if (matchingTargets.length !== 1) {
+          return failure(ERROR_CODES.INVALID_RECORD, "source_path must identify exactly one target of the decision record", 422, "source_path");
+        }
+        await registry.assertTarget(record.repository_id, normalizedSourcePath);
+        const repository = await registry.get(record.repository_id);
+        if (repository === null) return failure(ERROR_CODES.REPOSITORY_NOT_REGISTERED, "repository is not registered", 404);
+
+        let observedContent = "";
+        let observedBeforeMissing = false;
+        let observedContentHash: string;
+        try {
+          const observed = await resolver.worktree.readFile(repository.root, normalizedSourcePath);
+          observedContent = observed.content;
+          observedContentHash = observed.contentHash;
+        } catch (error) {
+          if (!(error instanceof WorkingTreePathMissingError)) throw error;
+          observedBeforeMissing = true;
+          observedContentHash = createHash("sha256").update(observedContent, "utf8").digest("hex");
+        }
+        const submittedContentHash = createHash("sha256").update(content, "utf8").digest("hex");
+        if (observedBeforeMissing !== beforeMissing || observedContentHash !== submittedContentHash) {
+          throw new PersistenceError(ERROR_CODES.HASH_MISMATCH, "automatic snapshot content does not match the current target state");
+        }
+
+        const existing = await snapshots.getAutomaticByCaptureId({
+          recordId,
+          captureId,
+          sourcePath: normalizedSourcePath,
+          contentHash: submittedContentHash,
+          beforeMissing,
+        });
+        if (existing !== null) {
+          if (existing.mode !== "git" && await snapshots.get(existing.snapshot_id) === null) {
+            throw new PersistenceError(ERROR_CODES.SOURCE_UNAVAILABLE, "automatic snapshot evidence is missing or corrupted");
+          }
+          return success(existing, 200);
+        }
+        const eligible = await detectGitBackable(registry, resolver.git, record, submittedContentHash, normalizedSourcePath);
+        const reference = !beforeMissing && eligible !== null
+          ? await snapshots.createAutomaticGitBacked({ recordId, captureId, sourcePath: normalizedSourcePath, baseSha: eligible.baseSha, contentHash: submittedContentHash })
+          : await snapshots.createAutomatic({ recordId, captureId, sourcePath: normalizedSourcePath, content, beforeMissing });
+        return success(reference, 201);
+      });
     }
 
     if (request.method === "POST" && parts.length === 3 && parts[0] === "decision-records" && parts[2] === "snapshot") {
@@ -559,6 +662,7 @@ export async function createRecorderServer(options: RecorderServerOptions = {}):
     token,
     async stop() {
       await server.stop();
+      snapshots.close();
       store.close();
     },
   };

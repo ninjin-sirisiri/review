@@ -321,6 +321,88 @@ curl -sS -X DELETE \
 
 snapshotはowner-local data directory内に保存され、content hashとサイズが検証されます。
 
+### 自動snapshotと遷移比較
+
+インストール済みのClaude Code／OpenCodeプラグインでは、判断に対応する`Edit`／`Write`の直前に、編集前のファイル状態をautomatic snapshotとして保存します。Recorderが停止している、保存に失敗する、対象のhashが変わっているなどの場合、編集も拒否されます。これは編集後に証拠を作るのではなく、編集前の状態を失わないためのfail-closedなゲートです。
+
+Review UIでautomatic snapshotを持つ判断を選択すると、同じ`repository_id`とpathの次のautomatic snapshotとの遷移を表示します。次のcaptureがなければ、現在の作業ツリーを`after: working tree`として使用します。次のcaptureが壊れている、または読み取れない場合は、作業ツリーへ黙ってfallbackせず、`source-unavailable`または`revision-not-found`を表示します。
+
+既存のmanual snapshotは明示的な`POST /snapshot`操作で保存する独立した機能であり、このautomatic chainには入りません。automatic captureを持たない既存の判断記録は従来どおりのsource／Git diff表示を維持します。
+
+automatic captureのAPI形状は次のとおりです。これはインストール済みのローカルアダプターが編集ゲートから呼び出すためのAPIであり、任意のcontentを証拠として注入する一般用途のAPIではありません。Recorderはrecord、対象path、現在のファイル状態とcontent hashを検証します。
+
+```http
+POST /v1/decision-records/<recordId>/automatic-snapshot
+```
+
+```json
+{
+  "capture_id": "<capture_id>",
+  "source_path": "src/example.ts",
+  "content": "<file content>",
+  "before_missing": false
+}
+```
+
+新規captureの成功時は`201`、同一の`capture_id`・record・path・content hash・`before_missing`を持つcaptureの再送時は`200`で、次のようなreferenceを返します。異なるcapture内容で同じ`capture_id`を再利用した場合はエラーになります。
+
+Git objectを参照できる場合の成功例です。owner-local storageへ保存する場合は`mode`が`changed-files`になり、`path`にstorage-relative pathが入ります。
+
+```json
+{
+  "success": true,
+  "data": {
+    "snapshot_id": "<snapshot_id>",
+    "record_id": "<recordId>",
+    "mode": "git",
+    "path": "",
+    "content_hash": "<sha256>",
+    "created_at": "2026-01-01T00:00:00.000Z",
+    "source_path": "src/example.ts",
+    "capture_kind": "automatic",
+    "before_missing": false,
+    "base_sha": "<commit_sha>"
+  }
+}
+```
+
+`mode`はGit objectを参照できる場合の`git`、owner-local storageへ保存する場合の`changed-files`です。後者では`path`がstorage-relative pathになります。認証、Origin、path、現在状態、サイズの検証に失敗した場合は、通常のAPI error envelope（`success:false`）と対応するerror codeを返し、snapshotを保存しません。
+
+遷移比較は次のGET APIです。
+
+```http
+GET /v1/decision-records/<recordId>/snapshot-diff?path=src/example.ts
+```
+
+次のautomatic snapshotが解決できた場合の形状は次のとおりです。`to`には次のcaptureのreferenceが入り、Git-backed referenceなら`base_sha`と作成時刻を含みます。
+
+```json
+{
+  "success": true,
+  "data": {
+    "state": "snapshot-resolved",
+    "path": "src/example.ts",
+    "from": { "kind": "snapshot", "snapshot_id": "<before_snapshot_id>", "record_id": "<recordId>", "created_at": "<time>", "content_hash": "<sha256>", "source_path": "src/example.ts" },
+    "to": { "kind": "snapshot", "snapshot_id": "<next_snapshot_id>", "record_id": "<next_record_id>", "created_at": "<time>", "content_hash": "<sha256>", "source_path": "src/example.ts" },
+    "hunks": [{ "oldStart": 1, "newStart": 1, "lines": [{ "type": "del", "oldLine": 1, "newLine": null, "content": "old" }, { "type": "add", "oldLine": null, "newLine": 1, "content": "new" }] }],
+    "old_missing": false,
+    "new_missing": false,
+    "binary": false
+  }
+}
+```
+
+次のcaptureがない場合、`data.to`は`{"kind":"working-tree"}`です。automatic captureがない旧記録の場合は、次のlegacy responseになり、UIは従来の表示へ戻ります。
+
+```json
+{
+  "success": true,
+  "data": { "state": "legacy-fallback", "reason": "automatic-snapshot-not-found", "path": "src/example.ts" }
+}
+```
+
+遷移のどちらかのsnapshotを検証できない場合は、HTTP成功レスポンス内の`data.state`を`source-unavailable`または`revision-not-found`として返します。これは表示上の失敗状態であり、現在の作業ツリーを代わりに返すものではありません。
+
 ## Claude Code／Codex／OpenCodeアダプター
 
 アダプターはJSONLを標準入力から受け取り、1行につき1件の結果を標準出力へ返します。
@@ -388,6 +470,8 @@ OpenCode用のプラグインは`plugins/opencode/src/index.ts`です。プロ�
 編集の流れはClaude Codeプラグインと同じです。まず`review_record_judgment`を呼び、`"success":true`を受け取った後だけ同じ対象へ`edit`を呼びます。permitは一致する1回の編集で消費され、hash変化・別ファイル・期限切れの場合は再記録が必要です。
 
 Recorderが停止していてもゲートは閉じたまま fail-closed で動作し、登録や記録の失敗はOpenCodeのログに警告として出力されます。
+
+OpenCodeの`edit`／`write`もClaude Codeの`Edit`／`Write`と同様に、許可前に編集前automatic snapshotを保存します。Recorderへのautomatic captureが成功しない限り、どちらのプラグインも編集を通しません。手動の`/snapshot`操作やアダプターからのJSONL判断記録だけでは、この遷移用captureは作成されません。
 
 ### JSONL入力形式
 

@@ -1,4 +1,13 @@
-import type { ApiFailure, ApiSuccess } from "./api";
+import type {
+  ApiFailure,
+  ApiSuccess,
+  DiffHunk,
+  DiffLine,
+  SnapshotDiff,
+  SnapshotDiffResponse,
+  SnapshotEndpoint,
+  WorkingTreeEndpoint,
+} from "./api";
 import { ERROR_CODES } from "./api";
 import type {
   AgentType,
@@ -7,6 +16,7 @@ import type {
   DecisionRecordInput,
   RevisionRef,
   ReviewSession,
+  SnapshotCaptureKind,
   SnapshotReference,
   TargetReference,
   UserDisposition,
@@ -30,6 +40,11 @@ const CHECK_STATUSES: Record<CheckEvidence["status"], true> = {
   passed: true,
   failed: true,
   "not-run": true,
+};
+const DIFF_LINE_TYPES: Record<DiffLine["type"], true> = {
+  context: true,
+  add: true,
+  del: true,
 };
 const SESSION_STATUSES: Record<ReviewSession["status"], true> = {
   active: true,
@@ -101,6 +116,26 @@ function nonEmptyString(value: unknown, field: string, maxLength = MAX_IDENTIFIE
 function textField(value: unknown, field: string): ApiFailure | null {
   return nonEmptyString(value, field, MAX_TEXT_FIELD_LENGTH);
 }
+
+function stringField(value: unknown, field: string): ApiFailure | null {
+  if (typeof value !== "string") return invalid(`${field} must be a string`, field);
+  // Diff content is bounded by Recorder's configured source and diff-output byte limits.
+  return null;
+}
+
+function positiveInteger(value: unknown, field: string): ApiFailure | null {
+  if (!Number.isInteger(value) || (value as number) < 1) return invalid(`${field} must be a positive integer`, field);
+  return null;
+}
+
+function nullablePositiveInteger(value: unknown, field: string): ApiFailure | null {
+  return value === null ? null : positiveInteger(value, field);
+}
+
+function booleanField(value: unknown, field: string): ApiFailure | null {
+  return typeof value === "boolean" ? null : invalid(`${field} must be a boolean`, field);
+}
+
 function timestamp(value: unknown, field: string, optional = false): ApiFailure | null {
   if (value === undefined && optional) return null;
   const stringError = nonEmptyString(value, field, 128);
@@ -333,7 +368,7 @@ export function validateReviewSession(value: unknown): ValidationResult<ReviewSe
 }
 
 export function validateSnapshotReference(value: unknown): ValidationResult<SnapshotReference> {
-  if (!isRecord(value) || !hasOnlyKeys(value, ["snapshot_id", "record_id", "mode", "path", "content_hash", "created_at", "base_sha", "source_path"])) {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["snapshot_id", "record_id", "mode", "path", "content_hash", "created_at", "base_sha", "source_path", "capture_kind", "before_missing"])) {
     return invalid("snapshot reference has an unsupported field");
   }
   const requiredError = firstError(
@@ -345,6 +380,16 @@ export function validateSnapshotReference(value: unknown): ValidationResult<Snap
   if (requiredError) return requiredError;
   if (typeof value.mode !== "string" || !hasOwnKey(SNAPSHOT_MODES, value.mode)) return invalid("mode is invalid", "mode");
   const mode = value.mode as SnapshotReference["mode"];
+  const captureKind = value.capture_kind;
+  if (captureKind !== undefined && captureKind !== "manual" && captureKind !== "automatic") {
+    return invalid("capture_kind is invalid", "capture_kind");
+  }
+  if (value.before_missing !== undefined && typeof value.before_missing !== "boolean") {
+    return invalid("before_missing must be a boolean", "before_missing");
+  }
+  if (captureKind !== "automatic" && value.before_missing !== undefined) {
+    return invalid("before_missing is only allowed on automatic snapshots", "before_missing");
+  }
   if (mode === "git") {
     if (typeof value.base_sha !== "string" || !/^[0-9a-f]{40}$/.test(value.base_sha)) {
       return invalid("base_sha must be a lowercase 40-character commit SHA for git snapshots", "base_sha");
@@ -352,6 +397,9 @@ export function validateSnapshotReference(value: unknown): ValidationResult<Snap
     const sourcePathResult = normalizeRelativePath(value.source_path, "source_path");
     if (!sourcePathResult.success) return sourcePathResult;
     if (value.path !== "") return invalid("path must be empty for git-backed snapshots", "path");
+    if (captureKind === "automatic" && typeof value.before_missing !== "boolean") {
+      return invalid("before_missing is required for automatic snapshots", "before_missing");
+    }
     return success({
       snapshot_id: value.snapshot_id as string,
       record_id: value.record_id as string,
@@ -361,13 +409,34 @@ export function validateSnapshotReference(value: unknown): ValidationResult<Snap
       created_at: value.created_at as string,
       base_sha: value.base_sha,
       source_path: sourcePathResult.data,
+      ...(captureKind === undefined ? {} : { capture_kind: captureKind as SnapshotCaptureKind }),
+      ...(captureKind === "automatic" ? { before_missing: value.before_missing as boolean } : {}),
     });
   }
-  if (value.base_sha !== undefined || value.source_path !== undefined) {
-    return invalid("base_sha and source_path are only allowed on git-backed snapshots", "base_sha");
+  if (value.base_sha !== undefined) {
+    return invalid("base_sha is only allowed on git-backed snapshots", "base_sha");
   }
   const pathResult = normalizeRelativePath(value.path, "path");
   if (!pathResult.success) return pathResult;
+  if (captureKind === "automatic") {
+    const sourcePathResult = normalizeRelativePath(value.source_path, "source_path");
+    if (!sourcePathResult.success) return sourcePathResult;
+    if (typeof value.before_missing !== "boolean") return invalid("before_missing is required for automatic snapshots", "before_missing");
+    return success({
+      snapshot_id: value.snapshot_id as string,
+      record_id: value.record_id as string,
+      mode,
+      path: pathResult.data,
+      content_hash: value.content_hash as string,
+      created_at: value.created_at as string,
+      source_path: sourcePathResult.data,
+      capture_kind: "automatic",
+      before_missing: value.before_missing,
+    });
+  }
+  if (value.source_path !== undefined) {
+    return invalid("source_path is only allowed on automatic snapshots", "source_path");
+  }
   return success({
     snapshot_id: value.snapshot_id as string,
     record_id: value.record_id as string,
@@ -375,7 +444,163 @@ export function validateSnapshotReference(value: unknown): ValidationResult<Snap
     path: pathResult.data,
     content_hash: value.content_hash as string,
     created_at: value.created_at as string,
+    ...(captureKind === undefined ? {} : { capture_kind: captureKind as SnapshotCaptureKind }),
   });
+}
+
+function validateDiffLine(value: unknown, hunkIndex: number, lineIndex: number): ValidationResult<DiffLine> {
+  const field = `hunks[${hunkIndex}].lines[${lineIndex}]`;
+  if (!isRecord(value) || !hasOnlyKeys(value, ["type", "oldLine", "newLine", "content"])) {
+    return invalid(`${field} has an unsupported field`, field);
+  }
+  const requiredError = firstError(
+    nullablePositiveInteger(value.oldLine, `${field}.oldLine`),
+    nullablePositiveInteger(value.newLine, `${field}.newLine`),
+    stringField(value.content, `${field}.content`),
+  );
+  if (requiredError) return requiredError;
+  if (typeof value.type !== "string" || !hasOwnKey(DIFF_LINE_TYPES, value.type)) {
+    return invalid(`${field}.type must be context, add, or del`, `${field}.type`);
+  }
+
+  const type = value.type as DiffLine["type"];
+  const oldLine = value.oldLine as number | null;
+  const newLine = value.newLine as number | null;
+  const lineShapeIsValid = type === "context"
+    ? oldLine !== null && newLine !== null
+    : type === "add"
+      ? oldLine === null && newLine !== null
+      : oldLine !== null && newLine === null;
+  if (!lineShapeIsValid) return invalid(`${field} line numbers do not match its type`, field);
+
+  return success({ type, oldLine, newLine, content: value.content as string });
+}
+
+function validateDiffHunk(value: unknown, hunkIndex: number): ValidationResult<DiffHunk> {
+  const field = `hunks[${hunkIndex}]`;
+  if (!isRecord(value) || !hasOnlyKeys(value, ["oldStart", "newStart", "lines"])) {
+    return invalid(`${field} has an unsupported field`, field);
+  }
+  const requiredError = firstError(
+    positiveInteger(value.oldStart, `${field}.oldStart`),
+    positiveInteger(value.newStart, `${field}.newStart`),
+  );
+  if (requiredError) return requiredError;
+  if (!Array.isArray(value.lines)) return invalid(`${field}.lines must be an array`, `${field}.lines`);
+  if (value.lines.length === 0) return invalid(`${field}.lines must contain at least one line`, `${field}.lines`);
+
+  const lines: DiffLine[] = [];
+  for (let lineIndex = 0; lineIndex < value.lines.length; lineIndex += 1) {
+    const result = validateDiffLine(value.lines[lineIndex], hunkIndex, lineIndex);
+    if (!result.success) return result;
+    lines.push(result.data);
+  }
+  return success({ oldStart: value.oldStart as number, newStart: value.newStart as number, lines });
+}
+
+function validateSnapshotEndpoint(value: unknown): ValidationResult<SnapshotEndpoint> {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["kind", "snapshot_id", "record_id", "created_at", "content_hash", "source_path", "base_sha"])) {
+    return invalid("snapshot endpoint has an unsupported field", "from");
+  }
+  const requiredError = firstError(
+    nonEmptyString(value.snapshot_id, "from.snapshot_id"),
+    nonEmptyString(value.record_id, "from.record_id"),
+    timestamp(value.created_at, "from.created_at"),
+    nonEmptyString(value.content_hash, "from.content_hash", 128),
+    value.base_sha === undefined ? null : nonEmptyString(value.base_sha, "from.base_sha", 128),
+  );
+  if (requiredError) return requiredError;
+  if (value.kind !== "snapshot") return invalid("snapshot endpoint kind must be snapshot", "from.kind");
+  const sourcePathResult = normalizeRelativePath(value.source_path, "from.source_path");
+  if (!sourcePathResult.success) return sourcePathResult;
+  return success({
+    kind: "snapshot",
+    snapshot_id: value.snapshot_id as string,
+    record_id: value.record_id as string,
+    created_at: value.created_at as string,
+    content_hash: value.content_hash as string,
+    source_path: sourcePathResult.data,
+    ...(value.base_sha === undefined ? {} : { base_sha: value.base_sha as string }),
+  });
+}
+
+function validateWorkingTreeEndpoint(value: unknown): ValidationResult<WorkingTreeEndpoint> {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["kind"]) || value.kind !== "working-tree") {
+    return invalid("working-tree endpoint must contain only kind", "to");
+  }
+  return success({ kind: "working-tree" });
+}
+
+function validateSnapshotResolved(value: Record<string, unknown>): ValidationResult<SnapshotDiff> {
+  if (!hasOnlyKeys(value, ["state", "path", "from", "to", "hunks", "old_missing", "new_missing", "binary"])) {
+    return invalid("snapshot-resolved response has an unsupported field");
+  }
+  const pathResult = normalizeRelativePath(value.path, "path");
+  if (!pathResult.success) return pathResult;
+  const fromResult = validateSnapshotEndpoint(value.from);
+  if (!fromResult.success) return fromResult;
+
+  let toResult: ValidationResult<SnapshotEndpoint | WorkingTreeEndpoint>;
+  if (isRecord(value.to) && value.to.kind === "snapshot") {
+    toResult = validateSnapshotEndpoint(value.to);
+  } else {
+    toResult = validateWorkingTreeEndpoint(value.to);
+  }
+  if (!toResult.success) return toResult;
+
+  const requiredError = firstError(
+    booleanField(value.old_missing, "old_missing"),
+    booleanField(value.new_missing, "new_missing"),
+    booleanField(value.binary, "binary"),
+  );
+  if (requiredError) return requiredError;
+  if (!Array.isArray(value.hunks)) return invalid("hunks must be an array", "hunks");
+  if (value.binary === true && value.hunks.length > 0) return invalid("binary snapshot diffs must not contain hunks", "hunks");
+
+  const hunks: DiffHunk[] = [];
+  for (let hunkIndex = 0; hunkIndex < value.hunks.length; hunkIndex += 1) {
+    const result = validateDiffHunk(value.hunks[hunkIndex], hunkIndex);
+    if (!result.success) return result;
+    hunks.push(result.data);
+  }
+  return success({
+    state: "snapshot-resolved",
+    path: pathResult.data,
+    from: fromResult.data,
+    to: toResult.data,
+    hunks,
+    old_missing: value.old_missing as boolean,
+    new_missing: value.new_missing as boolean,
+    binary: value.binary as boolean,
+  });
+}
+
+function validateLegacyFallback(value: Record<string, unknown>): ValidationResult<Extract<SnapshotDiffResponse, { state: "legacy-fallback" }>> {
+  if (!hasOnlyKeys(value, ["state", "reason", "path"])) return invalid("legacy-fallback response has an unsupported field");
+  if (value.reason !== "automatic-snapshot-not-found") return invalid("legacy-fallback reason is invalid", "reason");
+  const pathResult = normalizeRelativePath(value.path, "path");
+  if (!pathResult.success) return pathResult;
+  return success({ state: "legacy-fallback", reason: "automatic-snapshot-not-found", path: pathResult.data });
+}
+
+function validateSnapshotFailure(value: Record<string, unknown>): ValidationResult<Extract<SnapshotDiffResponse, { state: "source-unavailable" | "revision-not-found" }>> {
+  if (!hasOnlyKeys(value, ["state", "path", "message"])) return invalid("snapshot failure response has an unsupported field");
+  if (value.state !== "source-unavailable" && value.state !== "revision-not-found") {
+    return invalid("snapshot failure state is invalid", "state");
+  }
+  const pathResult = normalizeRelativePath(value.path, "path");
+  if (!pathResult.success) return pathResult;
+  const messageError = textField(value.message, "message");
+  if (messageError) return messageError;
+  return success({ state: value.state, path: pathResult.data, message: value.message as string });
+}
+
+export function validateSnapshotDiffResponse(value: unknown): ValidationResult<SnapshotDiffResponse> {
+  if (!isRecord(value)) return invalid("snapshot diff response must be an object");
+  if (value.state === "snapshot-resolved") return validateSnapshotResolved(value);
+  if (value.state === "legacy-fallback") return validateLegacyFallback(value);
+  if (value.state === "source-unavailable" || value.state === "revision-not-found") return validateSnapshotFailure(value);
+  return invalid("snapshot diff response state is invalid", "state");
 }
 
 export class ContractValidationError extends Error {
@@ -392,6 +617,12 @@ export class ContractValidationError extends Error {
 
 export function parseDecisionRecordInput(value: unknown): DecisionRecordInput {
   const result = validateDecisionRecordInput(value);
+  if (!result.success) throw new ContractValidationError(result);
+  return result.data;
+}
+
+export function parseSnapshotDiffResponse(value: unknown): SnapshotDiffResponse {
+  const result = validateSnapshotDiffResponse(value);
   if (!result.success) throw new ContractValidationError(result);
   return result.data;
 }

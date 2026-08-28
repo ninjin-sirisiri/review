@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DecisionRecordDetail, DecisionRecordSummary, SourceReferenceData } from "../api";
-import { buildDecisionIndex, decisionAnchors, diffBaseFor, overlapsBlock, targetAnchor } from "./decision-index";
+import { buildDecisionIndex, decisionAnchors, diffBaseFor, overlapsBlock, targetAnchor, transitionAnchors } from "./decision-index";
 
 function summary(recordId: string, overrides: Partial<DecisionRecordSummary> = {}): DecisionRecordSummary {
   return {
@@ -120,6 +120,24 @@ describe("overlapsBlock", () => {
     expect(overlapsBlock(anchor, { oldStart: null, oldEnd: null, newStart: 1, newEnd: 2 })).toBe(true);
     expect(overlapsBlock(anchor, { oldStart: 1, oldEnd: 4, newStart: null, newEnd: null })).toBe(false);
     expect(overlapsBlock(anchor, { oldStart: null, oldEnd: null, newStart: 4, newEnd: 6 })).toBe(false);
+  });
+});
+
+describe("transitionAnchors", () => {
+  it("maps only the selected path targets to the old side", () => {
+    const detail: DecisionRecordDetail = {
+      record: {
+        ...summary("transition"),
+        rationale: "",
+        checks: [],
+        open_questions: [],
+      },
+      sources: [],
+    };
+
+    expect(transitionAnchors(detail, "src/a.ts")).toEqual([
+      { side: "old", start: 10, end: 12 },
+    ]);
   });
 });
 

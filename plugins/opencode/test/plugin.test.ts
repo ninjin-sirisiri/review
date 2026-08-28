@@ -1,21 +1,30 @@
 import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { Plugin } from "@opencode-ai/plugin";
 import pluginModule from "../src/index";
 import { grantDecisionPermits, normalizeDecisionProposal } from "../../common/src/decision-gate";
+import { RecorderBridge } from "../../common/src/bridge";
 
 const pluginFactory = pluginModule.server;
 
 const GATED_ENV_KEYS = ["AI_REVIEW_SESSION_ID", "AI_REVIEW_REPOSITORY_ROOT", "AI_REVIEW_AGENT_TYPE", "AI_REVIEW_GATE_ROOT", "RECORDER_URL", "RECORDER_TOKEN_PATH"];
 const preservedEnv: Record<string, string | undefined> = {};
+const productionCapture = RecorderBridge.prototype.captureAutomaticSnapshot;
 
 beforeEach(() => {
   for (const key of GATED_ENV_KEYS) {
     preservedEnv[key] = process.env[key];
     delete process.env[key];
   }
+  RecorderBridge.prototype.captureAutomaticSnapshot = async function (input) {
+    return { success: true, status: 201, duplicate: false, recordId: input.recordId };
+  };
+});
+
+afterEach(() => {
+  RecorderBridge.prototype.captureAutomaticSnapshot = productionCapture;
 });
 
 async function fixture(): Promise<{ root: string; file: string; gateRoot: string }> {
@@ -62,6 +71,39 @@ test("the plugin gates edits before any judgment exists", async () => {
   expect(denied).toContain("blocked");
 });
 
+test("an invalid Recorder endpoint keeps hooks installed and denies a matched edit", async () => {
+  const current = await fixture();
+  process.env.AI_REVIEW_GATE_ROOT = current.gateRoot;
+  process.env.RECORDER_URL = "https://example.com/v1/decision-records";
+  const testCapture = RecorderBridge.prototype.captureAutomaticSnapshot;
+  RecorderBridge.prototype.captureAutomaticSnapshot = productionCapture;
+
+  try {
+    let initializationError: unknown;
+    let hooks: Awaited<ReturnType<typeof pluginFactory>> | undefined;
+    try {
+      hooks = await buildHooks(current);
+    } catch (error) {
+      initializationError = error;
+    }
+    expect(initializationError).toBeUndefined();
+    if (hooks === undefined) throw new Error("plugin returned no hooks");
+    const before = hooks["tool.execute.before"];
+    if (before === undefined) throw new Error("tool.execute.before hook missing");
+    const event = await normalizeDecisionProposal({
+      repositoryRoot: current.root,
+      targets: [{ path: "src/change.ts", lineStart: 1 }],
+      judgment: "safe",
+      rationale: "checked",
+    }, { sessionId: "ses_invalid-endpoint" });
+    await grantDecisionPermits(event, { recordId: "record-invalid-endpoint", gateRoot: current.gateRoot });
+
+    await expect(before({ tool: "edit", sessionID: "ses_invalid-endpoint", callID: "call-invalid-endpoint" }, { args: { filePath: current.file } })).rejects.toThrow("Automatic snapshot failed before edit: Recorder endpoint must use a loopback host");
+  } finally {
+    RecorderBridge.prototype.captureAutomaticSnapshot = testCapture;
+  }
+});
+
 test("the plugin consumes a permit only when an edit actually completes", async () => {
   const current = await fixture();
   process.env.AI_REVIEW_GATE_ROOT = current.gateRoot;
@@ -81,6 +123,40 @@ test("the plugin consumes a permit only when an edit actually completes", async 
   await before({ tool: "edit", sessionID: "ses_gate-002", callID: "call-2" }, { args: { filePath: current.file } });
   await after({ tool: "edit", sessionID: "ses_gate-002", callID: "call-2", args: { filePath: current.file } }, { title: "x", output: "", metadata: {} });
   await expect(before({ tool: "edit", sessionID: "ses_gate-002", callID: "call-3" }, { args: { filePath: current.file } })).rejects.toThrow("blocked");
+});
+
+test("the plugin shares one automatic snapshot bridge across pre-edit calls", async () => {
+  const current = await fixture();
+  process.env.AI_REVIEW_GATE_ROOT = current.gateRoot;
+  const bridgeInstances = new Set<RecorderBridge>();
+  const captureIds: string[] = [];
+  const originalCapture = RecorderBridge.prototype.captureAutomaticSnapshot;
+  RecorderBridge.prototype.captureAutomaticSnapshot = async function (input) {
+    bridgeInstances.add(this);
+    captureIds.push(input.captureId);
+    return { success: true, status: 201, duplicate: false, recordId: input.recordId };
+  };
+
+  try {
+    const hooks = await buildHooks(current);
+    const before = hooks["tool.execute.before"];
+    if (before === undefined) throw new Error("tool.execute.before hook missing");
+    const event = await normalizeDecisionProposal({
+      repositoryRoot: current.root,
+      targets: [{ path: "src/change.ts", lineStart: 1 }],
+      judgment: "safe",
+      rationale: "checked",
+    }, { sessionId: "ses_shared-001" });
+    await grantDecisionPermits(event, { recordId: "record-shared-001", gateRoot: current.gateRoot });
+
+    await before({ tool: "edit", sessionID: "ses_shared-001", callID: "call-shared-1" }, { args: { filePath: current.file } });
+    await before({ tool: "edit", sessionID: "ses_shared-001", callID: "call-shared-2" }, { args: { filePath: current.file } });
+
+    expect(bridgeInstances.size).toBe(1);
+    expect(captureIds[1]).toBe(captureIds[0]);
+  } finally {
+    RecorderBridge.prototype.captureAutomaticSnapshot = originalCapture;
+  }
 });
 
 test("an edit blocked outside the gate leaves the permit usable on retry", async () => {

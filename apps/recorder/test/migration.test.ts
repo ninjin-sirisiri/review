@@ -111,6 +111,30 @@ function seedLegacyData(db: Database): void {
   `);
 }
 
+function upgradeSnapshotsToV3(db: Database): void {
+  db.exec(`
+    CREATE TABLE snapshots_v3 (
+      snapshot_id TEXT PRIMARY KEY,
+      record_id TEXT NOT NULL REFERENCES decision_records(record_id) ON DELETE CASCADE,
+      mode TEXT NOT NULL CHECK (mode IN ('changed-files', 'patch', 'git')),
+      path TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      base_sha TEXT,
+      source_path TEXT,
+      CHECK (mode = 'git' OR (base_sha IS NULL AND source_path IS NULL)),
+      CHECK (mode <> 'git' OR (base_sha IS NOT NULL AND source_path IS NOT NULL AND path = '')),
+      CHECK (base_sha IS NULL OR (length(base_sha) = 40 AND base_sha NOT GLOB '*[^0-9a-f]*'))
+    );
+    INSERT INTO snapshots_v3 (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path)
+      SELECT snapshot_id, record_id, mode, path, content_hash, created_at, NULL, NULL FROM snapshots;
+    DROP TABLE snapshots;
+    ALTER TABLE snapshots_v3 RENAME TO snapshots;
+    CREATE UNIQUE INDEX snapshots_storage_path_unique ON snapshots(path) WHERE path <> '';
+    INSERT INTO schema_migrations (version) VALUES (2), (3);
+  `);
+}
+
 function opencodeSession(repositoryId = "repo-1"): ReviewSession {
   return {
     session_id: "session-opencode",
@@ -126,7 +150,7 @@ test("fresh databases accept every supported agent type", () => {
   try {
     migrateSchema(db);
     const version = db.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
-    expect(version.version).toBe(3);
+    expect(version.version).toBe(4);
 
     db.exec("INSERT INTO repositories (repository_id, root, created_at) VALUES ('repo-1', '/tmp/repo-1', '2026-08-24T00:00:00.000Z')");
     for (const agentType of ["claude-code", "codex", "opencode"] as const) {
@@ -158,7 +182,7 @@ test("migrating a legacy database preserves rows and unlocks the opencode agent 
     migrateSchema(migrated);
 
     const version = migrated.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
-    expect(version.version).toBe(3);
+    expect(version.version).toBe(4);
 
     const legacySession = migrated.query("SELECT agent_type FROM sessions WHERE session_id = 'session-legacy'").get() as { agent_type: string };
     expect(legacySession.agent_type).toBe("codex");
@@ -229,8 +253,18 @@ test("migrating a legacy database rebuilds snapshots for git-backed rows", async
         'legacy-record', 'session-legacy', 'repo-1', 'codex', 'working-tree', 'hash',
         'snapshot judgment', 'snapshot rationale', '[]', '[]', '2026-08-01T00:00:00.000Z', 'unreviewed'
       );
-      INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at)
-        VALUES ('legacy-snapshot', 'legacy-record', 'patch', 'legacy.snapshot', 'legacy-hash', '2026-08-01T00:00:00.000Z');
+      INSERT INTO decision_records (
+        record_id, session_id, repository_id, agent_type, revision_kind, revision_value,
+        judgment, rationale, checks_json, open_questions_json, created_at, user_disposition
+      ) VALUES (
+        'second-record', 'session-legacy', 'repo-1', 'codex', 'working-tree', 'hash-two',
+        'second snapshot judgment', 'second snapshot rationale', '[]', '[]', '2026-08-02T00:00:00.000Z', 'unreviewed'
+      );
+    `);
+    upgradeSnapshotsToV3(seeded);
+    seeded.exec(`
+      INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path)
+        VALUES ('legacy-snapshot', 'legacy-record', 'git', '', 'legacy-git-hash', '2026-08-01T00:00:00.000Z', '${"a".repeat(40)}', 'src/example.ts');
     `);
   } finally {
     seeded.close();
@@ -241,22 +275,87 @@ test("migrating a legacy database rebuilds snapshots for git-backed rows", async
     migrateSchema(db);
 
     const version = db.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
-    expect(version.version).toBe(3);
+    expect(version.version).toBe(4);
 
     const row = db.query("SELECT snapshot_id FROM snapshots").get() as { snapshot_id: string } | null;
     expect(row?.snapshot_id).toBe("legacy-snapshot");
 
-    const columns = (db.query("PRAGMA table_info(snapshots)").all() as Array<{ name: string }>).map((column) => column.name);
-    expect(columns).toContain("base_sha");
-    expect(columns).toContain("source_path");
-    const preserved = db.query("SELECT base_sha, source_path FROM snapshots WHERE snapshot_id = 'legacy-snapshot'").get() as { base_sha: string | null; source_path: string | null };
-    expect(preserved.base_sha).toBeNull();
-    expect(preserved.source_path).toBeNull();
+    const snapshotColumns = (db.query("PRAGMA table_info(snapshots)").all() as Array<{ name: string }>).map((column) => column.name);
+    expect(snapshotColumns).toEqual(expect.arrayContaining(["capture_kind", "before_missing", "capture_sequence", "capture_id"]));
+    expect(snapshotColumns).toContain("base_sha");
+    expect(snapshotColumns).toContain("source_path");
+    const legacy = db.query(
+      "SELECT capture_kind, before_missing, capture_sequence, capture_id FROM snapshots WHERE snapshot_id = 'legacy-snapshot'",
+    ).get() as { capture_kind: string; before_missing: number; capture_sequence: number | null; capture_id: string | null };
+    expect(legacy).toEqual({ capture_kind: "manual", before_missing: 0, capture_sequence: null, capture_id: null });
+    const preserved = db.query(
+      "SELECT mode, path, content_hash, created_at, base_sha, source_path FROM snapshots WHERE snapshot_id = 'legacy-snapshot'",
+    ).get() as {
+      mode: string;
+      path: string;
+      content_hash: string;
+      created_at: string;
+      base_sha: string | null;
+      source_path: string | null;
+    };
+    expect(preserved).toEqual({
+      mode: "git",
+      path: "",
+      content_hash: "legacy-git-hash",
+      created_at: "2026-08-01T00:00:00.000Z",
+      base_sha: "a".repeat(40),
+      source_path: "src/example.ts",
+    });
 
     const indexes = (db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'snapshots'").all() as Array<{ name: string }>).map((index) => index.name);
-    expect(indexes).toContain("snapshots_storage_path_unique");
+    expect(indexes).toEqual(expect.arrayContaining([
+      "snapshots_storage_path_unique",
+      "snapshots_capture_id_unique",
+      "snapshots_capture_sequence_unique",
+    ]));
+    const secondRecord = db.query("SELECT record_id FROM decision_records WHERE record_id = 'second-record'").get() as { record_id: string } | null;
+    expect(secondRecord?.record_id).toBe("second-record");
 
-    // Two git rows may share path=''.
+    db.query(`
+      INSERT INTO snapshots (
+        snapshot_id, record_id, mode, path, content_hash, created_at,
+        base_sha, source_path, capture_kind, before_missing, capture_sequence, capture_id
+      ) VALUES ('automatic-1', 'legacy-record', 'changed-files', 'snapshots/automatic-1.snapshot',
+        '${"b".repeat(64)}', '2026-08-27T00:00:00Z', NULL, 'src/a.ts', 'automatic', 0, 1, 'capture-1')
+    `).run();
+
+    expect(() => db.query(`
+      INSERT INTO snapshots (
+        snapshot_id, record_id, mode, path, content_hash, created_at,
+        base_sha, source_path, capture_kind, before_missing, capture_sequence, capture_id
+      ) VALUES ('automatic-bad', 'legacy-record', 'changed-files', 'snapshots/automatic-bad.snapshot',
+        '${"b".repeat(64)}', '2026-08-27T00:00:00Z', NULL, NULL, 'automatic', 0, 2, 'capture-bad')
+    `).run()).toThrow();
+
+    db.query(`
+      INSERT INTO snapshots (
+        snapshot_id, record_id, mode, path, content_hash, created_at,
+        base_sha, source_path, capture_kind, before_missing, capture_sequence, capture_id
+      ) VALUES ('automatic-2', 'legacy-record', 'changed-files', 'snapshots/automatic-2.snapshot',
+        '${"b".repeat(64)}', '2026-08-27T00:00:00Z', NULL, 'src/b.ts', 'automatic', 0, 2, 'capture-2')
+    `).run();
+
+    expect(() => db.query(`
+      INSERT INTO snapshots (
+        snapshot_id, record_id, mode, path, content_hash, created_at,
+        base_sha, source_path, capture_kind, before_missing, capture_sequence, capture_id
+      ) VALUES ('cross-record-capture-id', 'second-record', 'changed-files', 'snapshots/cross-record-capture-id.snapshot',
+        '${"b".repeat(64)}', '2026-08-27T00:00:00Z', NULL, 'src/cross-id.ts', 'automatic', 0, 3, 'capture-1')
+    `).run()).toThrow(/snapshots\.capture_id/);
+
+    expect(() => db.query(`
+      INSERT INTO snapshots (
+        snapshot_id, record_id, mode, path, content_hash, created_at,
+        base_sha, source_path, capture_kind, before_missing, capture_sequence, capture_id
+      ) VALUES ('cross-record-capture-sequence', 'second-record', 'changed-files', 'snapshots/cross-record-capture-sequence.snapshot',
+        '${"b".repeat(64)}', '2026-08-27T00:00:00Z', NULL, 'src/cross-sequence.ts', 'automatic', 0, 1, 'capture-cross-sequence')
+    `).run()).toThrow(/snapshots\.capture_sequence/);
+
     db.query(
       "INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path) VALUES ($id, 'legacy-record', 'git', '', 'h1', '2026-08-26T00:00:00Z', $sha, 'src/a.ts')",
     ).run({ $id: "git-1", $sha: "a".repeat(40) });
@@ -266,16 +365,56 @@ test("migrating a legacy database rebuilds snapshots for git-backed rows", async
 
     // Constraint matrix.
     expect(() =>
-      db.query("INSERT INTO snapshots VALUES ('bad-sha', 'legacy-record', 'git', '', 'h', '2026-08-26T00:00:00Z', 'zz', 'src/c.ts')").run(),
+      db.query("INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path) VALUES ('bad-sha', 'legacy-record', 'git', '', 'h', '2026-08-26T00:00:00Z', 'zz', 'src/c.ts')").run(),
     ).toThrow();
     expect(() =>
-      db.query(`INSERT INTO snapshots VALUES ('file-with-sha', 'legacy-record', 'patch', 'p.snapshot', 'h', '2026-08-26T00:00:00Z', '${"a".repeat(40)}', null)`).run(),
+      db.query(`INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path) VALUES ('file-with-sha', 'legacy-record', 'patch', 'p.snapshot', 'h', '2026-08-26T00:00:00Z', '${"a".repeat(40)}', null)`).run(),
     ).toThrow();
     // Duplicate real storage paths still collide through the partial index; a second distinct path is fine.
-    db.query("INSERT INTO snapshots VALUES ('dup-path', 'legacy-record', 'patch', 'same.snapshot', 'h', '2026-08-26T00:00:00Z', null, null)").run();
+    db.query("INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path) VALUES ('dup-path', 'legacy-record', 'patch', 'same.snapshot', 'h', '2026-08-26T00:00:00Z', null, null)").run();
     expect(() =>
-      db.query("INSERT INTO snapshots VALUES ('dup-path-2', 'legacy-record', 'patch', 'same.snapshot', 'h', '2026-08-26T00:00:00Z', null, null)").run(),
+      db.query("INSERT INTO snapshots (snapshot_id, record_id, mode, path, content_hash, created_at, base_sha, source_path) VALUES ('dup-path-2', 'legacy-record', 'patch', 'same.snapshot', 'h', '2026-08-26T00:00:00Z', null, null)").run(),
     ).toThrow();
+
+    expect(() => db.query(`
+      INSERT INTO snapshots (
+        snapshot_id, record_id, mode, path, content_hash, created_at,
+        base_sha, source_path, capture_kind, before_missing, capture_sequence, capture_id
+      ) VALUES ('capture-duplicate', 'legacy-record', 'changed-files', 'snapshots/capture-duplicate.snapshot',
+        '${"b".repeat(64)}', '2026-08-27T00:00:00Z', NULL, 'src/b.ts', 'automatic', 0, 3, 'capture-1')
+    `).run()).toThrow(/snapshots\.capture_id/);
+
+    expect(() => db.query(`
+      INSERT INTO snapshots (
+        snapshot_id, record_id, mode, path, content_hash, created_at,
+        base_sha, source_path, capture_kind, before_missing, capture_sequence, capture_id
+      ) VALUES ('sequence-duplicate', 'legacy-record', 'changed-files', 'snapshots/sequence-duplicate.snapshot',
+        '${"b".repeat(64)}', '2026-08-27T00:00:00Z', NULL, 'src/c.ts', 'automatic', 0, 2, 'capture-3')
+    `).run()).toThrow(/snapshots\.capture_sequence/);
+
+    db.query(`
+      INSERT INTO snapshots (
+        snapshot_id, record_id, mode, path, content_hash, created_at,
+        base_sha, source_path, capture_kind, before_missing, capture_sequence, capture_id
+      ) VALUES ('before-missing', 'legacy-record', 'changed-files', 'snapshots/before-missing.snapshot',
+        'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+        '2026-08-27T00:00:00Z', NULL, 'src/d.ts', 'automatic', 1, 4, 'capture-4')
+    `).run();
+    const beforeMissing = db.query(
+      "SELECT before_missing, content_hash FROM snapshots WHERE snapshot_id = 'before-missing'",
+    ).get() as { before_missing: number; content_hash: string };
+    expect(beforeMissing).toEqual({
+      before_missing: 1,
+      content_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    });
+
+    expect(() => db.query(`
+      INSERT INTO snapshots (
+        snapshot_id, record_id, mode, path, content_hash, created_at,
+        base_sha, source_path, capture_kind, before_missing, capture_sequence, capture_id
+      ) VALUES ('missing-before-content', 'legacy-record', 'changed-files', 'snapshots/missing-before-content.snapshot',
+        '${"b".repeat(64)}', '2026-08-27T00:00:00Z', NULL, 'src/e.ts', 'automatic', 1, 5, 'capture-5')
+    `).run()).toThrow();
   } finally {
     db.close();
   }

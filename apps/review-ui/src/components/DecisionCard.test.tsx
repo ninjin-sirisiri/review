@@ -60,6 +60,22 @@ describe("DecisionCard", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("exposes an independent selection control and announces its selected state", () => {
+    const onSelect = vi.fn();
+    const { rerender } = render(
+      <DecisionCard detail={detail} selected={false} onSelect={onSelect} />,
+    );
+
+    const select = screen.getByRole("button", { name: "View subsequent changes" });
+    expect(select.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(select);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+
+    rerender(<DecisionCard detail={detail} selected onSelect={onSelect} />);
+    const selected = screen.getByRole("button", { name: "Viewing subsequent changes" });
+    expect(selected.getAttribute("aria-pressed")).toBe("true");
+  });
+
   it("shows git provenance for snapshot-resolved sources", () => {
     render(<DecisionCard detail={detailWithSnapshot("git", "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0")} />);
 

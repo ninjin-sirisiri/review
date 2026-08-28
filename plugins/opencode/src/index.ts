@@ -2,6 +2,8 @@ import { realpath } from "node:fs/promises";
 import type { Plugin, PluginModule } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { runAdapter } from "../../common/src/adapter-contract";
+import { RecorderBridge } from "../../common/src/bridge";
+import type { AutomaticSnapshotBridge } from "../../common/src/decision-gate";
 import { AGENT_TYPE, gateToolUse, gateToolUseAfter, recordDecision, registerSession } from "./gate";
 
 const EDIT_TOOLS = new Set(["edit", "write", "patch", "multiedit", "notebookedit"]);
@@ -35,6 +37,25 @@ function logWarning(client: Parameters<Plugin>[0]["client"], message: string): v
 
 const plugin: Plugin = async ({ client, directory, worktree }) => {
   const repositoryRoot = await realpath(worktree || directory).catch(() => worktree || directory);
+  let recorderBridge: RecorderBridge | undefined;
+  const snapshotBridge: AutomaticSnapshotBridge = {
+    captureAutomaticSnapshot: async (input) => {
+      try {
+        recorderBridge ??= new RecorderBridge();
+        return await recorderBridge.captureAutomaticSnapshot(input);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          success: false,
+          code: "RECORDER_CONFIG_ERROR",
+          message,
+          error: message,
+          recordId: input.recordId,
+          attempts: 0,
+        };
+      }
+    },
+  };
   const registrations = new Map<string, Promise<void>>();
 
   async function ensureRegistered(sessionId: string): Promise<void> {
@@ -53,7 +74,7 @@ const plugin: Plugin = async ({ client, directory, worktree }) => {
   }
 
   function gateContext(sessionId: string) {
-    return { sessionId, repositoryRoot };
+    return { sessionId, repositoryRoot, snapshotBridge };
   }
 
   return {

@@ -55,6 +55,8 @@ export interface ReviewSession {
 
 export type SnapshotMode = "changed-files" | "patch" | "git";
 
+export type SnapshotCaptureKind = "manual" | "automatic";
+
 export interface SnapshotReference {
   snapshot_id: string;
   record_id: string;
@@ -65,6 +67,8 @@ export interface SnapshotReference {
   created_at: string;
   /** git mode only: concrete commit SHA captured at creation time. */
   base_sha?: string;
-  /** git mode only: registered-root-relative source path. */
+  /** Registered-root-relative source path for git and automatic snapshots. */
   source_path?: string;
+  capture_kind?: SnapshotCaptureKind;
+  before_missing?: boolean;
 }

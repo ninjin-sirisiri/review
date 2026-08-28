@@ -3,11 +3,14 @@ import {
   ERROR_CODES,
   MAX_TEXT_FIELD_LENGTH,
   type DecisionRecordInput,
+  type SnapshotDiffResponse,
   type UserDisposition,
   validateDecisionRecordInput,
   validateRevisionRef,
   validateReviewSession,
+  validateSnapshotDiffResponse,
   validateSnapshotReference,
+  parseSnapshotDiffResponse,
 } from "../src/index";
 
 const claudeFixturePath = new URL("./fixtures/claude-code.json", import.meta.url);
@@ -235,6 +238,18 @@ const gitSnapshotBase = {
   source_path: "src/example.ts",
 };
 
+const automaticFileSnapshot = {
+  snapshot_id: "snapshot-auto",
+  record_id: "record-001",
+  mode: "changed-files" as const,
+  path: "snapshots/record-001/snapshot-auto.snapshot",
+  content_hash: "b".repeat(64),
+  created_at: "2026-08-27T00:00:00.000Z",
+  source_path: "src/example.ts",
+  capture_kind: "automatic" as const,
+  before_missing: false,
+};
+
 test("accepts a git-backed snapshot reference", () => {
   const result = validateSnapshotReference(gitSnapshotBase);
   expect(result.success).toBe(true);
@@ -244,6 +259,39 @@ test("accepts a git-backed snapshot reference", () => {
     expect(result.data.base_sha).toBe("a".repeat(40));
     expect(result.data.source_path).toBe("src/example.ts");
   }
+});
+
+test("accepts an automatic file-backed snapshot reference", () => {
+  const result = validateSnapshotReference(automaticFileSnapshot);
+  expect(result.success).toBe(true);
+  if (result.success) {
+    expect(result.data.capture_kind).toBe("automatic");
+    expect(result.data.source_path).toBe("src/example.ts");
+    expect(result.data.before_missing).toBe(false);
+  }
+});
+
+test("accepts an automatic missing-file snapshot reference", () => {
+  const result = validateSnapshotReference({
+    ...automaticFileSnapshot,
+    before_missing: true,
+  });
+  expect(result.success).toBe(true);
+});
+
+test("requires before_missing for automatic git snapshots", () => {
+  expect(validateSnapshotReference({ ...gitSnapshotBase, capture_kind: "automatic" }).success).toBe(false);
+});
+
+test.each([
+  ["missing capture kind", { ...automaticFileSnapshot, capture_kind: undefined }],
+  ["missing source path", { ...automaticFileSnapshot, source_path: undefined }],
+  ["missing missing flag", { ...automaticFileSnapshot, before_missing: undefined }],
+  ["non-boolean missing flag", { ...automaticFileSnapshot, before_missing: "false" }],
+  ["escaping source path", { ...automaticFileSnapshot, source_path: "../outside.ts" }],
+  ["manual file with source path", { ...automaticFileSnapshot, capture_kind: "manual", source_path: "src/example.ts" }],
+])("rejects an invalid automatic snapshot: %s", (_label, value) => {
+  expect(validateSnapshotReference(value).success).toBe(false);
 });
 
 test.each([
@@ -258,6 +306,130 @@ test.each([
   expect(validateSnapshotReference(value).success).toBe(false);
 });
 
-test("rejects base_sha/source_path on non-git snapshots", () => {
-  expect(validateSnapshotReference({ ...gitSnapshotBase, mode: "patch", path: "patch.diff" }).success).toBe(false);
+test("rejects base_sha on non-git snapshots and accepts automatic source_path", () => {
+  expect(validateSnapshotReference({ ...automaticFileSnapshot, base_sha: "a".repeat(40) }).success).toBe(false);
+  expect(validateSnapshotReference(automaticFileSnapshot).success).toBe(true);
+});
+
+test("keeps legacy manual file and git references valid", () => {
+  expect(validateSnapshotReference({
+    snapshot_id: "legacy-file",
+    record_id: "record-001",
+    mode: "patch",
+    path: "snapshots/legacy.snapshot",
+    content_hash: "b".repeat(64),
+    created_at: "2026-08-27T00:00:00.000Z",
+  }).success).toBe(true);
+  expect(validateSnapshotReference(gitSnapshotBase).success).toBe(true);
+});
+
+test("accepts and discriminates transition responses", () => {
+  const resolved: Extract<SnapshotDiffResponse, { state: "snapshot-resolved" }> = {
+    state: "snapshot-resolved",
+    path: "src/example.ts",
+    from: {
+      kind: "snapshot",
+      snapshot_id: "before",
+      record_id: "record-001",
+      created_at: "2026-08-27T00:00:00.000Z",
+      content_hash: "a".repeat(64),
+      source_path: "src/example.ts",
+    },
+    to: { kind: "working-tree" },
+    hunks: [],
+    old_missing: false,
+    new_missing: false,
+    binary: false,
+  };
+  const result = validateSnapshotDiffResponse(resolved);
+  expect(result.success).toBe(true);
+  expect(parseSnapshotDiffResponse(resolved)).toEqual(resolved);
+});
+
+test("accepts diff lines longer than record text fields", () => {
+  const resolved: Extract<SnapshotDiffResponse, { state: "snapshot-resolved" }> = {
+    state: "snapshot-resolved",
+    path: "src/example.ts",
+    from: {
+      kind: "snapshot",
+      snapshot_id: "before",
+      record_id: "record-001",
+      created_at: "2026-08-27T00:00:00.000Z",
+      content_hash: "a".repeat(64),
+      source_path: "src/example.ts",
+    },
+    to: { kind: "working-tree" },
+    hunks: [{ oldStart: 1, newStart: 1, lines: [{ type: "add", oldLine: null, newLine: 1, content: "x".repeat(12_000) }] }],
+    old_missing: false,
+    new_missing: false,
+    binary: false,
+  };
+
+  expect(validateSnapshotDiffResponse(resolved).success).toBe(true);
+  expect(parseSnapshotDiffResponse(resolved)).toEqual(resolved);
+});
+
+test("rejects empty hunks and binary responses with non-empty hunks", () => {
+  const resolved: Extract<SnapshotDiffResponse, { state: "snapshot-resolved" }> = {
+    state: "snapshot-resolved",
+    path: "src/example.ts",
+    from: {
+      kind: "snapshot",
+      snapshot_id: "before",
+      record_id: "record-001",
+      created_at: "2026-08-27T00:00:00.000Z",
+      content_hash: "a".repeat(64),
+      source_path: "src/example.ts",
+    },
+    to: { kind: "working-tree" },
+    hunks: [{ oldStart: 1, newStart: 1, lines: [{ type: "context", oldLine: 1, newLine: 1, content: "one" }] }],
+    old_missing: false,
+    new_missing: false,
+    binary: false,
+  };
+
+  expect(validateSnapshotDiffResponse({
+    ...resolved,
+    hunks: [{ ...resolved.hunks[0]!, lines: [] }],
+  }).success).toBe(false);
+  expect(validateSnapshotDiffResponse({ ...resolved, binary: true }).success).toBe(false);
+  expect(validateSnapshotDiffResponse({ ...resolved, hunks: [], binary: true }).success).toBe(true);
+  expect(validateSnapshotDiffResponse({ ...resolved, hunks: [], binary: false }).success).toBe(true);
+});
+
+test.each([
+  ["an extra top-level field", (value: Extract<SnapshotDiffResponse, { state: "snapshot-resolved" }>) => ({ ...value, unexpected: true })],
+  ["a malformed hunk line", (value: Extract<SnapshotDiffResponse, { state: "snapshot-resolved" }>) => ({
+    ...value,
+    hunks: [{ ...value.hunks[0]!, lines: [{ type: "add", oldLine: null, newLine: 1 }] }],
+  })],
+  ["a malformed snapshot endpoint", (value: Extract<SnapshotDiffResponse, { state: "snapshot-resolved" }>) => ({
+    ...value,
+    from: { ...value.from, source_path: "../outside.ts" },
+  })],
+  ["an extra working-tree endpoint field", (value: Extract<SnapshotDiffResponse, { state: "snapshot-resolved" }>) => ({
+    ...value,
+    to: { kind: "working-tree", source_path: value.path },
+  })],
+] as const)("rejects %s in a snapshot transition response", (_label, mutate) => {
+  const value: Extract<SnapshotDiffResponse, { state: "snapshot-resolved" }> = {
+    state: "snapshot-resolved",
+    path: "src/example.ts",
+    from: {
+      kind: "snapshot",
+      snapshot_id: "before",
+      record_id: "record-001",
+      created_at: "2026-08-27T00:00:00.000Z",
+      content_hash: "a".repeat(64),
+      source_path: "src/example.ts",
+    },
+    to: { kind: "working-tree" },
+    hunks: [{ oldStart: 1, newStart: 1, lines: [{ type: "context", oldLine: 1, newLine: 1, content: "one" }] }],
+    old_missing: false,
+    new_missing: false,
+    binary: false,
+  };
+  const result = validateSnapshotDiffResponse(mutate(value));
+  expect(result.success).toBe(false);
+  expect(() => parseSnapshotDiffResponse(mutate(value))).toThrow();
 });

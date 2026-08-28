@@ -18,13 +18,17 @@ export async function detectGitBackable(
   git: GitReader,
   record: DecisionRecord,
   contentHash: string,
+  sourcePath?: string,
 ): Promise<GitBackableTarget | null> {
   try {
     const repository = await registry.get(record.repository_id);
     if (repository === null) return null;
     const headSha = await git.resolveRevision(repository.root, "HEAD");
     if (!/^[0-9a-f]{40}$/.test(headSha)) return null;
-    for (const target of record.targets) {
+    const targets = sourcePath === undefined
+      ? record.targets
+      : record.targets.filter((target) => target.repository_id === record.repository_id && target.path === sourcePath);
+    for (const target of targets) {
       try {
         await registry.assertTarget(record.repository_id, target.path);
       } catch {

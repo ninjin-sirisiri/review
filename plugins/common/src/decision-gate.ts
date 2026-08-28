@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
@@ -8,7 +8,7 @@ import {
   type CheckEvidence,
   type RevisionRef,
 } from "../../../packages/contracts/src/index";
-import type { HostDecisionEvent, HostTargetReference } from "./adapter-contract";
+import type { HostDecisionEvent, HostTargetReference, SubmitResult } from "./adapter-contract";
 
 const DEFAULT_PERMIT_TTL_MS = 10 * 60 * 1_000;
 const MAX_HASH_BYTES = 10 * 1_024 * 1_024;
@@ -55,6 +55,16 @@ export interface GateStorageOptions {
   ttlMs?: number;
 }
 
+export interface AutomaticSnapshotBridge {
+  captureAutomaticSnapshot(input: {
+    recordId: string;
+    captureId: string;
+    sourcePath: string;
+    content: string;
+    beforeMissing: boolean;
+  }): Promise<SubmitResult>;
+}
+
 export interface GrantedDecisionPermits {
   permits: number;
   gateDirectory: string;
@@ -68,10 +78,26 @@ export interface ConsumeDecisionPermitOptions {
   gateRoot?: string;
 }
 
+export interface MatchingDecisionPermit {
+  recordId: string;
+  captureId: string;
+  sessionId: string;
+  repositoryRoot: string;
+  path: string;
+  contentHash: string;
+}
+
+export interface CurrentFileState {
+  content: string;
+  beforeMissing: boolean;
+  contentHash: string;
+}
+
 interface DecisionPermit {
   sessionId: string;
   repositoryRoot: string;
   recordId: string;
+  captureId: string;
   path: string;
   contentHash: string;
   expiresAt: string;
@@ -108,12 +134,26 @@ function normalizedRelativePath(root: string, candidate: string): string {
   return relativeCandidate.split(sep).join("/");
 }
 
+async function readRegularFile(path: string): Promise<string> {
+  const details = await lstat(path);
+  if (details.isSymbolicLink() || !details.isFile()) fail(`target is not a regular file: ${path}`);
+  if (details.size > MAX_HASH_BYTES) fail(`target exceeds the hash size limit: ${path}`);
+  let bytes;
+  try {
+    bytes = await readFile(path);
+  } catch {
+    throw new Error(`target could not be read: ${path}`);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(`target could not be read: ${path}`);
+  }
+}
+
 async function currentFileText(path: string): Promise<string> {
   try {
-    const details = await stat(path);
-    if (!details.isFile()) fail(`target is not a regular file: ${path}`);
-    if (details.size > MAX_HASH_BYTES) fail(`target exceeds the hash size limit: ${path}`);
-    return await readFile(path, "utf8");
+    return await readRegularFile(path);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return "";
@@ -160,6 +200,12 @@ async function nearestExistingCanonicalPath(canonicalRoot: string, missingPath: 
     tail.push(basename(candidate));
     candidate = parent;
     try {
+      if ((await lstat(candidate)).isSymbolicLink()) return null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+      continue;
+    }
+    try {
       const resolved = await realpath(candidate);
       const relativeAncestor = relative(canonicalRoot, resolved);
       if (relativeAncestor === ".." || relativeAncestor.startsWith(`..${sep}`) || isAbsolute(relativeAncestor)) return null;
@@ -172,6 +218,19 @@ async function nearestExistingCanonicalPath(canonicalRoot: string, missingPath: 
 
 async function hashExistingFile(path: string): Promise<string> {
   return hashText(await currentFileText(path));
+}
+
+export async function readCurrentFileState(options: Pick<ConsumeDecisionPermitOptions, "repositoryRoot" | "filePath">): Promise<CurrentFileState> {
+  const canonical = await canonicalPath(options.repositoryRoot, options.filePath);
+  if (canonical === null) throw new Error(`target could not be resolved: ${options.filePath}`);
+  try {
+    const content = await readRegularFile(canonical.path);
+    return { content, beforeMissing: false, contentHash: hashText(content) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { content: "", beforeMissing: true, contentHash: hashText("") };
+    if (error instanceof Error) throw error;
+    throw new Error(`target could not be read: ${options.filePath}`);
+  }
 }
 
 function gateBase(options: GateStorageOptions): string {
@@ -284,7 +343,7 @@ export async function grantDecisionPermits(event: HostDecisionEvent, options: Ga
   await mkdir(directory, { recursive: true, mode: 0o700 });
   for (const target of event.targets) {
     const path = normalizedRelativePath(root, target.path);
-    const permit: DecisionPermit = { sessionId, repositoryRoot: root, recordId, path, contentHash: target.contentHash, expiresAt };
+    const permit: DecisionPermit = { sessionId, repositoryRoot: root, recordId, captureId: randomUUID(), path, contentHash: target.contentHash, expiresAt };
     await writeFile(permitPath(directory), `${JSON.stringify(permit)}\n`, { encoding: "utf8", mode: 0o600 });
   }
   return { permits: event.targets.length, gateDirectory: directory, expiresAt };
@@ -300,7 +359,7 @@ async function claimPermit(path: string): Promise<string | null> {
   }
 }
 
-async function findMatchingPermit(options: ConsumeDecisionPermitOptions): Promise<{ path: string } | null> {
+async function findMatchingPermit(options: ConsumeDecisionPermitOptions, checkContentHash = true): Promise<{ path: string; permit: MatchingDecisionPermit } | null> {
   const canonical = await canonicalPath(options.repositoryRoot, options.filePath);
   if (canonical === null) return null;
   const directory = gateDirectory(canonical.root, options.sessionId, options.gateRoot === undefined ? {} : { gateRoot: options.gateRoot });
@@ -324,28 +383,53 @@ async function findMatchingPermit(options: ConsumeDecisionPermitOptions): Promis
     try {
       const value = JSON.parse(raw) as Partial<DecisionPermit>;
       if (typeof value.sessionId !== "string" || typeof value.repositoryRoot !== "string" || typeof value.recordId !== "string" || typeof value.path !== "string" || typeof value.contentHash !== "string" || typeof value.expiresAt !== "string") continue;
+      if (Date.parse(value.expiresAt) <= Date.now()) {
+        await rm(original, { force: true }).catch(() => undefined);
+        continue;
+      }
+      if (typeof value.captureId !== "string" || value.captureId.trim().length === 0) continue;
       permit = value as DecisionPermit;
     } catch {
       continue;
     }
     if (permit.sessionId !== options.sessionId || permit.repositoryRoot !== canonical.root || permit.path !== relativeFile) continue;
-    if (Date.parse(permit.expiresAt) <= Date.now()) {
-      await rm(original, { force: true }).catch(() => undefined);
-      continue;
+    if (checkContentHash) {
+      const actualHash = await hashExistingFile(canonical.path).catch(() => null);
+      if (actualHash !== permit.contentHash) continue;
     }
-    const actualHash = await hashExistingFile(canonical.path).catch(() => null);
-    if (actualHash !== permit.contentHash) continue;
-    return { path: original };
+    return {
+      path: original,
+      permit: {
+        recordId: permit.recordId,
+        captureId: permit.captureId,
+        sessionId: permit.sessionId,
+        repositoryRoot: permit.repositoryRoot,
+        path: permit.path,
+        contentHash: permit.contentHash,
+      },
+    };
   }
   return null;
 }
 
+export async function findDecisionPermit(options: ConsumeDecisionPermitOptions): Promise<MatchingDecisionPermit | null> {
+  return (await findMatchingPermit(options))?.permit ?? null;
+}
+
 export async function peekDecisionPermit(options: ConsumeDecisionPermitOptions): Promise<boolean> {
-  return (await findMatchingPermit(options)) !== null;
+  return (await findDecisionPermit(options)) !== null;
 }
 
 export async function consumeDecisionPermit(options: ConsumeDecisionPermitOptions): Promise<boolean> {
-  const found = await findMatchingPermit(options);
+  return consumeMatchingPermit(options, true);
+}
+
+export async function consumeDecisionPermitAfterEdit(options: ConsumeDecisionPermitOptions): Promise<boolean> {
+  return consumeMatchingPermit(options, false);
+}
+
+async function consumeMatchingPermit(options: ConsumeDecisionPermitOptions, checkContentHash: boolean): Promise<boolean> {
+  const found = await findMatchingPermit(options, checkContentHash);
   if (found === null) return false;
   const claimed = await claimPermit(found.path);
   if (claimed === null) return false;

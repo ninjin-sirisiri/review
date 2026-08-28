@@ -24,6 +24,36 @@ export interface FileDiff {
   binary: boolean;
 }
 
+export interface SnapshotEndpoint {
+  kind: "snapshot";
+  snapshot_id: string;
+  record_id: string;
+  created_at: string;
+  content_hash: string;
+  source_path: string;
+  base_sha?: string;
+}
+
+export interface WorkingTreeEndpoint {
+  kind: "working-tree";
+}
+
+export interface SnapshotDiff {
+  state: "snapshot-resolved";
+  path: string;
+  from: SnapshotEndpoint;
+  to: SnapshotEndpoint | WorkingTreeEndpoint;
+  hunks: DiffHunk[];
+  old_missing: boolean;
+  new_missing: boolean;
+  binary: boolean;
+}
+
+export type SnapshotDiffResponse =
+  | SnapshotDiff
+  | { state: "legacy-fallback"; reason: "automatic-snapshot-not-found"; path: string }
+  | { state: "source-unavailable" | "revision-not-found"; path: string; message: string };
+
 export const ERROR_CODES = {
   UNAUTHORIZED: "UNAUTHORIZED",
   INVALID_RECORD: "INVALID_RECORD",

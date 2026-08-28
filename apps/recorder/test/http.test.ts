@@ -23,6 +23,12 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
   return fetch(`${app.server.url}${path}`, { ...init, headers });
 }
 
+async function requestTo(server: RecorderServer, serverToken: string, path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set("Authorization", `Bearer ${serverToken}`);
+  return fetch(`${server.server.url}${path}`, { ...init, headers });
+}
+
 async function json<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
@@ -31,6 +37,58 @@ async function runGit(args: string[]): Promise<void> {
   const child = spawn("git", args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
   const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
   if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed`);
+}
+
+async function setupAutomaticFixture(): Promise<void> {
+  await runGit(["init", "--quiet"]);
+  await runGit(["config", "user.email", "fixture@example.test"]);
+  await runGit(["config", "user.name", "Fixture"]);
+  await writeFile(join(root, "src", "example.ts"), "export const answer = 42;\n", "utf8");
+  await runGit(["add", "--", "src/example.ts"]);
+  await runGit(["commit", "--quiet", "-m", "fixture"]);
+
+  const repository = await request("/v1/repositories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root, repository_id: "repo-1" }),
+  });
+  expect(repository.status).toBe(201);
+
+  for (const [sessionId, recordId] of [["session-1", "record-1"], ["session-2", "record-2"], ["session-manual", "manual-record"]]) {
+    const session = await request("/v1/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, repository_id: "repo-1", agent_type: "codex", started_at: "2026-08-20T00:00:00Z", status: "active" }),
+    });
+    expect(session.status).toBe(201);
+    const record = await request("/v1/decision-records", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body(recordId, sessionId)),
+    });
+    expect(record.status).toBe(201);
+  }
+}
+
+async function postAutomatic(
+  recordId: string,
+  captureId: string,
+  sourcePath: string,
+  content: string,
+  beforeMissing = false,
+  extraHeaders: HeadersInit = {},
+): Promise<Response> {
+  const fixturePath = join(root, sourcePath);
+  if (beforeMissing) {
+    await rm(fixturePath, { force: true });
+  } else {
+    await writeFile(fixturePath, content, "utf8");
+  }
+  return request(`/v1/decision-records/${recordId}/automatic-snapshot`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...extraHeaders },
+    body: JSON.stringify({ capture_id: captureId, source_path: sourcePath, content, before_missing: beforeMissing }),
+  });
 }
 
 function body(recordId = "record-1", sessionId = "session-1", targetPath = "src/example.ts"): DecisionRecordInput {
@@ -202,6 +260,14 @@ describe("authenticated local Recorder HTTP API", () => {
     });
     expect(duplicate.status).toBe(200);
     expect(await json<{ success: true; data: { record: { record_id: string } } }>(duplicate)).toMatchObject({ success: true, data: { record: { record_id: "record-1" } } });
+
+    const conflict = await request("/v1/decision-records", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body(), judgment: "A different judgment must not reuse this record_id." }),
+    });
+    expect(conflict.status).toBe(409);
+    expect(await json<{ success: false; error: { code: string } }>(conflict)).toMatchObject({ success: false, error: { code: "DUPLICATE_RECORD" } });
   });
 
   test("lists registered repositories with their canonical roots", async () => {
@@ -234,11 +300,12 @@ describe("authenticated local Recorder HTTP API", () => {
       request("/v1/decision-records", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body("same-record", "session-1", "src/example.ts")) }),
       request("/v1/decision-records", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body("same-record", "session-1", "src/other.ts")) }),
     ]);
-    for (const response of [first, second]) {
-      expect([201, 200]).toContain(response.status);
-      const payload = await json<{ success: true; data: { record: { targets: Array<{ path: string }> }; sources: Array<{ path: string }> } }>(response);
-      expect(payload.data.sources[0]?.path).toBe(payload.data.record.targets[0]?.path);
-    }
+    expect([first.status, second.status].sort()).toEqual([201, 409]);
+    const conflict = first.status === 409 ? first : second;
+    expect(await json<{ success: false; error: { code: string } }>(conflict)).toMatchObject({ success: false, error: { code: "DUPLICATE_RECORD" } });
+    const created = first.status === 201 ? first : second;
+    const payload = await json<{ success: true; data: { record: { targets: Array<{ path: string }> }; sources: Array<{ path: string }> } }>(created);
+    expect(payload.data.sources[0]?.path).toBe(payload.data.record.targets[0]?.path);
   });
 
   test("updates disposition and lists records by repository", async () => {
@@ -408,6 +475,291 @@ describe("authenticated local Recorder HTTP API", () => {
     const unregistered = await request("/v1/repositories/repo-missing/files");
     expect(unregistered.status).toBe(404);
     expect(await json<{ success: false; error: { code: string } }>(unregistered)).toMatchObject({ success: false, error: { code: "REPOSITORY_NOT_REGISTERED" } });
+  });
+
+  test("creates an automatic snapshot only for the current target state", async () => {
+    await setupAutomaticFixture();
+    const response = await postAutomatic("record-1", "capture-http-1", "src/example.ts", "export const answer = 42;\n");
+    expect(response.status).toBe(201);
+    const payload = await json<{ success: true; data: { capture_kind: string; mode: string; path: string; source_path: string; base_sha?: string } }>(response);
+    expect(payload.data).toMatchObject({ capture_kind: "automatic", mode: "git", path: "", source_path: "src/example.ts" });
+    expect(payload.data.base_sha).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  test("automatic capture is idempotent and rejects a changed retry", async () => {
+    await setupAutomaticFixture();
+    const input = { captureId: "capture-http-repeat", sourcePath: "src/example.ts", content: "before\n" };
+    const first = await postAutomatic("record-1", input.captureId, input.sourcePath, input.content);
+    const second = await postAutomatic("record-1", input.captureId, input.sourcePath, input.content);
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(200);
+    expect((await json<{ success: true; data: { snapshot_id: string } }>(first)).data.snapshot_id)
+      .toBe((await json<{ success: true; data: { snapshot_id: string } }>(second)).data.snapshot_id);
+
+    const conflict = await postAutomatic("record-1", input.captureId, input.sourcePath, "different\n");
+    expect(conflict.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(conflict)).toMatchObject({ success: false, error: { code: "INVALID_RECORD" } });
+  });
+
+  test("returns the original reference when HEAD eligibility changes on retry", async () => {
+    await setupAutomaticFixture();
+    const content = "before\n";
+    const first = await postAutomatic("record-1", "capture-http-head-change", "src/example.ts", content);
+    expect(first.status).toBe(201);
+    const firstPayload = await json<{ success: true; data: { snapshot_id: string; mode: string; path: string; source_path: string; content_hash: string; before_missing: boolean } }>(first);
+    expect(firstPayload.data.mode).toBe("changed-files");
+
+    await runGit(["add", "--", "src/example.ts"]);
+    await runGit(["commit", "--quiet", "-m", "capture-content"]);
+
+    const retry = await postAutomatic("record-1", "capture-http-head-change", "src/example.ts", content);
+    expect(retry.status).toBe(200);
+    const retryPayload = await json<{ success: true; data: { snapshot_id: string; mode: string; path: string; source_path: string; content_hash: string; before_missing: boolean } }>(retry);
+    expect(retryPayload.data).toEqual(firstPayload.data);
+  });
+
+  test("does not report a file-backed capture as successful when its evidence is missing or corrupted", async () => {
+    await setupAutomaticFixture();
+    const content = "before-file-backed\n";
+    const first = await postAutomatic("record-1", "capture-http-file-integrity", "src/example.ts", content);
+    expect(first.status).toBe(201);
+    const firstPayload = await json<{ success: true; data: { mode: string; path: string } }>(first);
+    expect(firstPayload.data.mode).toBe("changed-files");
+
+    await rm(join(dataDir, firstPayload.data.path), { force: true });
+    const missing = await postAutomatic("record-1", "capture-http-file-integrity", "src/example.ts", content);
+    expect(missing.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(missing)).toMatchObject({ success: false, error: { code: "SOURCE_UNAVAILABLE" } });
+
+    await writeFile(join(dataDir, firstPayload.data.path), "tampered\n", "utf8");
+    const corrupted = await postAutomatic("record-1", "capture-http-file-integrity", "src/example.ts", content);
+    expect(corrupted.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(corrupted)).toMatchObject({ success: false, error: { code: "SOURCE_UNAVAILABLE" } });
+  });
+
+  test("serves snapshot-to-snapshot and snapshot-to-worktree transition diffs", async () => {
+    await setupAutomaticFixture();
+    const before = await postAutomatic("record-1", "capture-http-before", "src/example.ts", "one\n");
+    const next = await postAutomatic("record-2", "capture-http-next", "src/example.ts", "two\n");
+    expect(before.status).toBe(201);
+    expect(next.status).toBe(201);
+    const beforePayload = await json<{ success: true; data: { snapshot_id: string } }>(before);
+    const transition = await request("/v1/decision-records/record-1/snapshot-diff?path=src%2Fexample.ts");
+    expect(transition.status).toBe(200);
+    expect(await json<{ success: true; data: { state: string; from: { snapshot_id: string }; to: { kind: string } } }>(transition)).toMatchObject({
+      success: true,
+      data: { state: "snapshot-resolved", from: { snapshot_id: beforePayload.data.snapshot_id }, to: { kind: "snapshot" } },
+    });
+
+    await writeFile(join(root, "src", "example.ts"), "three\n", "utf8");
+    const worktreeTransition = await request("/v1/decision-records/record-2/snapshot-diff?path=src%2Fexample.ts");
+    expect(worktreeTransition.status).toBe(200);
+    expect(await json<{ success: true; data: { state: string; to: { kind: string } } }>(worktreeTransition)).toMatchObject({
+      success: true,
+      data: { state: "snapshot-resolved", to: { kind: "working-tree" } },
+    });
+  });
+
+  test("returns legacy fallback for records without automatic snapshots", async () => {
+    await setupAutomaticFixture();
+    const response = await request("/v1/decision-records/manual-record/snapshot-diff?path=src%2Fexample.ts");
+    expect(response.status).toBe(200);
+    expect(await json<{ success: true; data: { state: string; reason: string } }>(response)).toMatchObject({
+      success: true,
+      data: { state: "legacy-fallback", reason: "automatic-snapshot-not-found" },
+    });
+  });
+
+  test("requires authentication for automatic capture and transition reads", async () => {
+    await setupAutomaticFixture();
+    const automaticPath = `${app.server.url}/v1/decision-records/record-1/automatic-snapshot`;
+    const transitionPath = `${app.server.url}/v1/decision-records/record-1/snapshot-diff?path=src%2Fexample.ts`;
+    const missing = await fetch(automaticPath, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    expect(missing.status).toBe(401);
+    const incorrect = await fetch(transitionPath, { headers: { Authorization: "Bearer incorrect-token" } });
+    expect(incorrect.status).toBe(401);
+    const authenticated = await request("/v1/decision-records/record-1/snapshot-diff?path=src%2Fexample.ts");
+    expect(authenticated.status).toBe(200);
+  });
+
+  test("rejects disallowed origins and unknown records for automatic capture", async () => {
+    await setupAutomaticFixture();
+    const disallowed = await postAutomatic("record-1", "capture-http-origin", "src/example.ts", "origin\n", false, { Origin: "https://evil.example" });
+    expect(disallowed.status).toBe(403);
+    expect(await json<{ success: false; error: { code: string } }>(disallowed)).toMatchObject({ success: false, error: { code: "UNAUTHORIZED" } });
+
+    const unknown = await postAutomatic("missing-record", "capture-http-unknown", "src/example.ts", "unknown\n");
+    expect(unknown.status).toBe(404);
+    expect(await json<{ success: false; error: { code: string } }>(unknown)).toMatchObject({ success: false, error: { code: "INVALID_RECORD" } });
+  });
+
+  test("enforces exact target ownership and path normalization for automatic capture and diffs", async () => {
+    await setupAutomaticFixture();
+    const nonTarget = await postAutomatic("record-1", "capture-http-non-target", "src/other.ts", "other\n");
+    expect(nonTarget.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(nonTarget)).toMatchObject({ success: false, error: { code: "INVALID_RECORD" } });
+
+    const traversal = await request("/v1/decision-records/record-1/automatic-snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ capture_id: "capture-http-traversal", source_path: "../src/example.ts", content: "unsafe\n", before_missing: false }),
+    });
+    expect(traversal.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(traversal)).toMatchObject({ success: false, error: { code: "PATH_OUTSIDE_ROOT" } });
+
+    const traversalDiff = await request("/v1/decision-records/record-1/snapshot-diff?path=..%2Fsrc%2Fexample.ts");
+    expect(traversalDiff.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(traversalDiff)).toMatchObject({ success: false, error: { code: "PATH_OUTSIDE_ROOT" } });
+
+    const missingPath = await request("/v1/decision-records/record-1/snapshot-diff");
+    expect(missingPath.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string; field?: string } }>(missingPath)).toMatchObject({ success: false, error: { code: "INVALID_RECORD", field: "path" } });
+    const nonTargetDiff = await request("/v1/decision-records/record-1/snapshot-diff?path=src%2Fother.ts");
+    expect(nonTargetDiff.status).toBe(200);
+    expect(await json<{ success: true; data: { state: string; path: string } }>(nonTargetDiff)).toMatchObject({ success: true, data: { state: "source-unavailable", path: "src/other.ts" } });
+  });
+
+  test("rejects automatic capture when current content or missing state differs", async () => {
+    await setupAutomaticFixture();
+    await writeFile(join(root, "src", "example.ts"), "observed\n", "utf8");
+    const hashConflict = await request("/v1/decision-records/record-1/automatic-snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ capture_id: "capture-http-hash-conflict", source_path: "src/example.ts", content: "submitted\n", before_missing: false }),
+    });
+    expect(hashConflict.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(hashConflict)).toMatchObject({ success: false, error: { code: "HASH_MISMATCH" } });
+
+    await rm(join(root, "src", "example.ts"), { force: true });
+    const missingConflict = await request("/v1/decision-records/record-1/automatic-snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ capture_id: "capture-http-missing-conflict", source_path: "src/example.ts", content: "", before_missing: false }),
+    });
+    expect(missingConflict.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string } }>(missingConflict)).toMatchObject({ success: false, error: { code: "HASH_MISMATCH" } });
+
+    const missing = await postAutomatic("record-1", "capture-http-missing", "src/example.ts", "", true);
+    expect(missing.status).toBe(201);
+  });
+
+  test("rejects malformed and oversized automatic snapshot requests", async () => {
+    await setupAutomaticFixture();
+    const missingField = await request("/v1/decision-records/record-1/automatic-snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ capture_id: "capture-http-missing-field", source_path: "src/example.ts", content: "missing\n" }),
+    });
+    expect(missingField.status).toBe(422);
+
+    const extraField = await request("/v1/decision-records/record-1/automatic-snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ capture_id: "capture-http-extra", source_path: "src/example.ts", content: "extra\n", before_missing: false, mode: "patch" }),
+    });
+    expect(extraField.status).toBe(422);
+
+    const wrongType = await request("/v1/decision-records/record-1/automatic-snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ capture_id: "capture-http-type", source_path: "src/example.ts", content: "type\n", before_missing: "false" }),
+    });
+    expect(wrongType.status).toBe(422);
+
+    const limitedDataDir = await mkdtemp(join(tmpdir(), "ai-review-http-automatic-limit-data-"));
+    const limitedUiRoot = await mkdtemp(join(tmpdir(), "ai-review-http-automatic-limit-ui-"));
+    temporaryDirectories.push(limitedDataDir, limitedUiRoot);
+    const limitedApp = await createRecorderServer({
+      config: createRecorderConfig({ dataDir: limitedDataDir, maxSnapshotContentLength: 64 }),
+      maxJsonBytes: 2_000_000,
+      port: 0,
+      uiRoot: limitedUiRoot,
+    });
+    try {
+      const limitedToken = await readOwnerToken(limitedApp.config);
+      const limitedRepository = await requestTo(limitedApp, limitedToken, "/v1/repositories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root, repository_id: "repo-1" }),
+      });
+      expect(limitedRepository.status).toBe(201);
+      const limitedSession = await requestTo(limitedApp, limitedToken, "/v1/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "limited-session", repository_id: "repo-1", agent_type: "codex", started_at: "2026-08-20T00:00:00Z", status: "active" }),
+      });
+      expect(limitedSession.status).toBe(201);
+      const limitedRecord = await requestTo(limitedApp, limitedToken, "/v1/decision-records", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body("limited-record", "limited-session")),
+      });
+      expect(limitedRecord.status).toBe(201);
+
+      const oversizedContent = "x".repeat(100);
+      await writeFile(join(root, "src", "example.ts"), oversizedContent, "utf8");
+      const oversized = await requestTo(limitedApp, limitedToken, "/v1/decision-records/limited-record/automatic-snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capture_id: "capture-http-large", source_path: "src/example.ts", content: oversizedContent, before_missing: false }),
+      });
+      expect(oversized.status).toBe(413);
+      expect(await json<{ success: false; error: { code: string } }>(oversized)).toMatchObject({ success: false, error: { code: "PAYLOAD_TOO_LARGE" } });
+    } finally {
+      await limitedApp.stop();
+    }
+
+    const wrongAutomaticRoute = await request("/v1/decision-records/record-1/automatic-snapshot/extra", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    expect(wrongAutomaticRoute.status).toBe(404);
+    const wrongDiffRoute = await request("/v1/decision-records/record-1/snapshot-diff/extra?path=src%2Fexample.ts");
+    expect(wrongDiffRoute.status).toBe(404);
+  });
+
+  test("uses the requested path when two targets have the same HEAD content", async () => {
+    await setupAutomaticFixture();
+    const record = await app.service.getDecision("record-1");
+    expect(record).not.toBeNull();
+    if (record === null) return;
+    const target = record.targets[0]!;
+    app.store.db.query(
+      `INSERT INTO targets (
+         record_id, target_index, repository_id, path, line_start, line_end,
+         revision_kind, revision_value, content_hash
+       ) VALUES ($record_id, $target_index, $repository_id, $path, $line_start, $line_end,
+         $revision_kind, $revision_value, $content_hash)`,
+    ).run({
+      $record_id: "record-1",
+      $target_index: 1,
+      $repository_id: target.repository_id,
+      $path: "src/other.ts",
+      $line_start: target.line_start,
+      $line_end: target.line_end,
+      $revision_kind: target.revision.kind,
+      $revision_value: target.revision.kind === "commit" ? target.revision.sha : target.revision.contentHash,
+      $content_hash: target.content_hash,
+    });
+    await writeFile(join(root, "src", "other.ts"), "export const answer = 42;\n", "utf8");
+    await runGit(["add", "--", "src/other.ts"]);
+    await runGit(["commit", "--quiet", "-m", "same-content"]);
+    const response = await postAutomatic("record-1", "capture-http-exact-head-path", "src/other.ts", "export const answer = 42;\n");
+    expect(response.status).toBe(201);
+    const payload = await json<{ success: true; data: { mode: string; path: string; source_path: string; base_sha?: string } }>(response);
+    expect(payload.data).toMatchObject({ mode: "git", path: "", source_path: "src/other.ts" });
+    expect(payload.data.base_sha).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  test("returns source-unavailable for a corrupted next automatic snapshot", async () => {
+    await setupAutomaticFixture();
+    const before = await postAutomatic("record-1", "capture-http-corrupt-before", "src/example.ts", "one\n");
+    const next = await postAutomatic("record-2", "capture-http-corrupt-next", "src/example.ts", "two\n");
+    const nextPayload = await json<{ success: true; data: { path: string } }>(next);
+    expect(before.status).toBe(201);
+    expect(next.status).toBe(201);
+    await writeFile(join(dataDir, nextPayload.data.path), "tampered\n", "utf8");
+
+    const response = await request("/v1/decision-records/record-1/snapshot-diff?path=src%2Fexample.ts");
+    expect(response.status).toBe(200);
+    expect(await json<{ success: true; data: { state: string; path: string } }>(response)).toMatchObject({ success: true, data: { state: "source-unavailable", path: "src/example.ts" } });
   });
 
   test("stores a git-backed reference when snapshot content matches HEAD and serves it back", async () => {

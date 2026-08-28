@@ -36,10 +36,41 @@ function entryWithTarget(recordId: string, path: string, lineStart: number, line
   return { recordId, status: "ready", detail };
 }
 
+function multiTargetEntry(): JudgmentEntry {
+  const base = entryWithTarget("multi", "src/a.ts", 2, 2, "worktree");
+  if (base.status !== "ready") throw new Error("The fixture must be ready");
+  const target = base.detail.record.targets[0]!;
+  const otherTarget = {
+    ...target,
+    path: "src/b.ts",
+    line_start: 7,
+    line_end: 7,
+    revision: { kind: "working-tree" as const, contentHash: "other-hash" },
+    content_hash: "other-hash",
+  };
+  const source = base.detail.sources[0];
+  if (source === undefined || source.state !== "resolved") throw new Error("The fixture must be resolved");
+  return {
+    recordId: "multi",
+    status: "ready",
+    detail: {
+      ...base.detail,
+      record: { ...base.detail.record, targets: [target, otherTarget] },
+      sources: [
+        { ...source, target },
+        { ...source, path: "src/b.ts", revision: otherTarget.revision, target: otherTarget, content_hash: "other-hash" },
+      ],
+    },
+  };
+}
+
 const baseProps = {
   path: "src/a.ts",
+  transitionActive: false,
   selectedBlock: null,
   onSelectBlock: vi.fn(),
+  selectedRecordId: null,
+  onSelectJudgment: vi.fn(),
   onDispositionChange: vi.fn(async () => {
     throw new Error("not used");
   }),
@@ -54,6 +85,23 @@ describe("JudgmentPanel", () => {
 
     render(<JudgmentPanel {...baseProps} path={null} entries={[]} />);
     expect(screen.getByText("Select a file in the explorer to review its judgments.")).toBeTruthy();
+  });
+
+  it("passes selected state and record IDs to the card selection control", () => {
+    const onSelectJudgment = vi.fn();
+    render(
+      <JudgmentPanel
+        {...baseProps}
+        selectedRecordId="r1"
+        onSelectJudgment={onSelectJudgment}
+        entries={[entryWithTarget("r1", "src/a.ts", 4, 6, "commit")]}
+      />,
+    );
+
+    const select = screen.getByRole("button", { name: "Viewing subsequent changes" });
+    expect(select.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(select);
+    expect(onSelectJudgment).toHaveBeenCalledWith("r1");
   });
 
   it("filters to overlapping decisions when a block is selected and restores on clear", () => {
@@ -74,6 +122,31 @@ describe("JudgmentPanel", () => {
     expect(screen.queryByRole("heading", { name: "Judgment unrelated" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Clear block filter" }));
     expect(onSelectBlock).toHaveBeenCalledWith(null);
+  });
+
+  it("scopes block filtering to the selected path for multi-target records", () => {
+    render(
+      <JudgmentPanel
+        {...baseProps}
+        entries={[multiTargetEntry()]}
+        selectedBlock={{ oldStart: null, oldEnd: null, newStart: 7, newEnd: 7 }}
+      />,
+    );
+
+    expect(screen.getByText("No judgments overlap the selected lines.")).toBeTruthy();
+  });
+
+  it("uses old-side transition anchors when filtering a selected block", () => {
+    render(
+      <JudgmentPanel
+        {...baseProps}
+        transitionActive
+        entries={[entryWithTarget("transition", "src/a.ts", 2, 2, "worktree")]}
+        selectedBlock={{ oldStart: 2, oldEnd: 2, newStart: null, newEnd: null }}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Judgment transition" })).toBeTruthy();
   });
 
   it("renders loading placeholders and per-card errors with retry", () => {

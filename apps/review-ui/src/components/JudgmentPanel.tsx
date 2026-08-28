@@ -1,18 +1,19 @@
 import type { BlockSelection, DecisionAnchor } from "../lib/decision-index";
-import { decisionAnchors, overlapsBlock } from "../lib/decision-index";
+import { decisionAnchors, overlapsBlock, transitionAnchors } from "../lib/decision-index";
 import type { DecisionRecordDetail, UserDisposition } from "../api";
 import { DecisionCard } from "./DecisionCard";
 
-export interface JudgmentEntry {
-  recordId: string;
-  status: "loading" | "ready" | "error";
-  detail?: DecisionRecordDetail;
-  message?: string;
-}
+export type JudgmentEntry =
+  | { recordId: string; status: "loading" }
+  | { recordId: string; status: "ready"; detail: DecisionRecordDetail }
+  | { recordId: string; status: "error"; message?: string };
 
 interface JudgmentPanelProps {
   path: string | null;
   entries: JudgmentEntry[];
+  transitionActive: boolean;
+  selectedRecordId: string | null;
+  onSelectJudgment: (recordId: string) => void;
   selectedBlock: BlockSelection | null;
   onSelectBlock: (block: BlockSelection | null) => void;
   onDispositionChange: (recordId: string, disposition: UserDisposition) => Promise<DecisionRecordDetail>;
@@ -20,13 +21,24 @@ interface JudgmentPanelProps {
   onTargetClick: (path: string, line: number) => void;
 }
 
-function matchesSelectedBlock(detail: DecisionRecordDetail, selectedBlock: BlockSelection): boolean {
-  return decisionAnchors(detail).some((anchor: DecisionAnchor) => overlapsBlock(anchor, selectedBlock));
+function matchesSelectedBlock(
+  detail: DecisionRecordDetail,
+  path: string,
+  transitionActive: boolean,
+  selectedBlock: BlockSelection,
+): boolean {
+  const anchors: DecisionAnchor[] = transitionActive
+    ? transitionAnchors(detail, path)
+    : decisionAnchors({ ...detail, sources: detail.sources.filter((source) => source.path === path) });
+  return anchors.some((anchor) => overlapsBlock(anchor, selectedBlock));
 }
 
 export function JudgmentPanel({
   path,
   entries,
+  transitionActive,
+  selectedRecordId,
+  onSelectJudgment,
   selectedBlock,
   onSelectBlock,
   onDispositionChange,
@@ -44,7 +56,7 @@ export function JudgmentPanel({
   const visibleEntries = selectedBlock === null
     ? entries
     : entries.filter((entry) =>
-        entry.status === "ready" && entry.detail !== undefined && matchesSelectedBlock(entry.detail, selectedBlock),
+        entry.status === "ready" && matchesSelectedBlock(entry.detail, path, transitionActive, selectedBlock),
       );
 
   return (
@@ -74,10 +86,12 @@ export function JudgmentPanel({
               </div>
             );
           }
-          return (
+           return (
             <DecisionCard
               key={entry.recordId}
-              detail={entry.detail!}
+              detail={entry.detail}
+              selected={selectedRecordId === entry.recordId}
+              onSelect={() => onSelectJudgment(entry.recordId)}
               onDispositionChange={(disposition) => onDispositionChange(entry.recordId, disposition)}
               onTargetClick={onTargetClick}
             />

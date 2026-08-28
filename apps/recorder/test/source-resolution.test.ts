@@ -331,6 +331,56 @@ describe("source resolution", () => {
     expect(diff).not.toContain("SOURCE_UNAVAILABLE");
     context.store.close();
   });
+
+  test("preserves the pre-extraction unified diff output for a created file", async () => {
+    const context = await createResolverFixture();
+    const createdPath = "src/created.ts";
+    await writeFile(join(context.fixture.root, context.fixture.path), context.fixture.committed, "utf8");
+    await writeFile(join(context.fixture.root, createdPath), "brand new\n", "utf8");
+    await runGit(context.fixture.root, ["add", "--", createdPath]);
+    await runGit(context.fixture.root, ["commit", "--quiet", "-m", "created"]);
+
+    const diff = await new GitReader().readDiff(context.fixture.root, context.fixture.commitSha);
+
+    expect(diff).toBe(
+      "diff --git a/src/created.ts b/src/created.ts\n"
+      + "--- a/src/created.ts\n"
+      + "+++ b/src/created.ts\n"
+      + "@@ -1,1 +1,2 @@\n"
+      + "+brand new\n"
+      + " \n",
+    );
+    context.store.close();
+  });
+
+  test("preserves the pre-extraction unified diff output for a deleted file", async () => {
+    const context = await createResolverFixture();
+    await rm(join(context.fixture.root, context.fixture.path), { force: true });
+
+    const diff = await new GitReader().readDiff(context.fixture.root, context.fixture.commitSha);
+
+    expect(diff).toBe(
+      "diff --git a/src/example.ts b/src/example.ts\n"
+      + "--- a/src/example.ts\n"
+      + "+++ b/src/example.ts\n"
+      + "@@ -1,2 +1,1 @@\n"
+      + "-export const version = 1;\n"
+      + " \n",
+    );
+    context.store.close();
+  });
+
+  test("preserves a non-empty unified diff result for changed binary files", async () => {
+    const context = await createResolverFixture();
+    await writeFile(join(context.fixture.root, context.fixture.path), Uint8Array.from([0x00, 0x01, 0x02]));
+
+    const diff = await new GitReader().readDiff(context.fixture.root, context.fixture.commitSha);
+
+    expect(diff).not.toBe("");
+    expect(diff).toContain("diff --git a/src/example.ts b/src/example.ts");
+    context.store.close();
+  });
+
   test("returns snapshot content even after the live repository root disappears", async () => {
     const context = await createResolverFixture();
     const workingTarget = target(context.fixture, { kind: "working-tree", contentHash: hash(context.fixture.working) }, context.fixture.working);
@@ -654,6 +704,17 @@ describe("source resolution", () => {
     expect(diff.hunks).toHaveLength(0);
     expect(diff.old_missing).toBe(true);
     expect(diff.new_missing).toBe(false);
+    context.store.close();
+  });
+
+  test("readPathDiff enforces the configured structured diff output limit", async () => {
+    const context = await createResolverFixture();
+    const largeContent = `${Array.from({ length: 24 }, (_, index) => `changed-${index}`).join("\n")}\n`;
+    await writeFile(join(context.fixture.root, context.fixture.path), largeContent, "utf8");
+
+    await expect(new GitReader(256).readPathDiff(context.fixture.root, context.fixture.commitSha, context.fixture.path)).rejects.toMatchObject({
+      code: "PAYLOAD_TOO_LARGE",
+    });
     context.store.close();
   });
 

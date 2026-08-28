@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
   consumeDecisionPermit,
+  findDecisionPermit,
   grantDecisionPermits,
   likelyCodeMutation,
   normalizeDecisionProposal,
   peekDecisionPermit,
+  readCurrentFileState,
   type DecisionProposal,
 } from "../src/decision-gate";
 
@@ -176,6 +178,84 @@ describe("decision gate", () => {
       filePath: current.file,
       gateRoot: join(current.root, ".gate-state"),
     })).toBe(false);
+  });
+
+  test("finds permit capture metadata and reads the current file state", async () => {
+    const current = await repository();
+    const normalized = await normalizeDecisionProposal(proposal(current.root, current.hash), { sessionId: "session-capture" });
+    await grantDecisionPermits(normalized, { recordId: "record-capture", gateRoot: join(current.root, ".gate-state") });
+
+    const permit = await findDecisionPermit({
+      sessionId: "session-capture",
+      repositoryRoot: current.root,
+      filePath: current.file,
+      gateRoot: join(current.root, ".gate-state"),
+    });
+    expect(permit).toMatchObject({
+      recordId: "record-capture",
+      sessionId: "session-capture",
+      repositoryRoot: await realpath(current.root),
+      path: "src/change.ts",
+      contentHash: current.hash,
+    });
+    expect(permit?.captureId).toEqual(expect.any(String));
+    expect(await readCurrentFileState({ repositoryRoot: current.root, filePath: current.file })).toEqual({
+      content: "export const value = 1;\n",
+      beforeMissing: false,
+      contentHash: current.hash,
+    });
+  });
+
+  test("reports a missing final file distinctly from an empty existing file", async () => {
+    const current = await repository();
+    const missing = join(current.root, "docs", "new.md");
+
+    const emptyHash = createHash("sha256").update("", "utf8").digest("hex");
+    expect(await readCurrentFileState({ repositoryRoot: current.root, filePath: missing })).toEqual({ content: "", beforeMissing: true, contentHash: emptyHash });
+    await Bun.write(missing, "");
+    expect(await readCurrentFileState({ repositoryRoot: current.root, filePath: missing })).toEqual({ content: "", beforeMissing: false, contentHash: emptyHash });
+  });
+
+  test("cleans up expired legacy permits that have no capture ID", async () => {
+    const current = await repository();
+    const gateRoot = join(current.root, ".gate-state");
+    const normalized = await normalizeDecisionProposal(proposal(current.root, current.hash), { sessionId: "session-legacy" });
+    const granted = await grantDecisionPermits(normalized, { recordId: "record-legacy", gateRoot });
+    for (const entry of await readdir(granted.gateDirectory)) await rm(join(granted.gateDirectory, entry), { force: true });
+    await writeFile(join(granted.gateDirectory, "permit-legacy.json"), JSON.stringify({
+      sessionId: "session-legacy",
+      repositoryRoot: await realpath(current.root),
+      recordId: "record-legacy",
+      path: "src/change.ts",
+      contentHash: current.hash,
+      expiresAt: "2020-01-01T00:00:00.000Z",
+    }), "utf8");
+
+    expect(await findDecisionPermit({
+      sessionId: "session-legacy",
+      repositoryRoot: current.root,
+      filePath: current.file,
+      gateRoot,
+    })).toBeNull();
+    expect(await readdir(granted.gateDirectory)).toHaveLength(0);
+  });
+
+  test("rejects invalid UTF-8 in the current target state", async () => {
+    const current = await repository();
+    await writeFile(current.file, Buffer.from([0xc3, 0x28]));
+
+    await expect(readCurrentFileState({ repositoryRoot: current.root, filePath: current.file })).rejects.toThrow("target could not be read");
+  });
+
+  test("rejects a missing target beneath a dangling symlink ancestor", async () => {
+    const current = await repository();
+    const danglingParent = join(current.root, "dangling-parent");
+    await symlink(join(current.root, "does-not-exist"), danglingParent);
+
+    await expect(readCurrentFileState({
+      repositoryRoot: current.root,
+      filePath: join(danglingParent, "new.ts"),
+    })).rejects.toThrow("target could not be resolved");
   });
 });
 

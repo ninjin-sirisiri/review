@@ -92,6 +92,25 @@ function parseRevision(kind: RevisionRef["kind"], value: string): RevisionRef {
   return { kind, contentHash: value };
 }
 
+function decisionIdentity(value: DecisionRecordInput | DecisionRecord): Record<string, unknown> {
+  return {
+    record_id: value.record_id,
+    session_id: value.session_id,
+    repository_id: value.repository_id,
+    agent_type: value.agent_type,
+    revision: value.revision,
+    targets: value.targets,
+    judgment: value.judgment,
+    rationale: value.rationale,
+    checks: value.checks,
+    open_questions: value.open_questions,
+  };
+}
+
+function matchesDecisionIdentity(existing: DecisionRecord, candidate: DecisionRecord): boolean {
+  return JSON.stringify(decisionIdentity(existing)) === JSON.stringify(decisionIdentity(candidate));
+}
+
 function prepareDatabaseDirectory(config: RecorderConfig): void {
   mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
   mkdirSync(dirname(config.databasePath), { recursive: true, mode: 0o700 });
@@ -200,7 +219,12 @@ export class RecordStore {
 
     const transaction = this.db.transaction(() => {
       const existing = this.readDecision(decision.record_id);
-      if (existing !== null) return existing;
+      if (existing !== null) {
+        if (!matchesDecisionIdentity(existing, decision)) {
+          throw new PersistenceError(ERROR_CODES.DUPLICATE_RECORD, `decision ${decision.record_id} already exists with different content`);
+        }
+        return existing;
+      }
 
       const session = this.readSession(decision.session_id);
       if (session === null) {

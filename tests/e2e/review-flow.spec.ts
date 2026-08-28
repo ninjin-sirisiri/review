@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "@playwright/test";
-import type { DecisionRecord, DecisionRecordInput, ReviewSession } from "../../packages/contracts/src/index";
+import type { DecisionRecord, DecisionRecordInput, ReviewSession, SnapshotReference } from "../../packages/contracts/src/index";
 
 const PROJECT_ROOT = process.cwd();
 const UI_ROOT = join(PROJECT_ROOT, "apps/review-ui/dist");
@@ -327,4 +327,138 @@ test("switches the color scheme, persists it, and boots without flashing", async
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await page.reload();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+});
+
+test("compares a selected judgment with the next automatic snapshot", async ({ page }) => {
+  const beforeContent = "export const transition = \"before\";\n";
+  const afterContent = "export const transition = \"after\";\n";
+  const fixture = await createGitRepository("automatic-transition", "src/transition.ts", beforeContent);
+  const registration = await postJson("/v1/repositories", { root: fixture.root, repository_id: fixture.repositoryId });
+  expect(registration.status).toBe(201);
+  const firstSession = await createSession(fixture, "claude-code");
+  const firstEvent = eventFor(fixture, firstSession.session_id, "claude-code", `transition-before-${randomUUID()}`);
+  const firstSubmission = await runAdapter("claude-code", firstEvent);
+  expect(firstSubmission.exitCode, firstSubmission.stderr).toBe(0);
+  expect(firstSubmission.result, JSON.stringify(firstSubmission.result)).toMatchObject({ success: true, recordId: firstEvent.recordId });
+
+  const beforeCaptureId = `capture-before-${randomUUID()}`;
+  const beforeCapture = await postJson(`/v1/decision-records/${firstEvent.recordId}/automatic-snapshot`, {
+    capture_id: beforeCaptureId,
+    source_path: fixture.path,
+    content: beforeContent,
+    before_missing: false,
+  });
+  expect(beforeCapture.status).toBe(201);
+  const beforeReference = (await beforeCapture.json() as { data: SnapshotReference }).data;
+  expect(beforeReference).toMatchObject({
+    record_id: firstEvent.recordId,
+    source_path: fixture.path,
+    capture_kind: "automatic",
+    content_hash: createHash("sha256").update(beforeContent, "utf8").digest("hex"),
+  });
+
+  await writeFile(join(fixture.root, fixture.path), afterContent, "utf8");
+  fixture.content = afterContent;
+  fixture.contentHash = createHash("sha256").update(afterContent, "utf8").digest("hex");
+  const secondSession = await createSession(fixture, "codex");
+  const secondEvent = eventFor(fixture, secondSession.session_id, "codex", `transition-after-${randomUUID()}`);
+  const secondSubmission = await runAdapter("codex", secondEvent);
+  expect(secondSubmission.exitCode, secondSubmission.stderr).toBe(0);
+  expect(secondSubmission.result, JSON.stringify(secondSubmission.result)).toMatchObject({ success: true, recordId: secondEvent.recordId });
+
+  const afterCaptureId = `capture-after-${randomUUID()}`;
+  const afterCapture = await postJson(`/v1/decision-records/${secondEvent.recordId}/automatic-snapshot`, {
+    capture_id: afterCaptureId,
+    source_path: fixture.path,
+    content: afterContent,
+    before_missing: false,
+  });
+  expect(afterCapture.status).toBe(201);
+  const afterReference = (await afterCapture.json() as { data: SnapshotReference }).data;
+  expect(afterReference).toMatchObject({
+    record_id: secondEvent.recordId,
+    source_path: fixture.path,
+    capture_kind: "automatic",
+    content_hash: createHash("sha256").update(afterContent, "utf8").digest("hex"),
+  });
+
+  const transitionResponse = await apiRequest(
+    `/v1/decision-records/${firstEvent.recordId}/snapshot-diff?path=${encodeURIComponent(fixture.path)}`,
+  );
+  expect(transitionResponse.status).toBe(200);
+  const transitionBody = await transitionResponse.json() as { data: Record<string, unknown> };
+  expect(transitionBody).toMatchObject({
+    success: true,
+    data: {
+      state: "snapshot-resolved",
+      path: fixture.path,
+      from: {
+        kind: "snapshot",
+        snapshot_id: beforeReference.snapshot_id,
+        record_id: firstEvent.recordId,
+        source_path: fixture.path,
+      },
+      to: {
+        kind: "snapshot",
+        snapshot_id: afterReference.snapshot_id,
+        record_id: secondEvent.recordId,
+        source_path: fixture.path,
+      },
+    },
+  });
+
+  await page.goto(app.url);
+  await page.getByLabel("Owner bearer token").fill(token);
+  await page.getByRole("button", { name: "Load repositories" }).click();
+  await page.getByLabel("Repository").selectOption(fixture.repositoryId);
+  await page.getByRole("button", { name: "Open review timeline" }).click();
+  await page.getByRole("button", { name: /transition\.ts/ }).click();
+  await expect(page.getByRole("heading", { name: firstEvent.judgment })).toBeVisible();
+  const firstCard = page.getByRole("article").filter({ has: page.getByRole("heading", { name: firstEvent.judgment }) });
+  await firstCard.getByRole("button", { name: "View subsequent changes" }).click();
+
+  const sourceDiff = page.getByLabel("Source diff");
+  await expect(sourceDiff.getByText("before snapshot", { exact: true })).toBeVisible();
+  await expect(sourceDiff.getByText(/next snapshot/)).toBeVisible();
+  await expect(sourceDiff.locator(".diff-line--del code")).toHaveText('export const transition = "before";');
+  await expect(sourceDiff.locator(".diff-line--add code")).toHaveText('export const transition = "after";');
+});
+
+test("uses the current worktree when no next automatic snapshot exists", async ({ page }) => {
+  const beforeContent = "export const fallback = \"before\";\n";
+  const currentContent = "export const fallback = \"current\";\n";
+  const fixture = await createGitRepository("automatic-worktree-fallback", "src/fallback.ts", beforeContent);
+  const registration = await postJson("/v1/repositories", { root: fixture.root, repository_id: fixture.repositoryId });
+  expect(registration.status).toBe(201);
+  const session = await createSession(fixture, "codex");
+  const event = eventFor(fixture, session.session_id, "codex", `transition-fallback-${randomUUID()}`);
+  const submission = await runAdapter("codex", event);
+  expect(submission.exitCode, submission.stderr).toBe(0);
+  expect(submission.result).toMatchObject({ success: true, recordId: event.recordId });
+
+  const capture = await postJson(`/v1/decision-records/${event.recordId}/automatic-snapshot`, {
+    capture_id: `capture-fallback-${randomUUID()}`,
+    source_path: fixture.path,
+    content: beforeContent,
+    before_missing: false,
+  });
+  expect(capture.status).toBe(201);
+
+  await writeFile(join(fixture.root, fixture.path), currentContent, "utf8");
+
+  await page.goto(app.url);
+  await page.getByLabel("Owner bearer token").fill(token);
+  await page.getByRole("button", { name: "Load repositories" }).click();
+  await page.getByLabel("Repository").selectOption(fixture.repositoryId);
+  await page.getByRole("button", { name: "Open review timeline" }).click();
+  await page.getByRole("button", { name: /fallback\.ts/ }).click();
+  await expect(page.getByRole("heading", { name: event.judgment })).toBeVisible();
+  const card = page.getByRole("article").filter({ has: page.getByRole("heading", { name: event.judgment }) });
+  await card.getByRole("button", { name: "View subsequent changes" }).click();
+
+  const sourceDiff = page.getByLabel("Source diff");
+  await expect(sourceDiff.getByText("before snapshot", { exact: true })).toBeVisible();
+  await expect(sourceDiff.getByText("after: working tree", { exact: true })).toBeVisible();
+  await expect(sourceDiff.locator(".diff-line--del code")).toHaveText('export const fallback = "before";');
+  await expect(sourceDiff.locator(".diff-line--add code")).toHaveText('export const fallback = "current";');
 });

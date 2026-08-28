@@ -2,12 +2,14 @@ import { appendFile, realpath } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import {
-  consumeDecisionPermit,
+  consumeDecisionPermitAfterEdit,
   defaultGateRoot,
+  findDecisionPermit,
   grantDecisionPermits,
   likelyCodeMutation,
   normalizeDecisionProposal,
-  peekDecisionPermit,
+  readCurrentFileState,
+  type AutomaticSnapshotBridge,
   type GateStorageOptions,
 } from "../../common/src/decision-gate";
 import { mapHostEvent, type AdapterBridge } from "../../common/src/adapter-contract";
@@ -36,6 +38,10 @@ export interface PreToolUseDenyOutput {
 
 export type PreToolUseOutput = PreToolUseDenyOutput;
 
+export interface PreToolUseOptions extends GateStorageOptions {
+  bridge?: AutomaticSnapshotBridge;
+}
+
 export interface RecordDecisionOptions extends GateStorageOptions {
   bridge?: AdapterBridge;
   agentType?: AgentType;
@@ -63,10 +69,40 @@ function jsonRecord(value: unknown, field: string): JsonObject {
   return value as JsonObject;
 }
 
+export async function readBoundedStdin(stream: ReadableStream<Uint8Array>, maxBytes = MAX_STDIN_BYTES): Promise<string> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new RangeError("maxBytes must be a positive integer");
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      totalBytes += next.value.byteLength;
+      if (totalBytes > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The input is already rejected; cancellation failure is not actionable.
+        }
+        throw new Error("hook input exceeds the command limit");
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
 async function stdinText(): Promise<string> {
-  const content = await new Response(Bun.stdin.stream()).text();
-  if (new TextEncoder().encode(content).byteLength > MAX_STDIN_BYTES) throw new Error("hook input exceeds the command limit");
-  return content;
+  return readBoundedStdin(Bun.stdin.stream());
 }
 
 function sessionIdFromInput(input: PreToolUseInput): string {
@@ -117,7 +153,7 @@ function editReason(path: string): string {
   ].join(" ");
 }
 
-export async function checkPreToolUse(input: PreToolUseInput, options: GateStorageOptions = {}): Promise<PreToolUseOutput | null> {
+export async function checkPreToolUse(input: PreToolUseInput, options: PreToolUseOptions = {}): Promise<PreToolUseOutput | null> {
   const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
   if (toolName === "Bash" || toolName === "PowerShell") {
     const command = shellCommandFromTool(input);
@@ -136,13 +172,29 @@ export async function checkPreToolUse(input: PreToolUseInput, options: GateStora
   const repositoryRoot = cwdFromInput(input);
   // Peek only: consumption happens in checkPostToolUse once the edit has
   // actually run, so a denial by another PreToolUse hook does not waste it.
-  const permitted = await peekDecisionPermit({
+  const permit = await findDecisionPermit({
     sessionId,
     repositoryRoot,
     filePath,
     gateRoot: options.gateRoot ?? defaultGateRoot(),
   });
-  return permitted ? null : deny(editReason(filePath));
+  if (permit === null) return deny(editReason(filePath));
+  try {
+    const state = await readCurrentFileState({ repositoryRoot: permit.repositoryRoot, filePath });
+    if (state.contentHash !== permit.contentHash) return deny("Automatic snapshot failed before edit: target content changed since judgment");
+    const bridge = options.bridge ?? new RecorderBridge();
+    const captured = await bridge.captureAutomaticSnapshot({
+      recordId: permit.recordId,
+      captureId: permit.captureId,
+      sourcePath: permit.path,
+      content: state.content,
+      beforeMissing: state.beforeMissing,
+    });
+    if (captured.success) return null;
+    return deny(`Automatic snapshot failed before edit: ${captured.message}`);
+  } catch (error) {
+    return deny(`Automatic snapshot failed before edit: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 export interface PostToolUseInput {
@@ -163,7 +215,7 @@ export async function checkPostToolUse(input: PostToolUseInput, options: GateSto
   } catch {
     return;
   }
-  await consumeDecisionPermit({
+  await consumeDecisionPermitAfterEdit({
     sessionId,
     repositoryRoot: cwdFromInput(input),
     filePath,

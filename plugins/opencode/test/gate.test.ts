@@ -1,4 +1,4 @@
-import { mkdtemp, realpath } from "node:fs/promises";
+import { mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, expect, test } from "bun:test";
@@ -12,7 +12,7 @@ import {
 } from "../src/gate";
 import type { AdapterBridge, SubmitResult } from "../../common/src/adapter-contract";
 import type { RecorderSetupClient } from "../../common/src/recorder-setup";
-import { grantDecisionPermits, normalizeDecisionProposal } from "../../common/src/decision-gate";
+import { grantDecisionPermits, normalizeDecisionProposal, type AutomaticSnapshotBridge } from "../../common/src/decision-gate";
 
 const GATED_ENV_KEYS = ["AI_REVIEW_SESSION_ID", "AI_REVIEW_REPOSITORY_ROOT", "AI_REVIEW_AGENT_TYPE", "AI_REVIEW_GATE_ROOT"];
 const preservedEnv: Record<string, string | undefined> = {};
@@ -31,8 +31,22 @@ async function fixture(): Promise<{ root: string; file: string; gateRoot: string
   return { root, file, gateRoot: join(root, "gate-state") };
 }
 
-function context(current: { root: string; gateRoot: string }, sessionId = "session-opencode"): GateContext {
-  return { sessionId, repositoryRoot: current.root, gateRoot: current.gateRoot };
+function context(current: { root: string; gateRoot: string }, sessionId = "session-opencode", snapshotBridge?: AutomaticSnapshotBridge): GateContext {
+  return {
+    sessionId,
+    repositoryRoot: current.root,
+    gateRoot: current.gateRoot,
+    ...(snapshotBridge === undefined ? {} : { snapshotBridge }),
+  };
+}
+
+function successfulSnapshotBridge(captures: Array<Record<string, unknown>>): AutomaticSnapshotBridge {
+  return {
+    captureAutomaticSnapshot: async (input) => {
+      captures.push(input);
+      return { success: true, status: 201, duplicate: false, recordId: input.recordId };
+    },
+  };
 }
 
 test("edit is denied while no matching judgment permit exists", async () => {
@@ -62,7 +76,7 @@ test("one recorded judgment allows exactly one completed edit", async () => {
   await grantDecisionPermits(event, { recordId: "record-allowed", gateRoot: current.gateRoot });
   const call = { tool: "edit", args: { filePath: current.file } };
 
-  expect(await gateToolUse(call, context(current, "session-allowed"))).toBeNull();
+  expect(await gateToolUse(call, context(current, "session-allowed", successfulSnapshotBridge([])))).toBeNull();
   await gateToolUseAfter(call, context(current, "session-allowed"));
   expect(await gateToolUse(call, context(current, "session-allowed"))).not.toBeNull();
 });
@@ -105,7 +119,96 @@ test("recordDecision grants the edit permit only after Recorder submission succe
   expect(submitted).toBe(true);
   expect(result.success).toBe(true);
   expect(result.permits).toBe(1);
-  expect(await gateToolUse({ tool: "edit", args: { filePath: current.file } }, context(current, "session-record"))).toBeNull();
+  expect(await gateToolUse({ tool: "edit", args: { filePath: current.file } }, context(current, "session-record", successfulSnapshotBridge([])))).toBeNull();
+});
+
+test("edit capture receives the matching permit state and reuses its capture ID", async () => {
+  const current = await fixture();
+  const event = await normalizeDecisionProposal({
+    repositoryRoot: current.root,
+    targets: [{ path: "src/change.ts", lineStart: 1 }],
+    judgment: "safe",
+    rationale: "checked",
+  }, { sessionId: "session-capture" });
+  await grantDecisionPermits(event, { recordId: "record-capture", gateRoot: current.gateRoot });
+  const captures: Array<Record<string, unknown>> = [];
+  const bridge = successfulSnapshotBridge(captures);
+  const call = { tool: "edit", args: { filePath: current.file } };
+
+  expect(await gateToolUse(call, context(current, "session-capture", bridge))).toBeNull();
+  expect(await gateToolUse(call, context(current, "session-capture", bridge))).toBeNull();
+  expect(captures).toHaveLength(2);
+  expect(captures[0]).toMatchObject({
+    recordId: "record-capture",
+    sourcePath: "src/change.ts",
+    content: "export const value = 1;\n",
+    beforeMissing: false,
+  });
+  expect(captures[1]?.captureId).toBe(captures[0]?.captureId);
+});
+
+test("edit is denied when the target changed after the permit was issued", async () => {
+  const current = await fixture();
+  const event = await normalizeDecisionProposal({
+    repositoryRoot: current.root,
+    targets: [{ path: "src/change.ts", lineStart: 1 }],
+    judgment: "safe",
+    rationale: "checked",
+  }, { sessionId: "session-hash-mismatch" });
+  await grantDecisionPermits(event, { recordId: "record-hash-mismatch", gateRoot: current.gateRoot });
+  await writeFile(current.file, "export const value = 2;\n", "utf8");
+  const captures: Array<Record<string, unknown>> = [];
+
+  const reason = await gateToolUse({ tool: "edit", args: { filePath: current.file } }, context(current, "session-hash-mismatch", successfulSnapshotBridge(captures)));
+
+  expect(reason).not.toBeNull();
+  expect(captures).toHaveLength(0);
+});
+
+test("a failed automatic capture denies the edit without consuming its permit", async () => {
+  const current = await fixture();
+  const event = await normalizeDecisionProposal({
+    repositoryRoot: current.root,
+    targets: [{ path: "src/change.ts", lineStart: 1 }],
+    judgment: "safe",
+    rationale: "checked",
+  }, { sessionId: "session-capture-failure" });
+  await grantDecisionPermits(event, { recordId: "record-capture-failure", gateRoot: current.gateRoot });
+  const call = { tool: "edit", args: { filePath: current.file } };
+  const failedBridge: AutomaticSnapshotBridge = {
+    captureAutomaticSnapshot: async (input) => ({
+      success: false,
+      code: "HASH_MISMATCH",
+      message: "content changed before capture",
+      error: "content changed before capture",
+      recordId: input.recordId,
+      attempts: 1,
+    }),
+  };
+
+  expect(await gateToolUse(call, context(current, "session-capture-failure", failedBridge))).toContain("Automatic snapshot failed before edit: content changed before capture");
+  expect(await gateToolUse(call, context(current, "session-capture-failure", successfulSnapshotBridge([])))).toBeNull();
+  await gateToolUseAfter(call, context(current, "session-capture-failure"));
+  expect(await gateToolUse(call, context(current, "session-capture-failure", successfulSnapshotBridge([])))).not.toBeNull();
+});
+
+test("gateToolUseAfter consumes a permit even when the edited file no longer matches its pre-edit hash", async () => {
+  const current = await fixture();
+  const event = await normalizeDecisionProposal({
+    repositoryRoot: current.root,
+    targets: [{ path: "src/change.ts", lineStart: 1 }],
+    judgment: "safe",
+    rationale: "checked",
+  }, { sessionId: "session-post-change" });
+  await grantDecisionPermits(event, { recordId: "record-post-change", gateRoot: current.gateRoot });
+  const call = { tool: "edit", args: { filePath: current.file } };
+
+  expect(await gateToolUse(call, context(current, "session-post-change", successfulSnapshotBridge([])))).toBeNull();
+  await writeFile(current.file, "export const value = 2;\n", "utf8");
+  await gateToolUseAfter(call, context(current, "session-post-change"));
+  await writeFile(current.file, "export const value = 1;\n", "utf8");
+
+  expect(await gateToolUse(call, context(current, "session-post-change", successfulSnapshotBridge([])))).not.toBeNull();
 });
 
 test("recordDecision reports Recorder failures without granting permits", async () => {
@@ -123,6 +226,30 @@ test("recordDecision reports Recorder failures without granting permits", async 
   expect(result.success).toBe(false);
   expect(result.code).toBe("RECORDER_UNAVAILABLE");
   expect(await gateToolUse({ tool: "edit", args: { filePath: current.file } }, context(current, "session-failed"))).not.toBeNull();
+});
+
+test("recordDecision rejects a conflicting duplicate without granting a permit", async () => {
+  const current = await fixture();
+  const bridge: AdapterBridge = {
+    submit: async (): Promise<SubmitResult> => ({
+      success: false,
+      code: "DUPLICATE_RECORD",
+      message: "record_id already contains a different judgment",
+      error: "record_id already contains a different judgment",
+      recordId: "record-conflict",
+      attempts: 1,
+      status: 409,
+    }),
+  };
+  const result = await recordDecision({
+    repositoryRoot: current.root,
+    targets: [{ path: "src/change.ts", lineStart: 1 }],
+    judgment: "conflicting",
+    rationale: "must not be accepted",
+  }, { ...context(current, "session-conflict"), bridge });
+
+  expect(result).toMatchObject({ success: false, code: "DUPLICATE_RECORD", status: 409 });
+  expect(await gateToolUse({ tool: "edit", args: { filePath: current.file } }, context(current, "session-conflict"))).not.toBeNull();
 });
 
 test("registerSession registers an opencode session against the canonical repository root", async () => {

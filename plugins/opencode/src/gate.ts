@@ -2,12 +2,14 @@ import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
-  consumeDecisionPermit,
+  consumeDecisionPermitAfterEdit,
   defaultGateRoot,
+  findDecisionPermit,
   grantDecisionPermits,
   likelyCodeMutation,
   normalizeDecisionProposal,
-  peekDecisionPermit,
+  readCurrentFileState,
+  type AutomaticSnapshotBridge,
   type DecisionProposalDefaults,
   type GateStorageOptions,
 } from "../../common/src/decision-gate";
@@ -28,6 +30,7 @@ export interface ToolCall {
 export interface GateContext extends GateStorageOptions {
   sessionId: string;
   repositoryRoot: string;
+  snapshotBridge?: AutomaticSnapshotBridge;
 }
 
 export interface RegisterSessionOptions {
@@ -89,13 +92,30 @@ export async function gateToolUse(call: ToolCall, context: GateContext): Promise
   }
   // Peek only: consumption happens in gateToolUseAfter once the edit has run,
   // so an edit blocked elsewhere keeps its permit.
-  const permitted = await peekDecisionPermit({
+  const permit = await findDecisionPermit({
     sessionId: context.sessionId,
     repositoryRoot: resolve(context.repositoryRoot),
     filePath: resolve(filePath),
     gateRoot: context.gateRoot ?? defaultGateRoot(),
   });
-  if (permitted) return null;
+  if (permit !== null) {
+    try {
+      const state = await readCurrentFileState({ repositoryRoot: permit.repositoryRoot, filePath: resolve(filePath) });
+      if (state.contentHash !== permit.contentHash) return "Automatic snapshot failed before edit: target content changed since judgment";
+      const bridge = context.snapshotBridge ?? new RecorderBridge();
+      const captured = await bridge.captureAutomaticSnapshot({
+        recordId: permit.recordId,
+        captureId: permit.captureId,
+        sourcePath: permit.path,
+        content: state.content,
+        beforeMissing: state.beforeMissing,
+      });
+      if (captured.success) return null;
+      return `Automatic snapshot failed before edit: ${captured.message}`;
+    } catch (error) {
+      return `Automatic snapshot failed before edit: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
   return `Code edit blocked for ${filePath}: record a structured judgment first, then retry this exact edit. Pass {"targets":[{"path":"<repo-relative-path>","lineStart":1}],"judgment":"<decision>","rationale":"<why>"} to review_record_judgment; required fields are targets[].path, targets[].lineStart, judgment, rationale; lineEnd is optional and contentHash is computed automatically. The Recorder must be running locally first (ai-review --data-dir ./.ai-review --port 4318).`;
 }
 
@@ -109,7 +129,7 @@ export async function gateToolUseAfter(call: ToolCall, context: GateContext): Pr
   if (!EDIT_TOOLS.has(toolName)) return;
   const filePath = argString(call.args, ["filePath", "file_path", "path"]);
   if (filePath === null) return;
-  await consumeDecisionPermit({
+  await consumeDecisionPermitAfterEdit({
     sessionId: context.sessionId,
     repositoryRoot: resolve(context.repositoryRoot),
     filePath: resolve(filePath),

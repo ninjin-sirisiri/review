@@ -11,6 +11,7 @@ export interface BootstrapScreenProps {
   isLoading: boolean;
   error: string | null;
   onSubmit: () => void;
+  onResetSession: () => void;
 }
 
 export function BootstrapScreen({
@@ -22,6 +23,7 @@ export function BootstrapScreen({
   isLoading,
   error,
   onSubmit,
+  onResetSession,
 }: BootstrapScreenProps) {
   const pickingRepository = repositories !== null;
 
@@ -50,9 +52,10 @@ export function BootstrapScreen({
               autoComplete="off"
               value={tokenInput}
               onChange={(event) => onTokenChange(event.target.value)}
+              disabled={pickingRepository || isLoading}
               required
             />
-            {pickingRepository && (
+            {pickingRepository && repositories.length > 0 && (
               <>
                 <label htmlFor="repository">Repository</label>
                 <select
@@ -60,6 +63,7 @@ export function BootstrapScreen({
                   name="repository"
                   value={selectedRepositoryId}
                   onChange={(event) => onRepositoryChange(event.target.value)}
+                  disabled={isLoading}
                   required
                 >
                   <option value="" disabled>Select a repository…</option>
@@ -71,17 +75,26 @@ export function BootstrapScreen({
                 </select>
               </>
             )}
+            {pickingRepository && repositories.length === 0 && (
+              <p role="status" className="empty-state">No registered repositories were found for this owner token.</p>
+            )}
           </fieldset>
           {error !== null && <p className="inline-error" role="alert">{error}</p>}
-          <button type="submit" disabled={isLoading}>
-            {isLoading
-              ? pickingRepository
-                ? "Opening…"
-                : "Connecting…"
-              : pickingRepository
-                ? "Open review timeline"
-                : "Load repositories"}
-          </button>
+          {pickingRepository && repositories.length === 0 ? (
+            <button type="button" className="button-secondary" onClick={onResetSession}>
+              Use another token
+            </button>
+          ) : (
+            <button type="submit" disabled={isLoading}>
+              {isLoading
+                ? pickingRepository
+                  ? "Opening…"
+                  : "Connecting…"
+                : pickingRepository
+                  ? "Open review timeline"
+                  : "Load repositories"}
+            </button>
+          )}
         </form>
       </section>
     </main>

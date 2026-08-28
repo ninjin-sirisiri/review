@@ -6,6 +6,8 @@ import {
   type DecisionRecordSummary,
   type FileDiff,
   type RegisteredRepositorySummary,
+  type SnapshotDiff,
+  type SnapshotDiffResponse,
   type UserDisposition,
 } from "./api";
 import { BootstrapScreen } from "./components/BootstrapScreen";
@@ -13,7 +15,7 @@ import { ThemeToggle } from "./components/ThemeToggle";
 import { Workspace } from "./components/Workspace";
 import type { JudgmentEntry } from "./components/JudgmentPanel";
 import type { DecisionAnchor } from "./lib/decision-index";
-import { buildDecisionIndex, decisionAnchors, diffBaseFor } from "./lib/decision-index";
+import { buildDecisionIndex, decisionAnchors, diffBaseFor, transitionAnchors } from "./lib/decision-index";
 import { buildFileTree } from "./lib/file-tree";
 import "./styles.css";
 
@@ -31,6 +33,55 @@ function apiMessage(error: unknown): string {
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(apiMessage(error));
+}
+
+function assertSnapshotResponseMatchesSelection(result: SnapshotDiffResponse, path: string): SnapshotDiffResponse {
+  if (result.path !== path) {
+    throw new ReviewApiError("Recorder returned a snapshot transition that does not match the requested snapshot transition", {
+      code: "INVALID_RESPONSE",
+    });
+  }
+  return result;
+}
+
+function assertSnapshotTransitionMatchesSelection(result: SnapshotDiff, recordId: string, path: string): SnapshotDiff {
+  const destinationMatches = result.to.kind === "working-tree" || result.to.source_path === path;
+  if (result.path !== path || result.from.record_id !== recordId || result.from.source_path !== path || !destinationMatches) {
+    throw new ReviewApiError("Recorder returned a snapshot transition that does not match the requested snapshot transition", {
+      code: "INVALID_RESPONSE",
+    });
+  }
+  return result;
+}
+
+function currentPathEvidence(
+  entries: Iterable<JudgmentEntry>,
+  path: string | null,
+): { anchors: DecisionAnchor[]; fullText: { content: string; anchors: DecisionAnchor[] } | null } {
+  if (path === null) return { anchors: [], fullText: null };
+
+  const anchors: DecisionAnchor[] = [];
+  let fullText: { content: string; anchors: DecisionAnchor[] } | null = null;
+  for (const entry of entries) {
+    if (entry.status !== "ready" || entry.detail === undefined) continue;
+    const sources = entry.detail.sources.filter((source) => source.path === path);
+    if (sources.length === 0) continue;
+
+    const detail = sources.length === entry.detail.sources.length
+      ? entry.detail
+      : { ...entry.detail, sources };
+    const entryAnchors = decisionAnchors(detail);
+    anchors.push(...entryAnchors);
+
+    if (fullText === null) {
+      const source = sources.find((candidate) => candidate.state === "resolved" || candidate.state === "snapshot-resolved");
+      if (source !== undefined && "content" in source) {
+        fullText = { content: source.content, anchors: entryAnchors };
+      }
+    }
+  }
+
+  return { anchors, fullText };
 }
 
 export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) {
@@ -56,13 +107,17 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   // 「比較対象なし」状態として別扱いする。baseが記録済みSHAのときは従来どおりfileErrorになる。
   const [fileBaseMissing, setFileBaseMissing] = useState(false);
   const [diff, setDiff] = useState<FileDiff | null>(null);
-  const [fullText, setFullText] = useState<{ content: string; anchors: DecisionAnchor[] } | null>(null);
+  const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
+  const [snapshotDiff, setSnapshotDiff] = useState<SnapshotDiff | null>(null);
+  const [snapshotDiffLoading, setSnapshotDiffLoading] = useState(false);
+  const [snapshotDiffError, setSnapshotDiffError] = useState<ReviewApiError | Error | null>(null);
   const [recordStates, setRecordStates] = useState<Record<string, JudgmentEntry>>({});
-  const [anchors, setAnchors] = useState<DecisionAnchor[]>([]);
   const [workspaceKey, setWorkspaceKey] = useState(0);
   // M31: openFileが進める単調トークン。後発のファイル選択は先行ロードの非同期完了を無効化し、
   // 遅れて着いた応答が新しい選択の状態を上書きしないようにする。
   const requestTokenRef = useRef(0);
+  const sessionGenerationRef = useRef(0);
+  const snapshotRequestTokenRef = useRef(0);
 
   const decisionIndex = useMemo(() => buildDecisionIndex(decisions), [decisions]);
   const tree = useMemo(() => {
@@ -83,6 +138,20 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     });
   }, [selectedPath, decisionIndex, recordStates]);
 
+  const evidence = useMemo(
+    () => currentPathEvidence(Object.values(recordStates), selectedPath),
+    [recordStates, selectedPath],
+  );
+
+  const selectedTransitionAnchors = selectedRecordId !== null && selectedPath !== null
+    ? (() => {
+        const entry = recordStates[selectedRecordId];
+        return entry?.status === "ready" && entry.detail !== undefined
+          ? transitionAnchors(entry.detail, selectedPath)
+          : [];
+      })()
+    : [];
+
   async function handleSubmit() {
     setError(null);
     const token = tokenInput.trim();
@@ -91,11 +160,13 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
       return;
     }
 
+    const sessionGeneration = ++sessionGenerationRef.current;
     setIsLoading(true);
     try {
       if (repositories === null) {
         const client = apiFactory(token);
         const found = await client.listRepositories();
+        if (sessionGenerationRef.current !== sessionGeneration) return;
         setApi(client);
         setRepositories(found);
         if (found.length === 1) setSelectedRepositoryId(found[0].repository_id);
@@ -110,37 +181,47 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
       const client = api ?? apiFactory(tokenInput.trim());
       const records = await client.listDecisions(repository);
+      if (sessionGenerationRef.current !== sessionGeneration) return;
       setApi(client);
       setRepositoryId(repository);
       setDecisions(records);
-      await loadFiles(client, repository);
+      if (sessionGenerationRef.current !== sessionGeneration) return;
+      await loadFiles(client, repository, sessionGeneration);
     } catch (requestError) {
+      if (sessionGenerationRef.current !== sessionGeneration) return;
       if (repositories === null) {
         setApi(null);
         setRepositories(null);
       }
       setError(apiMessage(requestError));
     } finally {
-      setIsLoading(false);
+      if (sessionGenerationRef.current === sessionGeneration) setIsLoading(false);
     }
   }
 
-  async function loadFiles(client: ReviewApi, repository: string) {
+  async function loadFiles(client: ReviewApi, repository: string, sessionGeneration: number) {
+    const fileToken = requestTokenRef.current;
+    const isCurrent = () =>
+      sessionGenerationRef.current === sessionGeneration && requestTokenRef.current === fileToken;
+    if (!isCurrent()) return;
     setExplorerIsLoading(true);
     setExplorerError(null);
     try {
       const data = await client.listRepositoryFiles(repository);
+      if (!isCurrent()) return;
       setFilePaths(data.paths);
     } catch (requestError) {
+      if (!isCurrent()) return;
       setExplorerError(asError(requestError));
     } finally {
-      setExplorerIsLoading(false);
+      if (isCurrent()) setExplorerIsLoading(false);
     }
   }
 
   async function openFile(path: string) {
     if (api === null || repositoryId === null) return;
     const token = ++requestTokenRef.current;
+    resetSnapshotTransition();
     setSelectedPath(path);
     setSelectedBlockReset();
 
@@ -150,8 +231,6 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     setFileError(null);
     setFileBaseMissing(false);
     setDiff(null);
-    setFullText(null);
-    setAnchors([]);
     setRecordStates(Object.fromEntries(
       related.map((summary) => [summary.record_id, { recordId: summary.record_id, status: "loading" as const }]),
     ));
@@ -188,28 +267,59 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     }
 
     const nextStates: Record<string, JudgmentEntry> = {};
-    const nextAnchors: DecisionAnchor[] = [];
     for (const attempt of details) {
       if (attempt.ok) {
         nextStates[attempt.id] = { recordId: attempt.id, status: "ready", detail: attempt.value };
-        nextAnchors.push(...decisionAnchors(attempt.value));
       } else {
         nextStates[attempt.id] = { recordId: attempt.id, status: "error", message: apiMessage(attempt.error) };
       }
     }
     setRecordStates(nextStates);
-    setAnchors(nextAnchors);
-
-    for (const attempt of details) {
-      if (!attempt.ok) continue;
-      const source = attempt.value.sources.find((candidate) => candidate.state === "resolved" || candidate.state === "snapshot-resolved");
-      if (source !== undefined && "content" in source) {
-        setFullText({ content: source.content, anchors: decisionAnchors(attempt.value) });
-        break;
-      }
-    }
 
     setFileIsLoading(false);
+  }
+
+  async function selectJudgment(recordId: string, force = false) {
+    if (api === null || selectedPath === null) return;
+    const currentPathRecords = decisionIndex.get(selectedPath) ?? [];
+    if (!currentPathRecords.some((summary) => summary.record_id === recordId)) return;
+    if (!force && selectedRecordId === recordId) {
+      resetSnapshotTransition();
+      return;
+    }
+
+    const path = selectedPath;
+    const token = ++snapshotRequestTokenRef.current;
+    setSelectedRecordId(recordId);
+    setSnapshotDiff(null);
+    setSnapshotDiffError(null);
+    setSnapshotDiffLoading(true);
+    try {
+      const result = assertSnapshotResponseMatchesSelection(await api.getSnapshotDiff(recordId, path), path);
+      if (snapshotRequestTokenRef.current !== token) return;
+      if (result.state === "snapshot-resolved") {
+        setSnapshotDiff(assertSnapshotTransitionMatchesSelection(result, recordId, path));
+      } else if (result.state === "legacy-fallback") {
+        resetSnapshotTransition();
+      } else {
+        setSnapshotDiffError(new Error(result.message));
+      }
+    } catch (requestError) {
+      if (snapshotRequestTokenRef.current !== token) return;
+      setSnapshotDiffError(requestError instanceof ReviewApiError || requestError instanceof Error
+        ? requestError
+        : asError(requestError));
+    } finally {
+      if (snapshotRequestTokenRef.current === token) setSnapshotDiffLoading(false);
+    }
+  }
+
+  function resetSnapshotTransition() {
+    snapshotRequestTokenRef.current += 1;
+    setSelectedRecordId(null);
+    setSnapshotDiff(null);
+    setSnapshotDiffLoading(false);
+    setSnapshotDiffError(null);
   }
 
   function setSelectedBlockReset() {
@@ -219,7 +329,9 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
   async function handleDisposition(recordId: string, disposition: UserDisposition): Promise<DecisionRecordDetail> {
     if (api === null) throw new ReviewApiError("Not connected to Recorder", { code: "UNKNOWN" });
+    const token = requestTokenRef.current;
     const updated = await api.setDisposition(recordId, disposition);
+    if (requestTokenRef.current !== token) return updated;
     setDecisions((current) => current.map((decision) => (
       decision.record_id === updated.record.record_id ? updated.record : decision
     )));
@@ -250,20 +362,24 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   }
 
   function resetSession() {
+    requestTokenRef.current += 1;
+    sessionGenerationRef.current += 1;
+    resetSnapshotTransition();
     setApi(null);
     setRepositoryId(null);
     setRepositories(null);
     setSelectedRepositoryId("");
     setDecisions([]);
     setFilePaths([]);
+    setIsLoading(false);
+    setExplorerIsLoading(false);
     setExplorerError(null);
     setSelectedPath(null);
+    setFileIsLoading(false);
     setFileError(null);
     setFileBaseMissing(false);
     setDiff(null);
-    setFullText(null);
     setRecordStates({});
-    setAnchors([]);
     setTokenInput("");
     setError(null);
   }
@@ -279,6 +395,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
         isLoading={isLoading}
         error={error}
         onSubmit={() => void handleSubmit()}
+        onResetSession={resetSession}
       />
     );
   }
@@ -299,7 +416,39 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
         </div>
       </header>
       {error !== null && <p className="inline-error" role="alert">{error}</p>}
-      <Workspace key={workspaceKey} tree={tree} selectedPath={selectedPath} explorerIsLoading={explorerIsLoading} explorerError={explorerError} onExplorerRetry={() => api !== null && repositoryId !== null ? void loadFiles(api, repositoryId) : undefined} onOpenFile={(path) => void openFile(path)} fileIsLoading={fileIsLoading} fileError={fileError} fileBaseMissing={fileBaseMissing} diff={diff} fullText={fullText} onFileRetry={() => selectedPath !== null && void openFile(selectedPath)} judgments={judgments} anchors={anchors} onDispositionChange={(recordId, disposition) => handleDisposition(recordId, disposition)} onJudgmentRetry={(recordId) => void retryJudgment(recordId)} />
+      <Workspace
+        key={workspaceKey}
+        tree={tree}
+        selectedPath={selectedPath}
+        explorerIsLoading={explorerIsLoading}
+        explorerError={explorerError}
+        onExplorerRetry={() => api !== null && repositoryId !== null
+          ? void loadFiles(api, repositoryId, sessionGenerationRef.current)
+          : undefined}
+        onOpenFile={(path) => void openFile(path)}
+        fileIsLoading={fileIsLoading}
+        fileError={fileError}
+        fileBaseMissing={fileBaseMissing}
+        diff={diff}
+        fullText={evidence.fullText}
+        onFileRetry={() => {
+          if (selectedRecordId !== null && snapshotDiffError !== null) {
+            void selectJudgment(selectedRecordId, true);
+          } else if (selectedPath !== null) {
+            void openFile(selectedPath);
+          }
+        }}
+        judgments={judgments}
+        anchors={evidence.anchors}
+        transitionAnchors={selectedTransitionAnchors}
+        selectedRecordId={selectedRecordId}
+        onSelectJudgment={(recordId) => void selectJudgment(recordId)}
+        snapshotDiff={snapshotDiff}
+        snapshotDiffLoading={snapshotDiffLoading}
+        snapshotDiffError={snapshotDiffError}
+        onDispositionChange={(recordId, disposition) => handleDisposition(recordId, disposition)}
+        onJudgmentRetry={(recordId) => void retryJudgment(recordId)}
+      />
     </main>
   );
 }

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { expect, test } from "@playwright/test";
 import type { DecisionRecord, DecisionRecordInput, RevisionRef, SnapshotReference } from "../../packages/contracts/src/index";
 
@@ -125,22 +125,39 @@ async function createGitRepository(name: string, path: string, content: string):
   };
 }
 
-async function apiRequest(path: string, init: RequestInit = {}, options: { bearer?: string; origin?: string | null } = {}): Promise<Response> {
+async function apiRequest(path: string, init: RequestInit = {}, options: { bearer?: string | null; origin?: string | null } = {}): Promise<Response> {
   const headers = new Headers(init.headers);
-  const bearer = options.bearer ?? token;
-  headers.set("Authorization", `Bearer ${bearer}`);
+  if (options.bearer !== null) headers.set("Authorization", `Bearer ${options.bearer ?? token}`);
   if (options.origin !== null && init.method !== undefined && init.method !== "GET" && init.method !== "HEAD") {
     headers.set("Origin", options.origin ?? "http://127.0.0.1");
   }
   return fetch(`${app.url}${path}`, { ...init, headers });
 }
 
-async function postJson(path: string, value: unknown, options: { bearer?: string; origin?: string | null } = {}): Promise<Response> {
+async function postJson(path: string, value: unknown, options: { bearer?: string | null; origin?: string | null } = {}): Promise<Response> {
   return apiRequest(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(value),
   }, options);
+}
+
+function automaticSnapshotBody(sourcePath: string, content: string, beforeMissing = false, captureId = `security-capture-${randomUUID()}`) {
+  return {
+    capture_id: captureId,
+    source_path: sourcePath,
+    content,
+    before_missing: beforeMissing,
+  };
+}
+
+async function createCurrentRecord(path = "src/secure.ts", content = "export const secure = true;"): Promise<{ recordId: string; path: string; content: string }> {
+  const sessionId = await createSession(securityRepositoryId);
+  const fullContent = `${content}\n`;
+  const contentHash = createHash("sha256").update(fullContent, "utf8").digest("hex");
+  const result = await createRecord(recordInput(securityRepositoryId, sessionId, path, contentHash));
+  const record = ((result.body.data as Record<string, unknown>).record as DecisionRecord);
+  return { recordId: record.record_id, path, content: fullContent };
 }
 async function createSession(repositoryId: string, agentType: "codex" | "claude-code" = "codex"): Promise<string> {
   const sessionId = `security-session-${randomUUID()}`;
@@ -175,6 +192,17 @@ async function createRecord(input: DecisionRecordInput, expectedStatus = 201): P
   const response = await postJson("/v1/decision-records", input);
   expect(response.status).toBe(expectedStatus);
   return { response, body: await response.json() as Record<string, unknown> };
+}
+
+async function expectLegacyFallback(record: { recordId: string; path: string }): Promise<void> {
+  const response = await apiRequest(
+    `/v1/decision-records/${record.recordId}/snapshot-diff?path=${encodeURIComponent(record.path)}`,
+  );
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({
+    success: true,
+    data: { state: "legacy-fallback", reason: "automatic-snapshot-not-found", path: record.path },
+  });
 }
 
 test.beforeAll(async () => {
@@ -219,6 +247,111 @@ test("rejects invalid bearer tokens while keeping the public UI shell available"
 
   await page.goto(app.url);
   await expect(page.getByRole("heading", { name: "Review decisions with their source" })).toBeVisible();
+});
+
+test("requires an owner bearer token for automatic capture and snapshot diff routes", async () => {
+  const record = await createCurrentRecord();
+  const capturePath = `/v1/decision-records/${record.recordId}/automatic-snapshot`;
+  const diffPath = `/v1/decision-records/${record.recordId}/snapshot-diff?path=${encodeURIComponent(record.path)}`;
+  const captureId = `unauthorized-capture-${randomUUID()}`;
+
+  for (const bearer of [null, "wrong-token"] as const) {
+    const capture = await postJson(capturePath, automaticSnapshotBody(record.path, record.content, false, captureId), { bearer });
+    expect(capture.status).toBe(401);
+    expect(await capture.json()).toMatchObject({ success: false, error: { code: "UNAUTHORIZED" } });
+
+    const diff = await apiRequest(diffPath, {}, { bearer });
+    expect(diff.status).toBe(401);
+    expect(await diff.json()).toMatchObject({ success: false, error: { code: "UNAUTHORIZED" } });
+  }
+
+  await expectLegacyFallback(record);
+});
+
+test("rejects disallowed origins before automatic capture", async () => {
+  const record = await createCurrentRecord();
+  const captureId = `origin-capture-${randomUUID()}`;
+  const response = await postJson(
+    `/v1/decision-records/${record.recordId}/automatic-snapshot`,
+    automaticSnapshotBody(record.path, record.content, false, captureId),
+    { origin: "https://evil.example" },
+  );
+  expect(response.status).toBe(403);
+  const body = await response.json() as Record<string, unknown>;
+  expect(body).toMatchObject({ success: false, error: { code: "UNAUTHORIZED" } });
+  expect(JSON.stringify(body)).not.toContain(record.content);
+  await expectLegacyFallback(record);
+});
+
+test("rejects unknown records and non-target or traversal paths on automatic routes", async () => {
+  const record = await createCurrentRecord();
+  const unknownCapture = await postJson(
+    `/v1/decision-records/unknown-automatic-${randomUUID()}/automatic-snapshot`,
+    automaticSnapshotBody(record.path, record.content),
+  );
+  expect(unknownCapture.status).toBe(404);
+  expect(await unknownCapture.json()).toMatchObject({ success: false, error: { code: "INVALID_RECORD" } });
+
+  const unknownDiff = await apiRequest(
+    `/v1/decision-records/unknown-diff-${randomUUID()}/snapshot-diff?path=${encodeURIComponent(record.path)}`,
+  );
+  expect(unknownDiff.status).toBe(404);
+  expect(await unknownDiff.json()).toMatchObject({ success: false, error: { code: "INVALID_RECORD" } });
+
+  const nonTargetContent = "non-target source must not be captured\n";
+  const nonTargetCaptureId = `non-target-capture-${randomUUID()}`;
+  const nonTargetCapture = await postJson(
+    `/v1/decision-records/${record.recordId}/automatic-snapshot`,
+    automaticSnapshotBody("src/first.ts", nonTargetContent, false, nonTargetCaptureId),
+  );
+  expect(nonTargetCapture.status).toBe(422);
+  const nonTargetCaptureBody = await nonTargetCapture.json() as Record<string, unknown>;
+  expect(nonTargetCaptureBody).toMatchObject({ success: false, error: { code: "INVALID_RECORD", field: "source_path" } });
+  expect(JSON.stringify(nonTargetCaptureBody)).not.toContain(nonTargetContent);
+  await expectLegacyFallback(record);
+
+  const nonTargetDiff = await apiRequest(
+    `/v1/decision-records/${record.recordId}/snapshot-diff?path=${encodeURIComponent("src/first.ts")}`,
+  );
+  expect(nonTargetDiff.status).toBe(200);
+  const nonTargetDiffBody = await nonTargetDiff.json() as Record<string, unknown>;
+  expect(nonTargetDiffBody).toMatchObject({ success: true, data: { state: "source-unavailable", path: "src/first.ts" } });
+  expect(JSON.stringify(nonTargetDiffBody)).not.toContain(nonTargetContent);
+
+  const traversalContent = "traversal source must not be captured\n";
+  const traversalCaptureId = `traversal-capture-${randomUUID()}`;
+  const traversalCapture = await postJson(
+    `/v1/decision-records/${record.recordId}/automatic-snapshot`,
+    automaticSnapshotBody("../outside.ts", traversalContent, false, traversalCaptureId),
+  );
+  expect(traversalCapture.status).toBe(422);
+  const traversalCaptureBody = await traversalCapture.json() as Record<string, unknown>;
+  expect(traversalCaptureBody).toMatchObject({ success: false, error: { code: "PATH_OUTSIDE_ROOT" } });
+  expect(JSON.stringify(traversalCaptureBody)).not.toContain(traversalContent);
+  await expectLegacyFallback(record);
+
+  const traversalDiff = await apiRequest(
+    `/v1/decision-records/${record.recordId}/snapshot-diff?path=${encodeURIComponent("../outside.ts")}`,
+  );
+  expect(traversalDiff.status).toBe(422);
+  const traversalDiffBody = await traversalDiff.json() as Record<string, unknown>;
+  expect(traversalDiffBody).toMatchObject({ success: false, error: { code: "PATH_OUTSIDE_ROOT" } });
+  expect(JSON.stringify(traversalDiffBody)).not.toContain(traversalContent);
+});
+
+test("rejects automatic capture content that conflicts with the current target hash", async () => {
+  const record = await createCurrentRecord();
+  const submittedContent = "forged current content\n";
+  const captureId = `hash-conflict-capture-${randomUUID()}`;
+  const response = await postJson(
+    `/v1/decision-records/${record.recordId}/automatic-snapshot`,
+    automaticSnapshotBody(record.path, submittedContent, false, captureId),
+  );
+  expect(response.status).toBe(422);
+  const body = await response.json() as Record<string, unknown>;
+  expect(body).toMatchObject({ success: false, error: { code: "HASH_MISMATCH" } });
+  expect(JSON.stringify(body)).not.toContain(submittedContent);
+  await expectLegacyFallback(record);
 });
 
 test("rejects oversized chunked JSON and malformed UTF-8 before persistence", async () => {
@@ -362,11 +495,102 @@ test("caps source and patch reads without returning oversized content", async ()
     const oversizedPatch = await postJson(`/v1/decision-records/${snapshotRecordId}/snapshot`, { mode: "patch", content: patchContent });
     expect(oversizedPatch.status).toBe(413);
     expect(await oversizedPatch.json()).toMatchObject({ success: false, error: { code: "PAYLOAD_TOO_LARGE" } });
+
+    const oversizedAutomaticContent = "a".repeat(65);
+    const oversizedAutomaticCaptureId = `oversized-content-${randomUUID()}`;
+    const oversizedAutomatic = await postJson(
+      `/v1/decision-records/${snapshotRecordId}/automatic-snapshot`,
+      automaticSnapshotBody("src/secure.ts", oversizedAutomaticContent, false, oversizedAutomaticCaptureId),
+    );
+    expect(oversizedAutomatic.status).toBe(413);
+    const oversizedAutomaticResponse = await oversizedAutomatic.json() as Record<string, unknown>;
+    expect(oversizedAutomaticResponse).toMatchObject({ success: false, error: { code: "PAYLOAD_TOO_LARGE" } });
+    expect(JSON.stringify(oversizedAutomaticResponse)).not.toContain(oversizedAutomaticContent);
+    await expectLegacyFallback({ recordId: snapshotRecordId, path: "src/secure.ts" });
+
+    const encoder = new TextEncoder();
+    const oversizedAutomaticBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"capture_id":"oversized-body","source_path":"src/secure.ts","content":"'));
+        controller.enqueue(encoder.encode("b".repeat(1_000_100)));
+        controller.enqueue(encoder.encode('","before_missing":false}'));
+        controller.close();
+      },
+    });
+    const oversizedAutomaticRequest = await apiRequest(
+      `/v1/decision-records/${snapshotRecordId}/automatic-snapshot`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: oversizedAutomaticBody,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" },
+    );
+    expect(oversizedAutomaticRequest.status).toBe(413);
+    const oversizedAutomaticRequestBody = await oversizedAutomaticRequest.json() as Record<string, unknown>;
+    expect(oversizedAutomaticRequestBody).toMatchObject({ success: false, error: { code: "PAYLOAD_TOO_LARGE" } });
+    expect(JSON.stringify(oversizedAutomaticRequestBody)).not.toContain("b".repeat(128));
+    await expectLegacyFallback({ recordId: snapshotRecordId, path: "src/secure.ts" });
   } finally {
     app = originalApp;
     token = originalToken;
     await stopRecorder(limitedApp);
   }
+});
+
+test("does not fall back to the worktree when the next automatic snapshot is corrupted", async () => {
+  const beforeContent = "export const corrupted = \"before\";\n";
+  const nextContent = "export const corrupted = \"next\";\n";
+  const fallbackContent = "export const corrupted = \"fallback\";\n";
+  const fixture = await createGitRepository("automatic-corrupted-next", "src/corrupted.ts", beforeContent);
+  const registration = await postJson("/v1/repositories", { root: fixture.root, repository_id: fixture.repositoryId });
+  expect(registration.status).toBe(201);
+
+  const firstSession = await createSession(fixture.repositoryId);
+  const first = await createRecord(recordInput(
+    fixture.repositoryId,
+    firstSession,
+    fixture.path,
+    createHash("sha256").update(beforeContent, "utf8").digest("hex"),
+  ));
+  const firstRecordId = ((first.body.data as Record<string, unknown>).record as DecisionRecord).record_id;
+  const beforeCapture = await postJson(
+    `/v1/decision-records/${firstRecordId}/automatic-snapshot`,
+    automaticSnapshotBody(fixture.path, beforeContent),
+  );
+  expect(beforeCapture.status).toBe(201);
+
+  await writeFile(join(fixture.root, fixture.path), nextContent, "utf8");
+  const secondSession = await createSession(fixture.repositoryId);
+  const second = await createRecord(recordInput(
+    fixture.repositoryId,
+    secondSession,
+    fixture.path,
+    createHash("sha256").update(nextContent, "utf8").digest("hex"),
+  ));
+  const secondRecordId = ((second.body.data as Record<string, unknown>).record as DecisionRecord).record_id;
+  const nextCapture = await postJson(
+    `/v1/decision-records/${secondRecordId}/automatic-snapshot`,
+    automaticSnapshotBody(fixture.path, nextContent),
+  );
+  expect(nextCapture.status).toBe(201);
+  const nextReference = (await nextCapture.json() as { data: SnapshotReference }).data;
+  expect(nextReference).toMatchObject({ mode: "changed-files", capture_kind: "automatic", source_path: fixture.path });
+
+  await writeFile(join(dirname(app.tokenPath), nextReference.path), "corrupted snapshot content\n", "utf8");
+  await writeFile(join(fixture.root, fixture.path), fallbackContent, "utf8");
+
+  const response = await apiRequest(
+    `/v1/decision-records/${firstRecordId}/snapshot-diff?path=${encodeURIComponent(fixture.path)}`,
+  );
+  expect(response.status).toBe(200);
+  const body = await response.json() as Record<string, unknown>;
+  expect(body).toMatchObject({ success: true, data: { path: fixture.path } });
+  expect((body.data as Record<string, unknown>).state).toBe("source-unavailable");
+  const serialized = JSON.stringify(body);
+  expect(serialized).not.toContain(nextContent);
+  expect(serialized).not.toContain(fallbackContent);
+  expect(serialized).not.toContain("corrupted snapshot content");
 });
 
 test("never executes revision or path filter text as a command", async () => {

@@ -3,6 +3,8 @@ import type { DecisionRecordDetail, SourceReferenceData, UserDisposition } from 
 
 interface DecisionCardProps {
   detail: DecisionRecordDetail;
+  selected?: boolean;
+  onSelect?: () => void;
   onDispositionChange?: (disposition: UserDisposition) => Promise<DecisionRecordDetail | void>;
   onTargetClick?: (path: string, line: number) => void;
 }
@@ -38,7 +40,7 @@ function checkStatusLabel(status: "passed" | "failed" | "not-run"): string {
   return "Not run";
 }
 
-export function DecisionCard({ detail, onDispositionChange, onTargetClick }: DecisionCardProps) {
+export function DecisionCard({ detail, selected = false, onSelect = () => {}, onDispositionChange, onTargetClick }: DecisionCardProps) {
   const [displayedRecord, setDisplayedRecord] = useState(detail.record);
   const [isUpdating, setIsUpdating] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
@@ -72,7 +74,7 @@ export function DecisionCard({ detail, onDispositionChange, onTargetClick }: Dec
   const provenance = gitSnapshot?.snapshot?.base_sha?.slice(0, 8);
 
   return (
-    <article className="decision-card" aria-labelledby={`decision-${displayedRecord.record_id}`}>
+    <article className={`decision-card${selected ? " decision-card--selected" : ""}`} aria-labelledby={`decision-${displayedRecord.record_id}`}>
       <header className="decision-card__header">
         <div>
           <p className="eyebrow">Decision {displayedRecord.record_id}</p>
@@ -83,8 +85,11 @@ export function DecisionCard({ detail, onDispositionChange, onTargetClick }: Dec
               <span className="snapshot-provenance" title="Snapshot stored as a git reference">
                 {" · "}snapshot @{provenance}
               </span>
-            )}
+              )}
           </p>
+          <button type="button" className="decision-card__select" aria-pressed={selected} onClick={onSelect}>
+            {selected ? "Viewing subsequent changes" : "View subsequent changes"}
+          </button>
         </div>
         <fieldset className="disposition-controls" disabled={isUpdating || onDispositionChange === undefined}>
           <legend>Disposition</legend>

@@ -55,19 +55,17 @@ describe("RecordStore", () => {
     db.close();
   });
 
-  test("is idempotent by record_id and preserves immutable decision fields", async () => {
+  test("is idempotent only for matching record payloads", async () => {
     const db = new Database(":memory:");
     const store = new RecordStore(db);
     await store.createSession(session);
     const first = await store.insertDecision(decision);
-    const duplicate = await store.insertDecision({
+    await expect(store.insertDecision({
       ...decision,
       judgment: "A different judgment must not overwrite the first record.",
       rationale: "A different rationale must not overwrite the first record.",
       user_disposition: "accepted",
-    });
-
-    expect(duplicate).toEqual(first);
+    })).rejects.toMatchObject({ code: "DUPLICATE_RECORD" });
     expect(db.query("SELECT COUNT(*) AS count FROM decision_records").get()).toEqual({ count: 1 });
 
     const updated = await store.setDisposition(decision.record_id, "rejected");

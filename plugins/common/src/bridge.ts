@@ -136,22 +136,53 @@ export class RecorderBridge implements AdapterBridge {
   }
 
   submit(record: DecisionRecordInput): Promise<SubmitResult> {
-    const existing = this.pending.get(record.record_id);
+    const pendingKey = `record:${record.record_id}`;
+    const existing = this.pending.get(pendingKey);
     if (existing !== undefined) return existing;
     if (this.pending.size >= this.queueCapacity) {
       return Promise.resolve(responseFailure(record.record_id, "QUEUE_EXHAUSTED", "Recorder queue capacity is exhausted", 0));
     }
-    const operation = this.postWithRetry(record).finally(() => {
-      if (this.pending.get(record.record_id) === operation) this.pending.delete(record.record_id);
+    const operation = this.postWithRetry(record.record_id, this.endpoint, record).finally(() => {
+      if (this.pending.get(pendingKey) === operation) this.pending.delete(pendingKey);
     });
-    this.pending.set(record.record_id, operation);
+    this.pending.set(pendingKey, operation);
     return operation;
   }
 
-  private async postWithRetry(record: DecisionRecordInput): Promise<SubmitResult> {
+  captureAutomaticSnapshot(input: {
+    recordId: string;
+    captureId: string;
+    sourcePath: string;
+    content: string;
+    beforeMissing: boolean;
+  }): Promise<SubmitResult> {
+    const pendingKey = `capture:${input.captureId}`;
+    const existing = this.pending.get(pendingKey);
+    if (existing !== undefined) return existing;
+    if (this.pending.size >= this.queueCapacity) {
+      return Promise.resolve(responseFailure(input.recordId, "QUEUE_EXHAUSTED", "Recorder queue capacity is exhausted", 0));
+    }
+    const endpoint = new URL(this.endpoint);
+    endpoint.pathname = `${endpoint.pathname.replace(/\/$/, "")}/${encodeURIComponent(input.recordId)}/automatic-snapshot`;
+    endpoint.search = "";
+    endpoint.hash = "";
+    const operation = this.postWithRetry(input.recordId, endpoint.toString(), {
+      capture_id: input.captureId,
+      source_path: input.sourcePath,
+      content: input.content,
+      before_missing: input.beforeMissing,
+    }, true).finally(() => {
+      if (this.pending.get(pendingKey) === operation) this.pending.delete(pendingKey);
+    });
+    this.pending.set(pendingKey, operation);
+    return operation;
+  }
+
+  private async postWithRetry(recordId: string, endpoint: string, body: unknown, preserveServerFailure = false): Promise<SubmitResult> {
     const startedAt = Date.now();
     let attempts = 0;
     let lastFailure: SubmitFailure | undefined;
+    let lastServerFailure: SubmitFailure | undefined;
     while (attempts < this.maxAttempts && Date.now() - startedAt <= this.maxRetryDurationMs) {
       attempts += 1;
       try {
@@ -159,45 +190,53 @@ export class RecorderBridge implements AdapterBridge {
         if (token.length === 0) throw new Error("Recorder token file is empty");
         const remaining = this.maxRetryDurationMs - (Date.now() - startedAt);
         if (remaining <= 0) break;
-        const { response, body } = await requestWithTimeout(this.fetchImpl, this.endpoint, {
+        const { response, body: responseBody } = await requestWithTimeout(this.fetchImpl, endpoint, {
           method: "POST",
           headers: {
             authorization: `Bearer ${token}`,
             "content-type": "application/json",
           },
-          body: JSON.stringify(record),
+          body: JSON.stringify(body),
         }, remaining);
         if (response.ok) {
-          if (typeof body !== "object" || body === null || Array.isArray(body) || (body as Record<string, unknown>).success !== true) {
-            return responseFailure(record.record_id, "RECORDER_PROTOCOL_ERROR", "Recorder returned an invalid success envelope", attempts, response.status);
+          if (typeof responseBody !== "object" || responseBody === null || Array.isArray(responseBody) || (responseBody as Record<string, unknown>).success !== true) {
+            const detail = responseErrorBody(responseBody);
+            if (preserveServerFailure && (detail.code !== undefined || detail.message !== undefined)) {
+              return responseFailure(recordId, detail.code ?? "RECORDER_PROTOCOL_ERROR", detail.message ?? "Recorder returned an invalid success envelope", attempts, response.status);
+            }
+            return responseFailure(recordId, "RECORDER_PROTOCOL_ERROR", "Recorder returned an invalid success envelope", attempts, response.status);
           }
           return {
             success: true,
             status: response.status,
             duplicate: response.status === 200,
-            recordId: record.record_id,
+            recordId,
           };
         }
-        const detail = responseErrorBody(body);
+        const detail = responseErrorBody(responseBody);
         const failure = responseFailure(
-          record.record_id,
+          recordId,
           detail.code ?? (retryableStatus(response.status) ? "RECORDER_UNAVAILABLE" : "RECORDER_ERROR"),
           detail.message ?? `Recorder returned HTTP ${response.status}`,
           attempts,
           response.status,
         );
         lastFailure = failure;
+        lastServerFailure = failure;
         if (!retryableStatus(response.status)) return failure;
       } catch (error) {
-        lastFailure = responseFailure(record.record_id, "RECORDER_UNAVAILABLE", error instanceof Error ? error.message : String(error), attempts);
+        lastFailure = responseFailure(recordId, "RECORDER_UNAVAILABLE", error instanceof Error ? error.message : String(error), attempts);
       }
       const elapsed = Date.now() - startedAt;
       if (attempts >= this.maxAttempts || elapsed >= this.maxRetryDurationMs) break;
       const delay = Math.min(this.maxRetryDelayMs, this.retryBaseDelayMs * 2 ** (attempts - 1), this.maxRetryDurationMs - elapsed);
       await sleep(delay);
     }
+    if (preserveServerFailure && lastServerFailure !== undefined) {
+      return { ...lastServerFailure, attempts };
+    }
     return responseFailure(
-      record.record_id,
+      recordId,
       lastFailure?.code === "RECORDER_ERROR" ? "RECORDER_ERROR" : "RECORDER_UNAVAILABLE",
       "Recorder unavailable after bounded retries",
       attempts,

@@ -36,15 +36,14 @@ const decision: DecisionRecordInput = {
 };
 
 describe("RecordService", () => {
-  test("validates before persistence and returns the existing row for duplicate submissions", async () => {
+  test("validates before persistence and rejects conflicting duplicate submissions", async () => {
     const db = new Database(":memory:");
     const store = new RecordStore(db);
     await store.createSession(session);
     const service = new RecordService(store);
 
     const first = await service.record(decision);
-    const duplicate = await service.record({ ...decision, judgment: "ignored" });
-    expect(duplicate).toEqual(first);
+    await expect(service.record({ ...decision, judgment: "ignored" })).rejects.toMatchObject({ code: "DUPLICATE_RECORD" });
 
     await expect(service.record({ ...decision, judgment: "x".repeat(MAX_TEXT_FIELD_LENGTH + 1) })).rejects.toThrow();
     expect(await store.getDecision(decision.record_id)).toEqual(first);

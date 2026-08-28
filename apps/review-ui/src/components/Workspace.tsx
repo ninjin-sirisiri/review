@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { FileDiff } from "../../../../packages/contracts/src/index";
-import type { ReviewApiError, DecisionRecordDetail, UserDisposition } from "../api";
+import type { ReviewApiError, DecisionRecordDetail, SnapshotDiff, UserDisposition } from "../api";
 import type { FileTreeNode } from "../lib/file-tree";
 import type { DecisionAnchor, BlockSelection } from "../lib/decision-index";
 import type { JudgmentEntry } from "./JudgmentPanel";
@@ -24,6 +24,12 @@ export interface WorkspaceProps {
   onFileRetry: () => void;
   judgments: JudgmentEntry[];
   anchors: DecisionAnchor[];
+  transitionAnchors: DecisionAnchor[];
+  selectedRecordId: string | null;
+  onSelectJudgment: (recordId: string) => void;
+  snapshotDiff: SnapshotDiff | null;
+  snapshotDiffLoading: boolean;
+  snapshotDiffError: ReviewApiError | Error | null;
   onDispositionChange: (recordId: string, disposition: UserDisposition) => Promise<DecisionRecordDetail>;
   onJudgmentRetry: (recordId: string) => void;
 }
@@ -44,6 +50,12 @@ export function Workspace(props: WorkspaceProps) {
     onFileRetry,
     judgments,
     anchors,
+    transitionAnchors,
+    selectedRecordId,
+    onSelectJudgment,
+    snapshotDiff,
+    snapshotDiffLoading,
+    snapshotDiffError,
     onDispositionChange,
     onJudgmentRetry,
   } = props;
@@ -51,10 +63,11 @@ export function Workspace(props: WorkspaceProps) {
   const [selectedBlock, setSelectedBlock] = useState<BlockSelection | null>(null);
   const [navigateTo, setNavigateTo] = useState<{ line: number; token: number } | null>(null);
   const navigationToken = useRef(0);
+  const transitionActive = snapshotDiff !== null || snapshotDiffLoading || snapshotDiffError !== null;
 
   useEffect(() => {
     setSelectedBlock(null);
-  }, [selectedPath]);
+  }, [selectedPath, selectedRecordId, snapshotDiff, snapshotDiffLoading, snapshotDiffError]);
 
   function handleTargetClick(path: string, line: number) {
     if (path !== selectedPath) return;
@@ -79,6 +92,10 @@ export function Workspace(props: WorkspaceProps) {
         baseMissing={fileBaseMissing}
         diff={diff}
         anchors={anchors}
+        transitionAnchors={transitionAnchors}
+        snapshotDiff={snapshotDiff}
+        snapshotDiffLoading={snapshotDiffLoading}
+        snapshotDiffError={snapshotDiffError}
         selectedBlock={selectedBlock}
         onSelectBlock={setSelectedBlock}
         fullText={fullText}
@@ -88,6 +105,9 @@ export function Workspace(props: WorkspaceProps) {
       <JudgmentPanel
         path={selectedPath}
         entries={judgments}
+        transitionActive={transitionActive}
+        selectedRecordId={selectedRecordId}
+        onSelectJudgment={onSelectJudgment}
         selectedBlock={selectedBlock}
         onSelectBlock={setSelectedBlock}
         onDispositionChange={onDispositionChange}

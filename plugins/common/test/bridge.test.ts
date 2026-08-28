@@ -59,6 +59,162 @@ describe("host adapter mapper", () => {
 });
 
 describe("RecorderBridge", () => {
+  test("posts an automatic snapshot to the record-specific endpoint", async () => {
+    const requests: Request[] = [];
+    const bridge = new RecorderBridge({
+      endpoint: "http://127.0.0.1:4318/v1/decision-records",
+      tokenPath: await tokenFile(),
+      fetchImpl: async (input, init) => {
+        requests.push(new Request(input, init));
+        return response(201, { success: true, data: { snapshot_id: "snapshot-1" } });
+      },
+    });
+
+    const result = await bridge.captureAutomaticSnapshot({
+      recordId: "record-1",
+      captureId: "capture-1",
+      sourcePath: "src/a.ts",
+      content: "before\n",
+      beforeMissing: false,
+    });
+
+    expect(result.success).toBe(true);
+    expect(new URL(requests[0]!.url).pathname).toBe("/v1/decision-records/record-1/automatic-snapshot");
+    expect(requests[0]!.headers.get("authorization")).toBe("Bearer owner-token");
+    expect(await requests[0]!.json()).toEqual({
+      capture_id: "capture-1",
+      source_path: "src/a.ts",
+      content: "before\n",
+      before_missing: false,
+    });
+  });
+
+  test("retries automatic snapshot requests within the existing bounded policy", async () => {
+    let calls = 0;
+    const bridge = new RecorderBridge({
+      endpoint: "http://127.0.0.1:4318/v1/decision-records",
+      tokenPath: await tokenFile(),
+      maxAttempts: 2,
+      retryBaseDelayMs: 0,
+      fetchImpl: async () => {
+        calls += 1;
+        return calls === 1
+          ? response(503, { success: false, error: { code: "SOURCE_UNAVAILABLE", message: "try again" } })
+          : response(201, { success: true, data: { snapshot_id: "snapshot-2" } });
+      },
+    });
+
+    const result = await bridge.captureAutomaticSnapshot({
+      recordId: "record-2",
+      captureId: "capture-2",
+      sourcePath: "src/a.ts",
+      content: "before\n",
+      beforeMissing: false,
+    });
+
+    expect(result.success).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  test("preserves the exact server failure after automatic snapshot retry exhaustion", async () => {
+    let calls = 0;
+    const message = "automatic snapshot service is unavailable";
+    const bridge = new RecorderBridge({
+      endpoint: "http://127.0.0.1:4318/v1/decision-records",
+      tokenPath: await tokenFile(),
+      maxAttempts: 2,
+      retryBaseDelayMs: 0,
+      fetchImpl: async () => {
+        calls += 1;
+        return response(503, { success: false, error: { code: "SOURCE_UNAVAILABLE", message } });
+      },
+    });
+
+    const result = await bridge.captureAutomaticSnapshot({
+      recordId: "record-2b",
+      captureId: "capture-2b",
+      sourcePath: "src/a.ts",
+      content: "before\n",
+      beforeMissing: false,
+    });
+
+    expect(result).toMatchObject({ success: false, code: "SOURCE_UNAVAILABLE", message, error: message, attempts: 2, status: 503 });
+    expect(calls).toBe(2);
+  });
+
+  test("preserves an explicit failure envelope returned with a 2xx status", async () => {
+    const message = "automatic snapshot was rejected";
+    const bridge = new RecorderBridge({
+      endpoint: "http://127.0.0.1:4318/v1/decision-records",
+      tokenPath: await tokenFile(),
+      fetchImpl: async () => response(200, { success: false, error: { code: "HASH_MISMATCH", message } }),
+    });
+
+    const result = await bridge.captureAutomaticSnapshot({
+      recordId: "record-2c",
+      captureId: "capture-2c",
+      sourcePath: "src/a.ts",
+      content: "before\n",
+      beforeMissing: false,
+    });
+
+    expect(result).toMatchObject({ success: false, code: "HASH_MISMATCH", message, error: message, status: 200 });
+  });
+
+  test("returns the exact non-retryable automatic snapshot failure without leaking the token", async () => {
+    const message = "automatic snapshot content does not match the current target state";
+    const bridge = new RecorderBridge({
+      endpoint: "http://127.0.0.1:4318/v1/decision-records",
+      tokenPath: await tokenFile(),
+      fetchImpl: async (_input, init) => {
+        expect(String(init?.body)).not.toContain("owner-token");
+        return response(422, { success: false, error: { code: "HASH_MISMATCH", message } });
+      },
+    });
+
+    const result = await bridge.captureAutomaticSnapshot({
+      recordId: "record-3",
+      captureId: "capture-3",
+      sourcePath: "src/a.ts",
+      content: "before\n",
+      beforeMissing: false,
+    });
+
+    expect(result).toMatchObject({ success: false, code: "HASH_MISMATCH", message });
+  });
+
+  test("deduplicates concurrent automatic snapshot calls by capture ID", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let calls = 0;
+    const bridge = new RecorderBridge({
+      endpoint: "http://127.0.0.1:4318/v1/decision-records",
+      tokenPath: await tokenFile(),
+      fetchImpl: async () => {
+        calls += 1;
+        entered.resolve();
+        await release.promise;
+        return response(201, { success: true, data: { snapshot_id: "snapshot-4" } });
+      },
+    });
+    const input = {
+      recordId: "record-4",
+      captureId: "capture-4",
+      sourcePath: "src/a.ts",
+      content: "before\n",
+      beforeMissing: false,
+    };
+
+    const first = bridge.captureAutomaticSnapshot(input);
+    await entered.promise;
+    const second = bridge.captureAutomaticSnapshot(input);
+    release.resolve();
+
+    const results = await Promise.all([first, second]);
+    expect(results[0]).toEqual(results[1]);
+    expect(calls).toBe(1);
+  });
+
   test("submits with a token read from the configured token file", async () => {
     const path = await tokenFile();
     let request: Request | undefined;
