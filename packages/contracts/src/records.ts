@@ -1,4 +1,9 @@
-export type AgentType = "claude-code" | "codex" | "opencode";
+export const AGENT_TYPES = ["claude-code", "codex", "opencode", "cursor"] as const;
+export type AgentType = (typeof AGENT_TYPES)[number];
+
+export function isAgentType(value: unknown): value is AgentType {
+  return typeof value === "string" && (AGENT_TYPES as readonly string[]).includes(value);
+}
 
 export type RevisionRef =
   | { kind: "commit"; sha: string }

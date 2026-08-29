@@ -1,0 +1,17 @@
+{
+  "name": "ai-code-review-local",
+  "owner": {
+    "name": "AI Code Review Evidence"
+  },
+  "metadata": {
+    "description": "Local AI-generated code review evidence tooling"
+  },
+  "plugins": [
+    {
+      "name": "ai-code-review-cursor",
+      "source": "plugins/cursor",
+      "description": "Records pre-edit judgments and sends structured review evidence to the local Recorder",
+      "version": "0.2.0"
+    }
+  ]
+}

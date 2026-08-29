@@ -1,0 +1,12 @@
+{
+  "name": "ai-code-review-cursor",
+  "displayName": "AI Code Review Evidence",
+  "description": "Records pre-edit judgments and sends structured Cursor review evidence to a local Recorder",
+  "version": "0.2.0",
+  "author": {
+    "name": "AI Code Review Evidence"
+  },
+  "keywords": ["review", "evidence", "judgment", "hooks"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

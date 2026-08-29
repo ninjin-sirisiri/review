@@ -6,7 +6,7 @@ import {
   RecorderSetupError,
   defaultSetupTokenPath,
 } from "../../../plugins/common/src/recorder-setup";
-import type { AgentType, ReviewSession } from "../../../packages/contracts/src/index";
+import { isAgentType, type AgentType, type ReviewSession } from "../../../packages/contracts/src/index";
 
 export interface SetupCliOptions {
   root?: string;
@@ -35,7 +35,7 @@ Register the current repository and session with the local Recorder.
 Options:
   --root <path>       Repository root (default: current directory)
   --session-id <id>   Host session ID (default: AI_REVIEW_SESSION_ID or UUID)
-  --agent-type <type> claude-code, codex, or opencode (default: claude-code)
+  --agent-type <type> claude-code, codex, opencode, or cursor (default: claude-code)
   --recorder-url <url> Loopback Recorder decision endpoint
   --token-path <path> Token file path
   -h, --help          Show this help
@@ -47,12 +47,9 @@ function optionValue(args: string[], index: number, flag: string): { value: stri
   return { value, nextIndex: index + 1 };
 }
 
-const AGENT_TYPES: readonly AgentType[] = ["claude-code", "codex", "opencode"];
-
 function agentType(value: string): AgentType {
-  const match = AGENT_TYPES.find((type) => type === value);
-  if (match === undefined) throw new Error("--agent-type must be claude-code, codex, or opencode");
-  return match;
+  if (!isAgentType(value)) throw new Error("--agent-type must be claude-code, codex, opencode, or cursor");
+  return value;
 }
 
 export function parseSetupCliArgs(args: string[]): SetupCliOptions {
@@ -121,7 +118,7 @@ export async function setupRecorder(options: SetupCliOptions = {}, client?: Setu
   const sessionId = options.sessionId ?? process.env.AI_REVIEW_SESSION_ID ?? randomUUID();
   const sessionGenerated = options.sessionId === undefined && process.env.AI_REVIEW_SESSION_ID === undefined;
   const envAgentType = process.env.AI_REVIEW_AGENT_TYPE;
-  const type = options.agentType ?? (envAgentType === "codex" || envAgentType === "opencode" ? envAgentType : "claude-code");
+  const type = options.agentType ?? (isAgentType(envAgentType) ? envAgentType : "claude-code");
   const setupClient = client ?? new RecorderSetupClient({
     ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
     ...(options.tokenPath === undefined ? {} : { tokenPath: options.tokenPath }),

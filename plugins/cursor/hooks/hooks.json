@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "./bin/ai-review-session-start",
+        "timeout": 5
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "./bin/ai-review-pre-edit",
+        "matcher": "Write|StrReplace|ApplyPatch|Delete|EditNotebook|MultiEdit|Edit",
+        "timeout": 10,
+        "failClosed": true
+      },
+      {
+        "command": "./bin/ai-review-pre-edit",
+        "matcher": "Shell",
+        "timeout": 10,
+        "failClosed": true
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "./bin/ai-review-pre-edit",
+        "timeout": 10,
+        "failClosed": true
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "./bin/ai-review-post-edit",
+        "matcher": "Write|StrReplace|ApplyPatch|Delete|EditNotebook|MultiEdit|Edit",
+        "timeout": 10
+      }
+    ]
+  }
+}

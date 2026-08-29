@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 interface Migration {
   readonly sql: string;
@@ -11,7 +11,7 @@ interface Migration {
   readonly withoutForeignKeys?: boolean;
 }
 
-const AGENT_CHECK = "agent_type TEXT NOT NULL CHECK (agent_type IN ('claude-code', 'codex', 'opencode'))";
+const AGENT_CHECK = "agent_type TEXT NOT NULL CHECK (agent_type IN ('claude-code', 'codex', 'opencode', 'cursor'))";
 
 const MIGRATIONS: readonly Migration[] = [
   {
@@ -200,6 +200,54 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE UNIQUE INDEX snapshots_storage_path_unique ON snapshots(path) WHERE path <> '';
       CREATE UNIQUE INDEX snapshots_capture_id_unique ON snapshots(capture_id) WHERE capture_id IS NOT NULL;
       CREATE UNIQUE INDEX snapshots_capture_sequence_unique ON snapshots(capture_sequence) WHERE capture_sequence IS NOT NULL;
+      PRAGMA foreign_key_check;
+    `,
+  },
+  {
+    // Rebuild the two tables carrying an agent_type CHECK constraint so databases
+    // created before cursor support accept the new value (SQLite cannot alter
+    // a CHECK constraint in place).
+    withoutForeignKeys: true,
+    sql: `
+      CREATE TABLE sessions_rebuilt (
+        session_id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        ${AGENT_CHECK},
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'failed'))
+      );
+      INSERT INTO sessions_rebuilt (session_id, repository_id, agent_type, started_at, ended_at, status)
+        SELECT session_id, repository_id, agent_type, started_at, ended_at, status FROM sessions;
+      DROP TABLE sessions;
+      ALTER TABLE sessions_rebuilt RENAME TO sessions;
+
+      CREATE TABLE decision_records_rebuilt (
+        decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_id TEXT NOT NULL UNIQUE,
+        session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+        repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        ${AGENT_CHECK},
+        revision_kind TEXT NOT NULL CHECK (revision_kind IN ('commit', 'working-tree')),
+        revision_value TEXT NOT NULL,
+        judgment TEXT NOT NULL,
+        rationale TEXT NOT NULL,
+        checks_json TEXT NOT NULL,
+        open_questions_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        user_disposition TEXT NOT NULL CHECK (user_disposition IN ('unreviewed', 'accepted', 'rejected'))
+      );
+      INSERT INTO decision_records_rebuilt (
+        decision_id, record_id, session_id, repository_id, agent_type, revision_kind,
+        revision_value, judgment, rationale, checks_json, open_questions_json, created_at, user_disposition
+      )
+        SELECT
+          decision_id, record_id, session_id, repository_id, agent_type, revision_kind,
+          revision_value, judgment, rationale, checks_json, open_questions_json, created_at, user_disposition
+        FROM decision_records;
+      DROP TABLE decision_records;
+      ALTER TABLE decision_records_rebuilt RENAME TO decision_records;
+
       PRAGMA foreign_key_check;
     `,
   },

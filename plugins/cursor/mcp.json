@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ai-code-review": {
+      "command": "bun",
+      "args": ["${CURSOR_PLUGIN_ROOT}/bin/adapter.mjs", "mcp"]
+    }
+  }
+}

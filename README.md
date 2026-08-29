@@ -4,7 +4,7 @@ AIコーディングエージェントが行った判断を、実ファイル・
 
 ## できること
 
-- Claude Code／Codexの判断記録を共通形式へ変換
+- Claude Code／Codex／OpenCode／Cursorの判断記録を共通形式へ変換
 - 判断をファイル、行範囲、コミット、content hashへ関連付け
 - AIの判断、根拠、確認結果、未確認事項をタイムラインで表示
 - `accepted`／`rejected`／`unreviewed` の人間側レビュー状態を保存
@@ -193,7 +193,7 @@ curl -sS -X POST http://127.0.0.1:4318/v1/sessions \
   }"
 ```
 
-`agent_type`は`claude-code`、`codex`、`opencode`のいずれかです。Recorderはsessionとrepositoryの整合性を判断記録の保存前に検証します。
+`agent_type`は`claude-code`、`codex`、`opencode`、`cursor`のいずれかです。Recorderはsessionとrepositoryの整合性を判断記録の保存前に検証します。
 
 ### 判断記録を保存
 
@@ -403,7 +403,7 @@ GET /v1/decision-records/<recordId>/snapshot-diff?path=src/example.ts
 
 遷移のどちらかのsnapshotを検証できない場合は、HTTP成功レスポンス内の`data.state`を`source-unavailable`または`revision-not-found`として返します。これは表示上の失敗状態であり、現在の作業ツリーを代わりに返すものではありません。
 
-## Claude Code／Codex／OpenCodeアダプター
+## Claude Code／Codex／OpenCode／Cursorアダプター
 
 アダプターはJSONLを標準入力から受け取り、1行につき1件の結果を標準出力へ返します。
 
@@ -473,6 +473,34 @@ Recorderが停止していてもゲートは閉じたまま fail-closed で動�
 
 OpenCodeの`edit`／`write`もClaude Codeの`Edit`／`Write`と同様に、許可前に編集前automatic snapshotを保存します。Recorderへのautomatic captureが成功しない限り、どちらのプラグインも編集を通しません。手動の`/snapshot`操作やアダプターからのJSONL判断記録だけでは、この遷移用captureは作成されません。
 
+### Cursorプラグイン
+
+Cursor用のプラグインは`plugins/cursor/`です。Cursor Plugins形式（`.cursor-plugin/plugin.json`）で、hooks・skill・MCP toolを同梱します。bundleを更新した場合は先に再生成します。
+
+```bash
+bun run build:cursor-plugin
+```
+
+このリポジトリはプロジェクトhook（`.cursor/hooks.json`）を同梱します。Cursorは信頼済みworkspaceでこれを自動読み込みするため、プラグインをCustomizeで有効化しなくても編集ゲートは発火します。Cloud agentもプロジェクトhookだけを拾います。
+
+MCP tool `review_record_judgment` とskillが必要な場合は、ローカルmarketplaceを追加するか、次でプラグインを読み込みます。
+
+```bash
+ln -s "$PWD/plugins/cursor" ~/.cursor/plugins/local/ai-code-review-cursor
+```
+
+プラグイン導入後はCursorを再起動し、Pluginsで`ai-code-review-cursor`が有効であることを確認してください。ゲート自体は次の動作をします。
+
+- `sessionStart` hookがworkspaceをrepositoryとしてRecorderへ自動登録する（agent_typeは`cursor`）。登録結果は後続hook向けに`AI_REVIEW_SESSION_ID`、`AI_REVIEW_REPOSITORY_ROOT`、`AI_REVIEW_AGENT_TYPE=cursor`として返す。Cloud agentは`sessionStart`を実行しないため、初回のgate対象tool呼び出し時にも登録を試みる
+- `preToolUse`が`Write`／`StrReplace`／`ApplyPatch`／`Delete`（およびノートブック編集）を、対象ファイルの現在hashに一致する判断記録が先に保存されていない限り拒否する（`failClosed: true`）
+- `beforeShellExecution`および`preToolUse`の`Shell`で、明らかなファイル変更コマンド（リダイレクト、`sed -i`、`git checkout`等）も拒否し、組み込みの`Write`／`StrReplace`へ戻す
+- 同梱MCP tool `review_record_judgment` で判断を記録し、対象path・現在content hash・セッションに結び付いた1回使い切りのpermitを発行する
+- 許可前に編集前automatic snapshotを保存する。Recorderへのautomatic captureが成功しない限り編集を通さない
+
+編集の流れはOpenCodeプラグインと同じです。まず`review_record_judgment`を呼び、`"success":true`を受け取った後だけ同じ対象へ`Write`／`StrReplace`を呼びます。permitは一致する1回の編集で消費され、hash変化・別ファイル・期限切れの場合は再記録が必要です。
+
+Recorderが停止していてもゲートは閉じたまま fail-closed で動作します。`sessionStart`の登録失敗はstderrへ警告しますが、Cursorへはsession envを返すため後続hookがセッションIDを使えます。
+
 ### JSONL入力形式
 
 ```json
@@ -522,9 +550,15 @@ OpenCode:
 printf '%s\n' '<JSONL入力>' | bun plugins/opencode/src/index.ts
 ```
 
+Cursor:
+
+```bash
+printf '%s\n' '<JSONL入力>' | bun plugins/cursor/src/index.ts
+```
+
 プラグイン未インストールの開発時だけ、bundle生成前のsource entrypointを直接実行できます。
 
-ホスト側のhookやイベントからJSONLをアダプターへ接続する設定は、利用するClaude Code／Codex環境側で行います。アダプターはリポジトリを直接読み取らず、判断記録だけをRecorderへ送ります。
+ホスト側のhookやイベントからJSONLをアダプターへ接続する設定は、利用するClaude Code／Codex／Cursor環境側で行います。アダプターはリポジトリを直接読み取らず、判断記録だけをRecorderへ送ります。
 
 ### アダプターの制約
 
@@ -547,10 +581,10 @@ printf '%s\n' '<JSONL入力>' | bun plugins/opencode/src/index.ts
 Recorder起動
   → pluginを有効化してホストを再起動
   → SessionStartがrepository/sessionを自動登録
-  → AIがai-review-recordを実行
+  → AIがai-review-record（Cursorでは review_record_judgment）を実行
   → 判断記録をRecorderへ保存
   → 対象hashに紐づく1回限りの編集permitを発行
-  → Edit／Writeを許可
+  → Edit／Write（Cursorでは Write／StrReplace）を許可
 ```
 
 `SessionStart` hookはrepository IDやtoken自体を生成しませんが、Recorderへrepositoryとsessionを自動登録します。設定される環境変数は次のとおりです。
@@ -621,6 +655,15 @@ ai-code-review-claude@ai-code-review-local (0.2.0) (user)
 ```
 
 インストール後はClaude Code／OMPを再起動してください。`omp plugin install ./plugins/claude-code`はnpm/extension packageとして扱われ、`package.json`がないため使用できません。ローカルmarketplace経由でインストールします。
+
+Cursor:
+
+```bash
+bun run build:cursor-plugin
+ln -s "$PWD/plugins/cursor" ~/.cursor/plugins/local/ai-code-review-cursor
+```
+
+このリポジトリでは`.cursor/hooks.json`が編集ゲートを読み込むため、プラグイン未導入でも`preToolUse`／`beforeShellExecution`は発火します。MCP toolとskillを使う場合はCursorを再起動し、Pluginsで`ai-code-review-cursor`が有効であることを確認します。
 
 ### 4. SessionStartの自動登録
 
@@ -728,7 +771,7 @@ omp plugin list
 
 この構成は、AIの判断をhookが勝手に生成して全編集を無条件に記録する仕組みではありません。AIが`ai-review-record`で判断・根拠・対象を明示し、hookがその記録済みpermitを検証してから編集を許可します。
 
-そのため、repository IDとtokenだけを設定しても記録は始まりません。Recorder、repository、session、plugin、`ai-review-record`の5つがそろって初めて編集前記録が機能します。
+そのため、repository IDとtokenだけを設定しても記録は始まりません。Recorder、repository、session、plugin、判断記録コマンド（`ai-review-record`または`review_record_judgment`）の5つがそろって初めて編集前記録が機能します。
 
 ## セキュリティとデータ境界
 
@@ -790,6 +833,7 @@ plugins/common/           共通JSONL mapper／Recorder bridge
 plugins/claude-code/      Claude Code adapter
 plugins/codex/            Codex adapter
 plugins/opencode/         OpenCode plugin（判断ゲート＋record tool）
+plugins/cursor/           Cursor plugin（hooks＋MCP review_record_judgment）
 tests/e2e/                 Playwright workflow／security tests
 docs/superpowers/         設計仕様と実装計画
 ```

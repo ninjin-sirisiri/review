@@ -19,6 +19,7 @@ test("parseSetupCliArgs parses explicit setup options", () => {
     endpoint: "http://127.0.0.1:4318/v1/decision-records",
     tokenPath: "/tmp/token",
   });
+  expect(parseSetupCliArgs(["--agent-type", "cursor"]).agentType).toBe("cursor");
 });
 
 test("parseSetupCliArgs rejects unknown flags and missing values", () => {

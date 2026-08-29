@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Local-first evidence tool for reviewing decisions made by AI coding agents (Claude Code / Codex). Agent judgments are recorded as *decision records* bound to files, line ranges, git revisions, and content hashes; a local Recorder API stores them in SQLite and a React Review UI renders them as a reviewable timeline. It is a recording/review platform, not a security scanner. User-facing docs (README) are Japanese; code and comments are English.
+Local-first evidence tool for reviewing decisions made by AI coding agents (Claude Code / Codex / OpenCode / Cursor). Agent judgments are recorded as *decision records* bound to files, line ranges, git revisions, and content hashes; a local Recorder API stores them in SQLite and a React Review UI renders them as a reviewable timeline. It is a recording/review platform, not a security scanner. User-facing docs (README) are Japanese; code and comments are English.
 
 ## Commands
 
@@ -15,6 +15,7 @@ bun run test                 # ALL tests: bun test (contracts, recorder, plugins
 bun run e2e                  # builds review-ui, then runs Playwright against tests/e2e
 bun run build                # build contracts bundle to dist/
 bun run build:claude-plugin  # rebuild plugins/claude-code/bin/adapter.mjs after plugin source changes
+bun run build:cursor-plugin  # rebuild plugins/cursor/bin/adapter.mjs after plugin source changes
 bun run dev                  # recorder in watch mode
 
 # Recorder server (binds 127.0.0.1 only); build the UI before serving it
@@ -39,8 +40,8 @@ Test placement follows the runner: bun tests live in `packages/*/test`, `apps/re
 Bun workspaces monorepo (`packages/*`, `apps/*`, `plugins/*`). The pipeline:
 
 ```
-AI agent session (Claude Code / Codex / OpenCode)
-  → adapter (plugins/claude-code | plugins/codex) reads JSONL judgment input on stdin
+AI agent session (Claude Code / Codex / OpenCode / Cursor)
+  → adapter (plugins/claude-code | plugins/codex | plugins/opencode | plugins/cursor) reads JSONL judgment input on stdin
   → plugins/common maps it to contracts' DecisionRecordInput and POSTs to Recorder
   → Recorder validates via packages/contracts, persists to SQLite
   → Review UI (React 19 + Vite) fetches the timeline over the loopback /v1 API
@@ -52,7 +53,7 @@ AI agent session (Claude Code / Codex / OpenCode)
 - `apps/recorder` — the only stateful service: HTTP server (`src/http/server.ts`), owner-token auth, repository registration/validation, SQLite store (`src/store`), source resolution (`src/source`: git.ts read-only git access, worktree.ts working-tree reads, resolve.ts revision/hash matching).
 - `apps/review-ui` — two-pane workspace: Explorer file tree with per-file decision-count badges, plus judgment/detail panes. Talks to Recorder over fetch only.
 - `plugins/common` — JSONL mapping, Recorder bridge (loopback-only endpoints enforced, bounded in-memory retry queue), decision gate, `recorder-setup`.
-- `plugins/claude-code` / `plugins/codex` / `plugins/opencode` — thin adapters over common; claude-code ships hooks + skills for edit gating, opencode ships a native plugin (session auto-registration, edit gate via `tool.execute.before`, built-in `review_record_judgment` tool). Plugin changes require `bun run build:claude-plugin` before reinstall (claude-code only).
+- `plugins/claude-code` / `plugins/codex` / `plugins/opencode` / `plugins/cursor` — thin adapters over common; claude-code ships hooks + skills for edit gating, opencode ships a native plugin (session auto-registration, edit gate via `tool.execute.before`, built-in `review_record_judgment` tool), cursor ships Cursor hooks (`preToolUse` / `beforeShellExecution` / `sessionStart`) plus an MCP `review_record_judgment` tool. This repository also ships `.cursor/hooks.json` so Cursor loads the same gate as project hooks without installing the plugin. Plugin changes require `bun run build:claude-plugin` or `bun run build:cursor-plugin` before reinstall.
 - `docs/superpowers/{specs,plans}` — design specs and implementation plans.
 
 ### Core domain concepts
@@ -67,7 +68,9 @@ AI agent session (Claude Code / Codex / OpenCode)
 
 The `ai-code-review-claude` plugin enforces judgment-before-edit for this repo's own development when installed: a `PreToolUse` hook rejects `Edit`/`Write` (and obvious shell-based mutations like heredoc redirections) unless a single-use **permit** exists, created by piping a judgment into `ai-review-record` beforehand. Permits bind to target path + current content hash + session and are consumed by one matching edit. When an edit is blocked, re-confirm the target's current state and record a fresh judgment — never work around it with Bash edits or temporary allow-lists.
 
-Session setup is automatic: the plugin's `SessionStart` hook registers repository/session with the Recorder and exports `AI_REVIEW_SESSION_ID`, `AI_REVIEW_REPOSITORY_ROOT`, `AI_REVIEW_AGENT_TYPE`. Manual fallback: `ai-review setup --root "$PWD" --agent-type claude-code`.
+The Cursor equivalent is `ai-code-review-cursor` (`plugins/cursor`) plus the committed `.cursor/hooks.json`. `preToolUse` / `beforeShellExecution` reject `Write`/`StrReplace`/`ApplyPatch`/`Delete` and shell mutations unless a matching permit exists. Record with the bundled MCP tool `review_record_judgment` (or `bun plugins/cursor/bin/adapter.mjs record`). Session setup is automatic via `sessionStart`, which exports `AI_REVIEW_SESSION_ID`, `AI_REVIEW_REPOSITORY_ROOT`, and `AI_REVIEW_AGENT_TYPE=cursor`. Manual fallback: `ai-review setup --root "$PWD" --agent-type cursor`.
+
+Session setup is automatic for Claude Code: the plugin's `SessionStart` hook registers repository/session with the Recorder and exports `AI_REVIEW_SESSION_ID`, `AI_REVIEW_REPOSITORY_ROOT`, `AI_REVIEW_AGENT_TYPE`. Manual fallback: `ai-review setup --root "$PWD" --agent-type claude-code`.
 
 ## Security invariants (preserve these in any change)
 

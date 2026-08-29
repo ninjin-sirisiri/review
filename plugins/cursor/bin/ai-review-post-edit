@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+if [ -z "${CURSOR_PLUGIN_ROOT:-}" ]; then
+  CURSOR_PLUGIN_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+fi
+export CURSOR_PLUGIN_ROOT
+exec bun "$CURSOR_PLUGIN_ROOT/bin/adapter.mjs" post-edit

@@ -119,6 +119,19 @@ describe("decision input validation", () => {
     if (result.success) expect(result.data.user_disposition).toBe(disposition);
   });
 
+  test("accepts the cursor agent type", () => {
+    const result = validateDecisionRecordInput(validInput({ agent_type: "cursor" }));
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.agent_type).toBe("cursor");
+    expect(validateReviewSession({
+      session_id: "session-001",
+      repository_id: "repo-001",
+      agent_type: "cursor",
+      started_at: "2026-08-20T00:00:00.000Z",
+      status: "active",
+    }).success).toBe(true);
+  });
+
   test("rejects a missing required field with INVALID_RECORD", () => {
     const input = validInput();
     delete (input as unknown as Record<string, unknown>).record_id;

@@ -9,8 +9,8 @@ import type {
   WorkingTreeEndpoint,
 } from "./api";
 import { ERROR_CODES } from "./api";
+import { AGENT_TYPES, type AgentType } from "./records";
 import type {
-  AgentType,
   CheckEvidence,
   DecisionRecord,
   DecisionRecordInput,
@@ -31,11 +31,7 @@ const DISPOSITIONS: Record<UserDisposition, true> = {
   accepted: true,
   rejected: true,
 };
-const AGENTS: Record<AgentType, true> = {
-  "claude-code": true,
-  codex: true,
-  opencode: true,
-};
+const AGENTS: Record<AgentType, true> = Object.fromEntries(AGENT_TYPES.map((type) => [type, true])) as Record<AgentType, true>;
 const CHECK_STATUSES: Record<CheckEvidence["status"], true> = {
   passed: true,
   failed: true,
@@ -288,7 +284,7 @@ export function validateDecisionRecordInput(value: unknown): ValidationResult<De
   if (requiredError) return requiredError;
 
   if (typeof value.agent_type !== "string" || !hasOwnKey(AGENTS, value.agent_type)) {
-    return invalid("agent_type must be claude-code, codex, or opencode", "agent_type");
+    return invalid("agent_type must be claude-code, codex, opencode, or cursor", "agent_type");
   }
   const revisionResult = validateRevisionRef(value.revision);
   if (!revisionResult.success) return revisionResult;

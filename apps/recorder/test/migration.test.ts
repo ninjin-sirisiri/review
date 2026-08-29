@@ -150,10 +150,10 @@ test("fresh databases accept every supported agent type", () => {
   try {
     migrateSchema(db);
     const version = db.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
-    expect(version.version).toBe(4);
+    expect(version.version).toBe(5);
 
     db.exec("INSERT INTO repositories (repository_id, root, created_at) VALUES ('repo-1', '/tmp/repo-1', '2026-08-24T00:00:00.000Z')");
-    for (const agentType of ["claude-code", "codex", "opencode"] as const) {
+    for (const agentType of ["claude-code", "codex", "opencode", "cursor"] as const) {
       db.query("INSERT INTO sessions (session_id, repository_id, agent_type, started_at, status) VALUES ($id, $repo, $agent, $started, $status)").run({
         $id: `session-${agentType}`,
         $repo: "repo-1",
@@ -162,7 +162,7 @@ test("fresh databases accept every supported agent type", () => {
         $status: "active",
       });
     }
-    expect((db.query("SELECT COUNT(*) AS count FROM sessions").get() as { count: number }).count).toBe(3);
+    expect((db.query("SELECT COUNT(*) AS count FROM sessions").get() as { count: number }).count).toBe(4);
   } finally {
     db.close();
   }
@@ -182,7 +182,7 @@ test("migrating a legacy database preserves rows and unlocks the opencode agent 
     migrateSchema(migrated);
 
     const version = migrated.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
-    expect(version.version).toBe(4);
+    expect(version.version).toBe(5);
 
     const legacySession = migrated.query("SELECT agent_type FROM sessions WHERE session_id = 'session-legacy'").get() as { agent_type: string };
     expect(legacySession.agent_type).toBe("codex");
@@ -205,6 +205,15 @@ test("migrating a legacy database preserves rows and unlocks the opencode agent 
     });
     const inserted = migrated.query("SELECT agent_type FROM sessions WHERE session_id = 'session-opencode'").get() as { agent_type: string };
     expect(inserted.agent_type).toBe("opencode");
+    migrated.query("INSERT INTO sessions (session_id, repository_id, agent_type, started_at, status) VALUES ($id, $repo, $agent, $started, $status)").run({
+      $id: "session-cursor",
+      $repo: "repo-1",
+      $agent: "cursor",
+      $started: "2026-08-29T00:00:00.000Z",
+      $status: "active",
+    });
+    const cursorInserted = migrated.query("SELECT agent_type FROM sessions WHERE session_id = 'session-cursor'").get() as { agent_type: string };
+    expect(cursorInserted.agent_type).toBe("cursor");
   } finally {
     migrated.close();
   }
@@ -275,7 +284,7 @@ test("migrating a legacy database rebuilds snapshots for git-backed rows", async
     migrateSchema(db);
 
     const version = db.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
-    expect(version.version).toBe(4);
+    expect(version.version).toBe(5);
 
     const row = db.query("SELECT snapshot_id FROM snapshots").get() as { snapshot_id: string } | null;
     expect(row?.snapshot_id).toBe("legacy-snapshot");

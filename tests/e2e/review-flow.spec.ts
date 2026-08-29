@@ -116,7 +116,7 @@ async function postJson(path: string, value: unknown): Promise<Response> {
   });
 }
 
-async function createSession(repository: FixtureRepository, agentType: "codex" | "claude-code"): Promise<ReviewSession> {
+async function createSession(repository: FixtureRepository, agentType: "codex" | "claude-code" | "cursor"): Promise<ReviewSession> {
   const session = {
     session_id: `session-${randomUUID()}`,
     repository_id: repository.repositoryId,
@@ -129,7 +129,7 @@ async function createSession(repository: FixtureRepository, agentType: "codex" |
   return (await response.json() as { success: true; data: ReviewSession }).data;
 }
 
-function eventFor(repository: FixtureRepository, sessionId: string, agentType: "codex" | "claude-code", recordId = `record-${randomUUID()}`) {
+function eventFor(repository: FixtureRepository, sessionId: string, agentType: "codex" | "claude-code" | "cursor", recordId = `record-${randomUUID()}`) {
   return {
     sessionId: sessionId,
     repositoryRoot: repository.root,
@@ -150,7 +150,7 @@ function eventFor(repository: FixtureRepository, sessionId: string, agentType: "
   };
 }
 
-async function runAdapter(agentType: "codex" | "claude-code", event: unknown, endpoint = app.url): Promise<{ result: Record<string, unknown>; exitCode: number; stderr: string }> {
+async function runAdapter(agentType: "codex" | "claude-code" | "cursor", event: unknown, endpoint = app.url): Promise<{ result: Record<string, unknown>; exitCode: number; stderr: string }> {
   const child = spawn("bun", [`plugins/${agentType}/src/index.ts`], {
     cwd: PROJECT_ROOT,
     env: {
@@ -259,7 +259,7 @@ test("reviews a decision through the explorer, accepts it, and flags a tampered 
 // 共有adaptersリポジトリに判断を1件追加するため、record数を数えるテストより前に置けない。
 
 test("submits both adapter fixtures through the common JSONL bridge", async () => {
-  for (const agentType of ["codex", "claude-code"] as const) {
+  for (const agentType of ["codex", "claude-code", "cursor"] as const) {
     const session = await createSession(adapters, agentType);
     const submission = await runAdapter(agentType, eventFor(adapters, session.session_id, agentType));
     expect(submission.exitCode, submission.stderr).toBe(0);
@@ -267,7 +267,7 @@ test("submits both adapter fixtures through the common JSONL bridge", async () =
   }
   const records = await apiRequest(`/v1/decision-records?repository_id=${adapters.repositoryId}`);
   expect(records.status).toBe(200);
-  expect((await records.json() as { data: DecisionRecordInput[] }).data).toHaveLength(2);
+  expect((await records.json() as { data: DecisionRecordInput[] }).data).toHaveLength(3);
 });
 
 test("keeps a failed Recorder submission non-blocking for the host adapter", async () => {
