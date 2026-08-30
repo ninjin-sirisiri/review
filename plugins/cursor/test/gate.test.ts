@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,6 +6,7 @@ import { afterAll, beforeEach, expect, test } from "bun:test";
 import { grantDecisionPermits, normalizeDecisionProposal, type AutomaticSnapshotBridge } from "../../common/src/decision-gate";
 import type { AdapterBridge, SubmitResult } from "../../common/src/adapter-contract";
 import type { RecorderSetupClient } from "../../common/src/recorder-setup";
+import type { ReviewSession } from "../../../packages/contracts/src/index";
 import {
   AGENT_TYPE,
   checkPostToolUse,
@@ -12,9 +14,31 @@ import {
   handleSessionStart,
   readBoundedStdin,
   recordDecision,
+  sessionStartOutput,
 } from "../src/gate";
 
-const GATED_ENV_KEYS = ["AI_REVIEW_SESSION_ID", "AI_REVIEW_REPOSITORY_ROOT", "AI_REVIEW_AGENT_TYPE", "AI_REVIEW_GATE_ROOT", "AI_REVIEW_CURSOR_SESSION_ROOT"];
+function passingSetupClient(): Pick<RecorderSetupClient, "ensureSession"> {
+  return {
+    ensureSession: async (root: string, session: ReviewSession) => ({
+      repository: { repository_id: "repository-setup", root, created_at: "2026-08-29T00:00:00.000Z" },
+      session,
+    }),
+  } as unknown as Pick<RecorderSetupClient, "ensureSession">;
+}
+
+function repositoryIdFor(root: string): string {
+  return createHash("sha256").update(root, "utf8").digest("hex");
+}
+
+const GATED_ENV_KEYS = [
+  "AI_REVIEW_SESSION_ID",
+  "AI_REVIEW_REPOSITORY_ROOT",
+  "AI_REVIEW_AGENT_TYPE",
+  "AI_REVIEW_GATE_ROOT",
+  "AI_REVIEW_CURSOR_SESSION_ROOT",
+  "CURSOR_PROJECT_DIR",
+  "CURSOR_PLUGIN_ROOT",
+];
 const preservedEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
@@ -311,6 +335,46 @@ test("sessionStart registers a cursor session and returns env for later hooks", 
   expect(result.additional_context).toContain("review_record_judgment");
 });
 
+test("sessionStart prefers workspace_roots over a plugin-directory cwd", async () => {
+  const current = await fixture();
+  const pluginCwd = await realpath(await mkdtemp(join(tmpdir(), "ai-review-plugin-cwd-")));
+  process.env.CURSOR_PLUGIN_ROOT = pluginCwd;
+
+  const result = await handleSessionStart({
+    session_id: "session-workspace-roots",
+    cwd: pluginCwd,
+    workspace_roots: [current.root],
+  }, { setupClient: passingSetupClient(), sessionStoreRoot: current.sessionStoreRoot });
+
+  expect(result.env.AI_REVIEW_REPOSITORY_ROOT).toBe(current.root);
+});
+
+test("sessionStart prefers CURSOR_PROJECT_DIR over a plugin-directory cwd", async () => {
+  const current = await fixture();
+  const pluginCwd = await realpath(await mkdtemp(join(tmpdir(), "ai-review-plugin-cwd-")));
+  process.env.CURSOR_PLUGIN_ROOT = pluginCwd;
+  process.env.CURSOR_PROJECT_DIR = current.root;
+
+  const result = await handleSessionStart({
+    conversation_id: "session-project-dir-root",
+    cwd: pluginCwd,
+  }, { setupClient: passingSetupClient(), sessionStoreRoot: current.sessionStoreRoot });
+
+  expect(result.env.AI_REVIEW_REPOSITORY_ROOT).toBe(current.root);
+});
+
+test("beforeSubmitPrompt session output continues the prompt after persisting", async () => {
+  const current = await fixture();
+  const result = await handleSessionStart({
+    hook_event_name: "beforeSubmitPrompt",
+    conversation_id: "session-submit",
+    workspace_roots: [current.root],
+  }, { setupClient: passingSetupClient(), sessionStoreRoot: current.sessionStoreRoot });
+
+  expect(sessionStartOutput({ hook_event_name: "beforeSubmitPrompt" }, result)).toEqual({ continue: true });
+  expect(sessionStartOutput({ hook_event_name: "sessionStart" }, result)).toEqual(result);
+});
+
 test("sessionStart still returns env when Recorder auto-registration fails", async () => {
   const current = await fixture();
   const setupClient = {
@@ -337,12 +401,7 @@ test("recordDecision can recover the persisted Cursor session when env is empty"
     session_id: "session-persisted",
     cwd: current.root,
   }, {
-    setupClient: {
-      ensureSession: async (root, session) => ({
-        repository: { repository_id: "repository-setup", root, created_at: "2026-08-29T00:00:00.000Z" },
-        session,
-      }),
-    } as unknown as Pick<RecorderSetupClient, "ensureSession">,
+    setupClient: passingSetupClient(),
     sessionStoreRoot: current.sessionStoreRoot,
   });
   const bridge: AdapterBridge = {
@@ -363,4 +422,112 @@ test("recordDecision can recover the persisted Cursor session when env is empty"
     tool_name: "Write",
     tool_input: { path: current.file },
   }, { gateRoot: current.gateRoot, bridge: successfulSnapshotBridge([]) })).toBeNull();
+});
+
+test("recordDecision recovers the persisted session from CURSOR_PROJECT_DIR when MCP env is empty", async () => {
+  const current = await fixture();
+  await handleSessionStart({
+    session_id: "session-project-dir",
+    cwd: current.root,
+  }, {
+    setupClient: passingSetupClient(),
+    sessionStoreRoot: current.sessionStoreRoot,
+  });
+  process.env.CURSOR_PROJECT_DIR = current.root;
+  const bridge: AdapterBridge = {
+    submit: async (record): Promise<SubmitResult> => {
+      expect(record.session_id).toBe("session-project-dir");
+      expect(record.repository_id).toBe(repositoryIdFor(current.root));
+      return { success: true, status: 201, duplicate: false, recordId: record.record_id };
+    },
+  };
+
+  const result = await recordDecision({
+    targets: [{ path: "src/change.ts", lineStart: 1 }],
+    judgment: "safe",
+    rationale: "checked",
+  }, { bridge, gateRoot: current.gateRoot, sessionStoreRoot: current.sessionStoreRoot });
+
+  expect(result.success).toBe(true);
+});
+
+test("recordDecision falls back to the latest persisted session when cwd is the plugin root", async () => {
+  const current = await fixture();
+  await handleSessionStart({
+    session_id: "session-latest",
+    cwd: current.root,
+  }, {
+    setupClient: passingSetupClient(),
+    sessionStoreRoot: current.sessionStoreRoot,
+  });
+  process.env.CURSOR_PLUGIN_ROOT = process.cwd();
+  const bridge: AdapterBridge = {
+    submit: async (record): Promise<SubmitResult> => {
+      expect(record.session_id).toBe("session-latest");
+      expect(record.repository_id).toBe(repositoryIdFor(current.root));
+      return { success: true, status: 201, duplicate: false, recordId: record.record_id };
+    },
+  };
+
+  const result = await recordDecision({
+    targets: [{ path: "src/change.ts", lineStart: 1 }],
+    judgment: "safe",
+    rationale: "checked",
+  }, { bridge, gateRoot: current.gateRoot, sessionStoreRoot: current.sessionStoreRoot });
+
+  expect(result.success).toBe(true);
+});
+
+test("recordDecision does not adopt a latest session from a different repository", async () => {
+  const current = await fixture();
+  const other = await fixture();
+  await handleSessionStart({
+    session_id: "session-foreign",
+    cwd: other.root,
+  }, {
+    setupClient: passingSetupClient(),
+    sessionStoreRoot: current.sessionStoreRoot,
+  });
+  process.env.CURSOR_PROJECT_DIR = current.root;
+
+  await expect(recordDecision({
+    targets: [{ path: "src/change.ts", lineStart: 1 }],
+    judgment: "safe",
+    rationale: "checked",
+  }, {
+    bridge: {
+      submit: async (): Promise<SubmitResult> => {
+        throw new Error("must not submit a mismatched session");
+      },
+    },
+    gateRoot: current.gateRoot,
+    sessionStoreRoot: current.sessionStoreRoot,
+  })).rejects.toThrow("sessionId is required; start the plugin session first");
+});
+
+test("recordDecision explains a Recorder that still rejects agent_type cursor", async () => {
+  const current = await fixture();
+  const bridge: AdapterBridge = {
+    submit: async (record): Promise<SubmitResult> => ({
+      success: false,
+      status: 422,
+      code: "INVALID_RECORD",
+      message: "agent_type must be claude-code, codex, or opencode",
+      error: "agent_type must be claude-code, codex, or opencode",
+      recordId: record.record_id,
+      attempts: 1,
+    }),
+  };
+
+  const result = await recordDecision({
+    repositoryRoot: current.root,
+    targets: [{ path: "src/change.ts", lineStart: 1 }],
+    judgment: "safe",
+    rationale: "checked",
+  }, { sessionId: "session-old-recorder", bridge, gateRoot: current.gateRoot });
+
+  expect(result.success).toBe(false);
+  expect(result.message).toContain("agent_type must be claude-code, codex, or opencode");
+  expect(result.message).toContain("restart Recorder");
+  expect(result.message).toContain("cursor");
 });

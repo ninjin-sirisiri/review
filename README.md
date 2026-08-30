@@ -489,17 +489,19 @@ MCP tool `review_record_judgment` とskillが必要な場合は、ローカルma
 ln -s "$PWD/plugins/cursor" ~/.cursor/plugins/local/ai-code-review-cursor
 ```
 
+特定のリポジトリだけに入れる場合は、実行ファイルをそのリポジトリの`.cursor/plugins/ai-code-review-cursor/`へコピーし、プロジェクトの`.cursor/hooks.json`と`.cursor/mcp.json`から参照します。コピーした`.cursor-plugin/plugin.json`からは`hooks`を外してください。残すとCursorがプラグイン同梱のfail-closedフックも読み、`./bin/ai-review-pre-edit`が削除済みの`~/.cursor/plugins/local/`などをcwdにして`spawn /bin/zsh ENOENT`で編集もShellも止まります。同梱hooksのcommandは`/bin/sh "${CURSOR_PLUGIN_ROOT}/bin/..."`です。CursorはこれをinstallPathで展開します。
+
 プラグイン導入後はCursorを再起動し、Pluginsで`ai-code-review-cursor`が有効であることを確認してください。ゲート自体は次の動作をします。
 
-- `sessionStart` hookがworkspaceをrepositoryとしてRecorderへ自動登録する（agent_typeは`cursor`）。登録結果は後続hook向けに`AI_REVIEW_SESSION_ID`、`AI_REVIEW_REPOSITORY_ROOT`、`AI_REVIEW_AGENT_TYPE=cursor`として返す。Cloud agentは`sessionStart`を実行しないため、初回のgate対象tool呼び出し時にも登録を試みる
-- `preToolUse`が`Write`／`StrReplace`／`ApplyPatch`／`Delete`（およびノートブック編集）を、対象ファイルの現在hashに一致する判断記録が先に保存されていない限り拒否する（`failClosed: true`）
+- `sessionStart` hookがworkspaceをrepositoryとしてRecorderへ自動登録する（agent_typeは`cursor`）。Cursorは新しいComposer会話の作成時だけ`sessionStart`を呼ぶため、同じ登録を`beforeSubmitPrompt`でも行う。登録結果は後続hook向けに`AI_REVIEW_SESSION_ID`、`AI_REVIEW_REPOSITORY_ROOT`、`AI_REVIEW_AGENT_TYPE=cursor`として返す。Cloud agentは`sessionStart`を実行しないため、初回のgate対象tool呼び出し時にも登録を試みる
+- `preToolUse`が`Write`／`StrReplace`／`ApplyPatch`／`Delete`（およびノートブック編集）を、対象ファイルの現在hashに一致する判断記録が先に保存されていない限り拒否する（`failClosed: true`）。許可時も`{"permission":"allow"}`を返す
 - `beforeShellExecution`および`preToolUse`の`Shell`で、明らかなファイル変更コマンド（リダイレクト、`sed -i`、`git checkout`等）も拒否し、組み込みの`Write`／`StrReplace`へ戻す
 - 同梱MCP tool `review_record_judgment` で判断を記録し、対象path・現在content hash・セッションに結び付いた1回使い切りのpermitを発行する
 - 許可前に編集前automatic snapshotを保存する。Recorderへのautomatic captureが成功しない限り編集を通さない
 
 編集の流れはOpenCodeプラグインと同じです。まず`review_record_judgment`を呼び、`"success":true`を受け取った後だけ同じ対象へ`Write`／`StrReplace`を呼びます。permitは一致する1回の編集で消費され、hash変化・別ファイル・期限切れの場合は再記録が必要です。
 
-Recorderが停止していてもゲートは閉じたまま fail-closed で動作します。`sessionStart`の登録失敗はstderrへ警告しますが、Cursorへはsession envを返すため後続hookがセッションIDを使えます。
+Recorderが停止していてもゲートは閉じたまま fail-closed で動作します。`sessionStart`／`beforeSubmitPrompt`の登録失敗はstderrへ警告しますが、Cursorへはsession env（またはprompt continuation）を返すため後続hookがセッションIDを使えます。
 
 ### JSONL入力形式
 
@@ -663,16 +665,16 @@ bun run build:cursor-plugin
 ln -s "$PWD/plugins/cursor" ~/.cursor/plugins/local/ai-code-review-cursor
 ```
 
-このリポジトリでは`.cursor/hooks.json`が編集ゲートを読み込むため、プラグイン未導入でも`preToolUse`／`beforeShellExecution`は発火します。MCP toolとskillを使う場合はCursorを再起動し、Pluginsで`ai-code-review-cursor`が有効であることを確認します。
+このリポジトリでは`.cursor/hooks.json`が編集ゲートを読み込むため、プラグイン未導入でも`preToolUse`／`beforeShellExecution`／`beforeSubmitPrompt`は発火します。MCP toolとskillを使う場合はCursorを再起動し、Pluginsで`ai-code-review-cursor`が有効であることを確認します。
 
 ### 4. SessionStartの自動登録
 
-ホストを再起動すると、`SessionStart` hookが次を自動実行します。
+ホストを再起動すると、`sessionStart` hookが次を自動実行します。Cursorは新しいComposer会話の作成時だけ`sessionStart`を呼ぶため、同じ処理を最初の`beforeSubmitPrompt`でも実行します。
 
-1. 現在のrepository rootをcanonical化
+1. 現在のrepository rootをcanonical化（`workspace_roots`／`CURSOR_PROJECT_DIR`をプラグインcwdより優先）
 2. Recorderへrepositoryを登録
 3. `AI_REVIEW_SESSION_ID`に対応するsessionを登録
-4. `AI_REVIEW_SESSION_ID`、root、agent typeを環境へ保存
+4. `AI_REVIEW_SESSION_ID`、root、agent typeを環境へ保存（`beforeSubmitPrompt`ではprompt continuationだけを返す）
 
 自動登録の確認:
 
@@ -798,6 +800,28 @@ omp plugin list
 ### `REPOSITORY_NOT_REGISTERED`またはsessionエラー
 
 SessionStartの自動登録または`ai-review setup`を実行してください。アダプターは判断記録を保存しますが、登録前のsession/repositoryを推測して作成しません。
+
+### フックが別プラグインの `adapter.mjs` を探して失敗する
+
+Cursorはフック実行時に、別プラグインの`CURSOR_PLUGIN_ROOT`を残したままにすることがあります。本プラグインのラッパーは常に自身のディレクトリでこの変数を上書きします。古いラッパーが残っている場合はプラグインを更新し、Cursorを再起動してください。
+
+### `spawn /bin/zsh ENOENT` で fail-closed になる
+
+Cursorはcommandフックを`process.env.SHELL`（macOSでは多くの場合`/bin/zsh`）の`-c`で起動し、プラグインフックのcwdはplugin installPathです。installPathが削除済み（例: アンインストールした`~/.cursor/plugins/local/ai-code-review-cursor`）だと、Nodeは実行ファイルではなくcwd欠如を`spawn /bin/zsh ENOENT`と報告します。判断記録が成功していても、fail-closedな`preToolUse`がWriteもShellも拒否します。
+
+対処:
+
+- ユーザー全体へ入れたプラグインを外したあとはCursorを再起動する
+- プロジェクト専用コピーでは`.cursor/hooks.json`だけをゲートにし、コピーした`plugin.json`の`hooks`は外す
+- プラグイン同梱hooksは`/bin/sh "${CURSOR_PLUGIN_ROOT}/bin/ai-review-pre-edit"`を使う。相対パス`./bin/...`には戻さない
+
+### `sessionId is required; start the plugin session first`
+
+CursorのMCPサーバーは`sessionStart`が返した環境変数を引き継ぎません。ワークスペースで`sessionStart`または`beforeSubmitPrompt`が成功していれば、`${workspaceFolder}`（`AI_REVIEW_REPOSITORY_ROOT`）または`CURSOR_PROJECT_DIR`からpersisted sessionを復元します。新しい会話を開始するかプロンプトを送り直し、Recorderが起動していることを確認してください。
+
+### `agent_type must be claude-code, codex, or opencode`
+
+起動中のRecorderが`cursor`をまだ認めていません。メッセージに`cursor`が含まれない場合は、このリポジトリの現行ソースからRecorderを再起動してください。contractsの現行メッセージは`claude-code, codex, opencode, or cursor`です。
 
 ### `hash-mismatch`
 

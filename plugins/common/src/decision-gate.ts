@@ -370,6 +370,7 @@ async function findMatchingPermit(options: ConsumeDecisionPermitOptions, checkCo
     return null;
   }
   const relativeFile = relative(canonical.root, canonical.path).split(sep).join("/");
+  let newest: { path: string; permit: MatchingDecisionPermit; expiresAt: number } | null = null;
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
     const original = join(directory, entry.name);
@@ -397,8 +398,11 @@ async function findMatchingPermit(options: ConsumeDecisionPermitOptions, checkCo
       const actualHash = await hashExistingFile(canonical.path).catch(() => null);
       if (actualHash !== permit.contentHash) continue;
     }
-    return {
+    const expiresAt = Date.parse(permit.expiresAt);
+    if (newest !== null && newest.expiresAt >= expiresAt) continue;
+    newest = {
       path: original,
+      expiresAt,
       permit: {
         recordId: permit.recordId,
         captureId: permit.captureId,
@@ -409,7 +413,7 @@ async function findMatchingPermit(options: ConsumeDecisionPermitOptions, checkCo
       },
     };
   }
-  return null;
+  return newest === null ? null : { path: newest.path, permit: newest.permit };
 }
 
 export async function findDecisionPermit(options: ConsumeDecisionPermitOptions): Promise<MatchingDecisionPermit | null> {

@@ -1031,6 +1031,7 @@ async function findMatchingPermit(options, checkContentHash = true) {
     return null;
   }
   const relativeFile = relative(canonical.root, canonical.path).split(sep).join("/");
+  let newest = null;
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json"))
       continue;
@@ -1065,8 +1066,12 @@ async function findMatchingPermit(options, checkContentHash = true) {
       if (actualHash !== permit.contentHash)
         continue;
     }
-    return {
+    const expiresAt = Date.parse(permit.expiresAt);
+    if (newest !== null && newest.expiresAt >= expiresAt)
+      continue;
+    newest = {
       path: original,
+      expiresAt,
       permit: {
         recordId: permit.recordId,
         captureId: permit.captureId,
@@ -1077,7 +1082,7 @@ async function findMatchingPermit(options, checkContentHash = true) {
       }
     };
   }
-  return null;
+  return newest === null ? null : { path: newest.path, permit: newest.permit };
 }
 async function findDecisionPermit(options) {
   return (await findMatchingPermit(options))?.permit ?? null;
@@ -1375,6 +1380,7 @@ var EDIT_TOOLS = new Set([
   "notebookedit"
 ]);
 var PATH_KEYS = ["file_path", "filePath", "path", "notebook_path", "target_notebook", "target_file"];
+var ALLOW = { permission: "allow" };
 function jsonRecord(value) {
   if (typeof value !== "object" || value === null || Array.isArray(value))
     return null;
@@ -1403,21 +1409,69 @@ function joinSessionHome() {
 function sessionStorePath(root, options) {
   return join3(sessionStoreBase(options), `${sha2562(root)}.json`);
 }
-async function persistCursorSession(root, sessionId, options = {}) {
-  const path = sessionStorePath(root, options);
-  await mkdir2(dirname2(path), { recursive: true, mode: 448 });
-  await writeFile2(path, `${JSON.stringify({ sessionId, repositoryRoot: root })}
-`, { encoding: "utf8", mode: 384 });
+function latestSessionPath(options) {
+  return join3(sessionStoreBase(options), "latest.json");
 }
-async function loadCursorSession(root, options = {}) {
+function unresolvedTemplate(value) {
+  return value.includes("${");
+}
+function usablePath(value) {
+  if (typeof value !== "string")
+    return;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || unresolvedTemplate(trimmed))
+    return;
+  return trimmed;
+}
+async function canonicalPath2(value) {
+  const resolved = resolve2(value);
+  return realpath2(resolved).catch(() => resolved);
+}
+async function pathsEqual(left, right) {
+  return await canonicalPath2(left) === await canonicalPath2(right);
+}
+async function readCursorSessionFile(path) {
   try {
-    const raw = JSON.parse(await readFile4(sessionStorePath(root, options), "utf8"));
-    if (typeof raw.sessionId === "string" && raw.sessionId.trim().length > 0)
-      return raw.sessionId;
+    const raw = JSON.parse(await readFile4(path, "utf8"));
+    if (typeof raw.sessionId !== "string" || raw.sessionId.trim().length === 0)
+      return;
+    if (typeof raw.repositoryRoot !== "string" || raw.repositoryRoot.trim().length === 0)
+      return;
+    return { sessionId: raw.sessionId, repositoryRoot: raw.repositoryRoot };
   } catch {
     return;
   }
-  return;
+}
+async function persistCursorSession(root, sessionId, options = {}) {
+  const payload = `${JSON.stringify({ sessionId, repositoryRoot: root })}
+`;
+  const path = sessionStorePath(root, options);
+  await mkdir2(dirname2(path), { recursive: true, mode: 448 });
+  await writeFile2(path, payload, { encoding: "utf8", mode: 384 });
+  await writeFile2(latestSessionPath(options), payload, { encoding: "utf8", mode: 384 });
+}
+async function loadCursorSession(root, options = {}) {
+  return (await readCursorSessionFile(sessionStorePath(root, options)))?.sessionId;
+}
+async function loadLatestCursorSession(options = {}) {
+  return readCursorSessionFile(latestSessionPath(options));
+}
+async function resolveCursorRepositoryRoot(options = {}, proposalRoot) {
+  const candidates = [options.repositoryRoot, process.env.AI_REVIEW_REPOSITORY_ROOT, proposalRoot, process.env.CURSOR_PROJECT_DIR];
+  for (const candidate of candidates) {
+    const usable = usablePath(candidate);
+    if (usable !== undefined)
+      return canonicalPath2(usable);
+  }
+  const pluginRoot = usablePath(process.env.CURSOR_PLUGIN_ROOT);
+  if (pluginRoot !== undefined && await pathsEqual(process.cwd(), pluginRoot))
+    return;
+  return canonicalPath2(process.cwd());
+}
+function annotateCursorRecorderError(message) {
+  if (message.includes("cursor") || !message.includes("agent_type must be"))
+    return message;
+  return `${message}. This plugin records agent_type=cursor; restart Recorder from the current review checkout so it accepts cursor.`;
 }
 async function readBoundedStdin(stream, maxBytes = MAX_STDIN_BYTES) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
@@ -1460,16 +1514,29 @@ function sessionIdFromInput(input) {
     throw new Error("Cursor session id is unavailable; restart the session so the plugin can initialize it");
   return value;
 }
-function workspaceRootFromInput(input) {
-  if (typeof process.env.AI_REVIEW_REPOSITORY_ROOT === "string" && process.env.AI_REVIEW_REPOSITORY_ROOT.trim().length > 0) {
-    return resolve2(process.env.AI_REVIEW_REPOSITORY_ROOT);
-  }
-  if (typeof input.cwd === "string" && input.cwd.trim().length > 0)
-    return resolve2(input.cwd);
+async function workspaceRootFromInput(input) {
+  const pluginRoot = usablePath(process.env.CURSOR_PLUGIN_ROOT);
+  const candidates = [];
+  const envRoot = usablePath(process.env.AI_REVIEW_REPOSITORY_ROOT);
+  if (envRoot !== undefined)
+    candidates.push(envRoot);
   if (Array.isArray(input.workspace_roots)) {
-    const first = input.workspace_roots.find((root) => typeof root === "string" && root.trim().length > 0);
-    if (typeof first === "string")
-      return resolve2(first);
+    for (const root of input.workspace_roots) {
+      if (typeof root === "string" && root.trim().length > 0)
+        candidates.push(root);
+    }
+  }
+  const projectDir = usablePath(process.env.CURSOR_PROJECT_DIR);
+  if (projectDir !== undefined)
+    candidates.push(projectDir);
+  if (typeof input.cwd === "string" && input.cwd.trim().length > 0)
+    candidates.push(input.cwd);
+  candidates.push(process.cwd());
+  for (const candidate of candidates) {
+    const resolved = resolve2(candidate);
+    if (pluginRoot !== undefined && await pathsEqual(resolved, pluginRoot))
+      continue;
+    return resolved;
   }
   return resolve2(process.cwd());
 }
@@ -1575,7 +1642,7 @@ async function checkPreToolUse(input, options = {}) {
   } catch (error) {
     return deny(error instanceof Error ? error.message : String(error));
   }
-  const repositoryRoot = workspaceRootFromInput(input);
+  const repositoryRoot = await workspaceRootFromInput(input);
   for (const filePath of filePaths) {
     const denied = await capturePermit(filePath, sessionId, repositoryRoot, options);
     if (denied !== null)
@@ -1596,7 +1663,7 @@ async function checkPostToolUse(input, options = {}) {
   } catch {
     return;
   }
-  const repositoryRoot = workspaceRootFromInput(input);
+  const repositoryRoot = await workspaceRootFromInput(input);
   for (const filePath of filePaths) {
     await consumeDecisionPermitAfterEdit({
       sessionId,
@@ -1635,10 +1702,16 @@ async function registerSession(sessionId, repositoryRoot, options = {}) {
     registration: registered.session
   };
 }
+function sessionStartOutput(input, result) {
+  const event = jsonRecord(input)?.hook_event_name;
+  if (event === "beforeSubmitPrompt" || event === "UserPromptSubmit")
+    return { continue: true };
+  return result;
+}
 async function handleSessionStart(input, options = {}) {
   const payload = jsonRecord(input) ?? {};
   const sessionId = sessionIdFromInput(payload);
-  const cwd = workspaceRootFromInput(payload);
+  const cwd = await workspaceRootFromInput(payload);
   const canonicalRoot = await realpath2(cwd).catch(() => cwd);
   await persistCursorSession(canonicalRoot, sessionId, options);
   try {
@@ -1655,12 +1728,30 @@ async function handleSessionStart(input, options = {}) {
     additional_context: ADDITIONAL_CONTEXT
   };
 }
+async function resolveCursorRecordContext(options, proposalRoot) {
+  const explicitSession = usablePath(options.sessionId ?? process.env.AI_REVIEW_SESSION_ID);
+  const resolvedRoot = await resolveCursorRepositoryRoot(options, proposalRoot);
+  const persisted = resolvedRoot === undefined ? undefined : await loadCursorSession(resolvedRoot, options);
+  if (explicitSession !== undefined) {
+    return { sessionId: explicitSession, ...resolvedRoot === undefined ? {} : { repositoryRoot: resolvedRoot } };
+  }
+  if (persisted !== undefined && resolvedRoot !== undefined) {
+    return { sessionId: persisted, repositoryRoot: resolvedRoot };
+  }
+  const latest = await loadLatestCursorSession(options);
+  if (latest === undefined) {
+    return resolvedRoot === undefined ? {} : { repositoryRoot: resolvedRoot };
+  }
+  const latestRoot = await canonicalPath2(latest.repositoryRoot);
+  if (resolvedRoot === undefined || latestRoot === resolvedRoot) {
+    return { sessionId: latest.sessionId, repositoryRoot: latestRoot };
+  }
+  return { repositoryRoot: resolvedRoot };
+}
 async function recordDecision(value, options = {}) {
   const proposal = jsonRecord(value);
   const proposalRoot = proposal !== null && typeof proposal.repositoryRoot === "string" ? proposal.repositoryRoot : undefined;
-  const repositoryRoot = options.repositoryRoot ?? process.env.AI_REVIEW_REPOSITORY_ROOT ?? proposalRoot;
-  const persisted = repositoryRoot === undefined ? undefined : await loadCursorSession(resolve2(repositoryRoot), options);
-  const sessionId = options.sessionId ?? process.env.AI_REVIEW_SESSION_ID ?? persisted;
+  const { sessionId, repositoryRoot } = await resolveCursorRecordContext(options, proposalRoot);
   const event = await normalizeDecisionProposal(value, {
     ...sessionId === undefined ? {} : { sessionId },
     ...repositoryRoot === undefined ? {} : { repositoryRoot }
@@ -1673,7 +1764,7 @@ async function recordDecision(value, options = {}) {
       success: false,
       recordId: record.record_id,
       code: submitted.code,
-      message: submitted.message,
+      message: annotateCursorRecorderError(submitted.message),
       ...submitted.status === undefined ? {} : { status: submitted.status }
     };
   }
@@ -1696,11 +1787,14 @@ async function runPreEditHook() {
     return;
   }
   try {
-    await registerSession(sessionIdFromInput(input), workspaceRootFromInput(input));
+    const sessionId = sessionIdFromInput(input);
+    const root = await workspaceRootFromInput(input);
+    const canonicalRoot = await realpath2(root).catch(() => root);
+    await persistCursorSession(canonicalRoot, sessionId);
+    await registerSession(sessionId, canonicalRoot);
   } catch {}
   const result = await checkPreToolUse(input);
-  if (result !== null)
-    process.stdout.write(`${JSON.stringify(result)}
+  process.stdout.write(`${JSON.stringify(result ?? ALLOW)}
 `);
 }
 async function runPostEditHook() {
@@ -1725,12 +1819,13 @@ async function runRecordCommand() {
 async function runSessionStartHook() {
   const warnings = [];
   try {
-    const result = await handleSessionStart(JSON.parse(await stdinText()), {
+    const input = JSON.parse(await stdinText());
+    const result = await handleSessionStart(input, {
       onRegistrationError: (error) => {
         warnings.push(error instanceof Error ? error.message : String(error));
       }
     });
-    process.stdout.write(`${JSON.stringify(result)}
+    process.stdout.write(`${JSON.stringify(sessionStartOutput(input, result))}
 `);
     if (warnings.length > 0)
       process.stderr.write(`${warnings.join(`
@@ -1896,5 +1991,6 @@ export {
   mapHostEvent,
   recordDecision,
   registerSession,
-  runAdapter
+  runAdapter,
+  sessionStartOutput
 };

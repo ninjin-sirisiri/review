@@ -40,7 +40,7 @@ JSON
 
 3. Continue only when the tool or command prints `"success":true`. The permit is tied to the target's current content hash and is consumed by one matching edit. Record every file that will be edited; a changed hash, different path, expired permit, failed Recorder submission, or second edit requires a new record.
 
-`sessionStart` supplies the session and repository defaults. Pass `repositoryRoot` or `sessionId` only when operating outside that initialized session. For a new file, record its path with `lineStart: 1`; the empty pre-edit content is hashed by the command.
+`sessionStart` and `beforeSubmitPrompt` persist the session for the workspace. The MCP server does not inherit those environment variables; `review_record_judgment` recovers `sessionId` from the persisted Cursor session using the workspace root (`workspace_roots` / `AI_REVIEW_REPOSITORY_ROOT` / `CURSOR_PROJECT_DIR`). Pass `repositoryRoot` or `sessionId` only when operating outside that workspace. For a new file, record its path with `lineStart: 1`; the empty pre-edit content is hashed by the command.
 
 ## Non-negotiable rules
 

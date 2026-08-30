@@ -1,17 +1,45 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, expect, test } from "bun:test";
+import { afterAll, beforeEach, expect, test } from "bun:test";
 import type { AdapterBridge, SubmitResult } from "../../common/src/adapter-contract";
+import type { RecorderSetupClient } from "../../common/src/recorder-setup";
+import type { ReviewSession } from "../../../packages/contracts/src/index";
+import { handleSessionStart } from "../src/gate";
 import { dispatchMcpMessage } from "../src/mcp";
 
-const GATED_ENV_KEYS = ["AI_REVIEW_SESSION_ID", "AI_REVIEW_REPOSITORY_ROOT", "AI_REVIEW_AGENT_TYPE", "AI_REVIEW_GATE_ROOT"];
+const GATED_ENV_KEYS = [
+  "AI_REVIEW_SESSION_ID",
+  "AI_REVIEW_REPOSITORY_ROOT",
+  "AI_REVIEW_AGENT_TYPE",
+  "AI_REVIEW_GATE_ROOT",
+  "AI_REVIEW_CURSOR_SESSION_ROOT",
+  "CURSOR_PROJECT_DIR",
+  "CURSOR_PLUGIN_ROOT",
+];
 const preservedEnv: Record<string, string | undefined> = {};
+
+function passingSetupClient(): Pick<RecorderSetupClient, "ensureSession"> {
+  return {
+    ensureSession: async (root: string, session: ReviewSession) => ({
+      repository: { repository_id: "repository-setup", root, created_at: "2026-08-29T00:00:00.000Z" },
+      session,
+    }),
+  } as unknown as Pick<RecorderSetupClient, "ensureSession">;
+}
 
 beforeEach(() => {
   for (const key of GATED_ENV_KEYS) {
     preservedEnv[key] = process.env[key];
     delete process.env[key];
+  }
+});
+
+afterAll(() => {
+  for (const [key, value] of Object.entries(preservedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
   }
 });
 
@@ -70,4 +98,41 @@ test("tools/call returns a structured failure for an unknown tool", async () => 
   expect(result).toMatchObject({ jsonrpc: "2.0", id: 4 });
   const payload = result as { result: { isError?: boolean } };
   expect(payload.result.isError).toBe(true);
+});
+
+test("tools/call recovers the persisted Cursor session when MCP has no sessionStart env", async () => {
+  const current = await fixture();
+  await handleSessionStart({
+    session_id: "session-mcp-env",
+    cwd: current.root,
+  }, {
+    setupClient: passingSetupClient(),
+    sessionStoreRoot: join(current.root, "cursor-sessions"),
+  });
+  process.env.CURSOR_PROJECT_DIR = current.root;
+  const bridge: AdapterBridge = {
+    submit: async (record): Promise<SubmitResult> => {
+      expect(record.session_id).toBe("session-mcp-env");
+      expect(record.repository_id).toBe(createHash("sha256").update(current.root, "utf8").digest("hex"));
+      return { success: true, status: 201, duplicate: false, recordId: record.record_id };
+    },
+  };
+
+  const result = await dispatchMcpMessage({
+    jsonrpc: "2.0",
+    id: 5,
+    method: "tools/call",
+    params: {
+      name: "review_record_judgment",
+      arguments: {
+        targets: [{ path: "src/change.ts", lineStart: 1 }],
+        judgment: "the change preserves the invariant",
+        rationale: "the focused branch keeps the existing guard",
+      },
+    },
+  }, { gateRoot: current.gateRoot, sessionStoreRoot: join(current.root, "cursor-sessions"), bridge });
+
+  const payload = result as { result: { content: Array<{ text: string }>; isError?: boolean } };
+  expect(payload.result.isError).toBeFalsy();
+  expect(JSON.parse(payload.result.content[0]?.text ?? "")).toMatchObject({ success: true, permits: 1 });
 });

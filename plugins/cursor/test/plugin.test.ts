@@ -9,6 +9,7 @@ type GateHooks = {
   version: number;
   hooks: {
     sessionStart: Array<{ command: string }>;
+    beforeSubmitPrompt: Array<{ command: string }>;
     preToolUse: Array<{ command: string; failClosed?: boolean; matcher?: string }>;
     beforeShellExecution: Array<{ command: string; failClosed?: boolean }>;
     postToolUse: Array<{ command: string; matcher?: string }>;
@@ -18,6 +19,7 @@ type GateHooks = {
 function assertFailClosedGate(hooks: GateHooks, preEditCommand: string, postEditCommand: string, sessionCommand: string) {
   expect(hooks.version).toBe(1);
   expect(hooks.hooks.sessionStart.some((hook) => hook.command === sessionCommand)).toBe(true);
+  expect(hooks.hooks.beforeSubmitPrompt.some((hook) => hook.command === sessionCommand)).toBe(true);
   expect(hooks.hooks.preToolUse.length).toBeGreaterThan(0);
   expect(hooks.hooks.preToolUse.every((hook) => hook.command === preEditCommand && hook.failClosed === true)).toBe(true);
   expect(hooks.hooks.preToolUse.some((hook) => hook.matcher?.includes("Write"))).toBe(true);
@@ -29,11 +31,28 @@ function assertFailClosedGate(hooks: GateHooks, preEditCommand: string, postEdit
   expect(hooks.hooks.postToolUse.some((hook) => hook.command === postEditCommand && hook.matcher?.includes("Write"))).toBe(true);
 }
 
+const pluginPreEditCommand = '/bin/sh "${CURSOR_PLUGIN_ROOT}/bin/ai-review-pre-edit"';
+const pluginPostEditCommand = '/bin/sh "${CURSOR_PLUGIN_ROOT}/bin/ai-review-post-edit"';
+const pluginSessionCommand = '/bin/sh "${CURSOR_PLUGIN_ROOT}/bin/ai-review-session-start"';
+
 test("Cursor plugin hooks fail closed on gated edit and shell events", async () => {
   const hooks = await Bun.file(join(pluginRoot, "hooks/hooks.json")).json() as GateHooks & {
     hooks: { beforeShellExecution: Array<{ command: string; timeout?: number; failClosed?: boolean }> };
   };
-  assertFailClosedGate(hooks, "./bin/ai-review-pre-edit", "./bin/ai-review-post-edit", "./bin/ai-review-session-start");
+  assertFailClosedGate(hooks, pluginPreEditCommand, pluginPostEditCommand, pluginSessionCommand);
+});
+
+test("Cursor plugin hook commands invoke the POSIX wrappers via CURSOR_PLUGIN_ROOT", async () => {
+  const hooks = await Bun.file(join(pluginRoot, "hooks/hooks.json")).json() as GateHooks;
+  const commands = [
+    ...hooks.hooks.sessionStart,
+    ...hooks.hooks.beforeSubmitPrompt,
+    ...hooks.hooks.preToolUse,
+    ...hooks.hooks.beforeShellExecution,
+    ...hooks.hooks.postToolUse,
+  ].map((hook) => hook.command);
+  expect(commands.every((command) => command.startsWith("/bin/sh \"${CURSOR_PLUGIN_ROOT}/bin/"))).toBe(true);
+  expect(commands.some((command) => command.includes("./bin/"))).toBe(false);
 });
 
 test("project Cursor hooks load the same fail-closed gate from the repository", async () => {
@@ -64,12 +83,28 @@ async function runPreEdit(env: NodeJS.ProcessEnv, input: unknown): Promise<{ exi
   return { exitCode, stdout, stderr };
 }
 
+async function runSessionStart(env: NodeJS.ProcessEnv, input: unknown): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const child = Bun.spawn([join(pluginRoot, "bin/ai-review-session-start")], {
+    cwd: repoRoot,
+    env,
+    stdin: new Response(`${JSON.stringify(input)}\n`),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
 test("pre-edit wrapper locates the adapter without CURSOR_PLUGIN_ROOT", async () => {
   const env = { ...process.env };
   delete env.CURSOR_PLUGIN_ROOT;
   const result = await runPreEdit(env, { tool_name: "Read", cwd: repoRoot });
   expect(result.exitCode).toBe(0);
-  expect(result.stdout.trim()).toBe("");
+  expect(JSON.parse(result.stdout)).toEqual({ permission: "allow" });
   expect(result.stderr).not.toContain("CURSOR_PLUGIN_ROOT must be set");
 });
 
@@ -85,4 +120,41 @@ test("pre-edit wrapper still denies a Write when CURSOR_PLUGIN_ROOT is unset", a
   expect(result.exitCode).toBe(0);
   const payload = JSON.parse(result.stdout) as { permission?: string };
   expect(payload.permission).toBe("deny");
+});
+
+test("pre-edit wrapper ignores an inherited CURSOR_PLUGIN_ROOT from another plugin", async () => {
+  const env = { ...process.env };
+  env.CURSOR_PLUGIN_ROOT = join(pluginRoot, "test", "foreign-plugin-root");
+  const result = await runPreEdit(env, { tool_name: "Read", cwd: repoRoot });
+  expect(result.exitCode).toBe(0);
+  expect(result.stderr).not.toContain("Module not found");
+  expect(JSON.parse(result.stdout)).toEqual({ permission: "allow" });
+});
+
+test("Cursor wrappers always bind CURSOR_PLUGIN_ROOT to their own plugin directory", async () => {
+  const wrappers = ["ai-review-pre-edit", "ai-review-post-edit", "ai-review-session-start", "ai-review-record", "ai-review-cursor"];
+  for (const name of wrappers) {
+    const text = await Bun.file(join(pluginRoot, "bin", name)).text();
+    expect(text).not.toContain("if [ -z \"${CURSOR_PLUGIN_ROOT:-}\" ]");
+    expect(text).toContain("CURSOR_PLUGIN_ROOT=\"$(CDPATH= cd -- \"$SCRIPT_DIR/..\" && pwd)\"");
+  }
+});
+
+test("plugin MCP config passes the workspace folder as the repository root", async () => {
+  const mcp = await Bun.file(join(pluginRoot, "mcp.json")).json() as {
+    mcpServers: { "ai-code-review": { env?: Record<string, string> } };
+  };
+  expect(mcp.mcpServers["ai-code-review"]?.env?.AI_REVIEW_REPOSITORY_ROOT).toBe("${workspaceFolder}");
+});
+
+test("session-start wrapper continues a beforeSubmitPrompt after persisting", async () => {
+  const env = { ...process.env };
+  delete env.CURSOR_PLUGIN_ROOT;
+  const result = await runSessionStart(env, {
+    hook_event_name: "beforeSubmitPrompt",
+    conversation_id: "session-submit-wrapper",
+    workspace_roots: [repoRoot],
+  });
+  expect(result.exitCode).toBe(0);
+  expect(JSON.parse(result.stdout)).toEqual({ continue: true });
 });

@@ -4,7 +4,13 @@
     "sessionStart": [
       {
         "command": "plugins/cursor/bin/ai-review-session-start",
-        "timeout": 5
+        "timeout": 15
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "plugins/cursor/bin/ai-review-session-start",
+        "timeout": 10
       }
     ],
     "preToolUse": [

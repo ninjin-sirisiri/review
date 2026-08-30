@@ -57,6 +57,12 @@ export interface CursorDenyOutput {
   user_message: string;
 }
 
+export interface CursorAllowOutput {
+  permission: "allow";
+}
+
+const ALLOW: CursorAllowOutput = { permission: "allow" };
+
 export interface PreToolUseOptions extends GateStorageOptions {
   bridge?: AutomaticSnapshotBridge;
 }
@@ -135,20 +141,79 @@ function sessionStorePath(root: string, options: { sessionStoreRoot?: string }):
   return join(sessionStoreBase(options), `${sha256(root)}.json`);
 }
 
-export async function persistCursorSession(root: string, sessionId: string, options: { sessionStoreRoot?: string } = {}): Promise<void> {
-  const path = sessionStorePath(root, options);
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await writeFile(path, `${JSON.stringify({ sessionId, repositoryRoot: root })}\n`, { encoding: "utf8", mode: 0o600 });
+function latestSessionPath(options: { sessionStoreRoot?: string }): string {
+  return join(sessionStoreBase(options), "latest.json");
 }
 
-export async function loadCursorSession(root: string, options: { sessionStoreRoot?: string } = {}): Promise<string | undefined> {
+function unresolvedTemplate(value: string): boolean {
+  return value.includes("${");
+}
+
+function usablePath(value: string | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || unresolvedTemplate(trimmed)) return undefined;
+  return trimmed;
+}
+
+async function canonicalPath(value: string): Promise<string> {
+  const resolved = resolve(value);
+  return realpath(resolved).catch(() => resolved);
+}
+
+async function pathsEqual(left: string, right: string): Promise<boolean> {
+  return (await canonicalPath(left)) === (await canonicalPath(right));
+}
+
+interface PersistedCursorSession {
+  sessionId: string;
+  repositoryRoot: string;
+}
+
+async function readCursorSessionFile(path: string): Promise<PersistedCursorSession | undefined> {
   try {
-    const raw = JSON.parse(await readFile(sessionStorePath(root, options), "utf8")) as { sessionId?: unknown };
-    if (typeof raw.sessionId === "string" && raw.sessionId.trim().length > 0) return raw.sessionId;
+    const raw = JSON.parse(await readFile(path, "utf8")) as { sessionId?: unknown; repositoryRoot?: unknown };
+    if (typeof raw.sessionId !== "string" || raw.sessionId.trim().length === 0) return undefined;
+    if (typeof raw.repositoryRoot !== "string" || raw.repositoryRoot.trim().length === 0) return undefined;
+    return { sessionId: raw.sessionId, repositoryRoot: raw.repositoryRoot };
   } catch {
     return undefined;
   }
-  return undefined;
+}
+
+export async function persistCursorSession(root: string, sessionId: string, options: { sessionStoreRoot?: string } = {}): Promise<void> {
+  const payload = `${JSON.stringify({ sessionId, repositoryRoot: root })}\n`;
+  const path = sessionStorePath(root, options);
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await writeFile(path, payload, { encoding: "utf8", mode: 0o600 });
+  await writeFile(latestSessionPath(options), payload, { encoding: "utf8", mode: 0o600 });
+}
+
+export async function loadCursorSession(root: string, options: { sessionStoreRoot?: string } = {}): Promise<string | undefined> {
+  return (await readCursorSessionFile(sessionStorePath(root, options)))?.sessionId;
+}
+
+export async function loadLatestCursorSession(options: { sessionStoreRoot?: string } = {}): Promise<PersistedCursorSession | undefined> {
+  return readCursorSessionFile(latestSessionPath(options));
+}
+
+export async function resolveCursorRepositoryRoot(
+  options: RecordDecisionOptions = {},
+  proposalRoot?: string,
+): Promise<string | undefined> {
+  const candidates = [options.repositoryRoot, process.env.AI_REVIEW_REPOSITORY_ROOT, proposalRoot, process.env.CURSOR_PROJECT_DIR];
+  for (const candidate of candidates) {
+    const usable = usablePath(candidate);
+    if (usable !== undefined) return canonicalPath(usable);
+  }
+  const pluginRoot = usablePath(process.env.CURSOR_PLUGIN_ROOT);
+  if (pluginRoot !== undefined && await pathsEqual(process.cwd(), pluginRoot)) return undefined;
+  return canonicalPath(process.cwd());
+}
+
+function annotateCursorRecorderError(message: string): string {
+  if (message.includes("cursor") || !message.includes("agent_type must be")) return message;
+  return `${message}. This plugin records agent_type=cursor; restart Recorder from the current review checkout so it accepts cursor.`;
 }
 
 export async function readBoundedStdin(stream: ReadableStream<Uint8Array>, maxBytes = MAX_STDIN_BYTES): Promise<string> {
@@ -191,14 +256,24 @@ function sessionIdFromInput(input: CursorHookInput): string {
   return value;
 }
 
-function workspaceRootFromInput(input: CursorHookInput): string {
-  if (typeof process.env.AI_REVIEW_REPOSITORY_ROOT === "string" && process.env.AI_REVIEW_REPOSITORY_ROOT.trim().length > 0) {
-    return resolve(process.env.AI_REVIEW_REPOSITORY_ROOT);
-  }
-  if (typeof input.cwd === "string" && input.cwd.trim().length > 0) return resolve(input.cwd);
+async function workspaceRootFromInput(input: CursorHookInput): Promise<string> {
+  const pluginRoot = usablePath(process.env.CURSOR_PLUGIN_ROOT);
+  const candidates: string[] = [];
+  const envRoot = usablePath(process.env.AI_REVIEW_REPOSITORY_ROOT);
+  if (envRoot !== undefined) candidates.push(envRoot);
   if (Array.isArray(input.workspace_roots)) {
-    const first = input.workspace_roots.find((root) => typeof root === "string" && root.trim().length > 0);
-    if (typeof first === "string") return resolve(first);
+    for (const root of input.workspace_roots) {
+      if (typeof root === "string" && root.trim().length > 0) candidates.push(root);
+    }
+  }
+  const projectDir = usablePath(process.env.CURSOR_PROJECT_DIR);
+  if (projectDir !== undefined) candidates.push(projectDir);
+  if (typeof input.cwd === "string" && input.cwd.trim().length > 0) candidates.push(input.cwd);
+  candidates.push(process.cwd());
+  for (const candidate of candidates) {
+    const resolved = resolve(candidate);
+    if (pluginRoot !== undefined && await pathsEqual(resolved, pluginRoot)) continue;
+    return resolved;
   }
   return resolve(process.cwd());
 }
@@ -298,7 +373,7 @@ export async function checkPreToolUse(input: CursorHookInput, options: PreToolUs
   } catch (error) {
     return deny(error instanceof Error ? error.message : String(error));
   }
-  const repositoryRoot = workspaceRootFromInput(input);
+  const repositoryRoot = await workspaceRootFromInput(input);
   for (const filePath of filePaths) {
     const denied = await capturePermit(filePath, sessionId, repositoryRoot, options);
     if (denied !== null) return denied;
@@ -317,7 +392,7 @@ export async function checkPostToolUse(input: CursorHookInput, options: GateStor
   } catch {
     return;
   }
-  const repositoryRoot = workspaceRootFromInput(input);
+  const repositoryRoot = await workspaceRootFromInput(input);
   for (const filePath of filePaths) {
     await consumeDecisionPermitAfterEdit({
       sessionId,
@@ -360,10 +435,16 @@ export async function registerSession(sessionId: string, repositoryRoot: string,
   };
 }
 
+export function sessionStartOutput(input: unknown, result: SessionStartResult): SessionStartResult | { continue: true } {
+  const event = jsonRecord(input)?.hook_event_name;
+  if (event === "beforeSubmitPrompt" || event === "UserPromptSubmit") return { continue: true };
+  return result;
+}
+
 export async function handleSessionStart(input: unknown, options: SessionStartOptions = {}): Promise<SessionStartResult> {
   const payload = (jsonRecord(input) ?? {}) as CursorHookInput;
   const sessionId = sessionIdFromInput(payload);
-  const cwd = workspaceRootFromInput(payload);
+  const cwd = await workspaceRootFromInput(payload);
   const canonicalRoot = await realpath(cwd).catch(() => cwd);
   await persistCursorSession(canonicalRoot, sessionId, options);
   try {
@@ -381,12 +462,34 @@ export async function handleSessionStart(input: unknown, options: SessionStartOp
   };
 }
 
+async function resolveCursorRecordContext(
+  options: RecordDecisionOptions,
+  proposalRoot?: string,
+): Promise<{ sessionId?: string; repositoryRoot?: string }> {
+  const explicitSession = usablePath(options.sessionId ?? process.env.AI_REVIEW_SESSION_ID);
+  const resolvedRoot = await resolveCursorRepositoryRoot(options, proposalRoot);
+  const persisted = resolvedRoot === undefined ? undefined : await loadCursorSession(resolvedRoot, options);
+  if (explicitSession !== undefined) {
+    return { sessionId: explicitSession, ...(resolvedRoot === undefined ? {} : { repositoryRoot: resolvedRoot }) };
+  }
+  if (persisted !== undefined && resolvedRoot !== undefined) {
+    return { sessionId: persisted, repositoryRoot: resolvedRoot };
+  }
+  const latest = await loadLatestCursorSession(options);
+  if (latest === undefined) {
+    return resolvedRoot === undefined ? {} : { repositoryRoot: resolvedRoot };
+  }
+  const latestRoot = await canonicalPath(latest.repositoryRoot);
+  if (resolvedRoot === undefined || latestRoot === resolvedRoot) {
+    return { sessionId: latest.sessionId, repositoryRoot: latestRoot };
+  }
+  return { repositoryRoot: resolvedRoot };
+}
+
 export async function recordDecision(value: unknown, options: RecordDecisionOptions = {}): Promise<RecordDecisionResult> {
   const proposal = jsonRecord(value);
   const proposalRoot = proposal !== null && typeof proposal.repositoryRoot === "string" ? proposal.repositoryRoot : undefined;
-  const repositoryRoot = options.repositoryRoot ?? process.env.AI_REVIEW_REPOSITORY_ROOT ?? proposalRoot;
-  const persisted = repositoryRoot === undefined ? undefined : await loadCursorSession(resolve(repositoryRoot), options);
-  const sessionId = options.sessionId ?? process.env.AI_REVIEW_SESSION_ID ?? persisted;
+  const { sessionId, repositoryRoot } = await resolveCursorRecordContext(options, proposalRoot);
   const event = await normalizeDecisionProposal(value, {
     ...(sessionId === undefined ? {} : { sessionId }),
     ...(repositoryRoot === undefined ? {} : { repositoryRoot }),
@@ -399,7 +502,7 @@ export async function recordDecision(value: unknown, options: RecordDecisionOpti
       success: false,
       recordId: record.record_id,
       code: submitted.code,
-      message: submitted.message,
+      message: annotateCursorRecorderError(submitted.message),
       ...(submitted.status === undefined ? {} : { status: submitted.status }),
     };
   }
@@ -423,12 +526,16 @@ export async function runPreEditHook(): Promise<void> {
     return;
   }
   try {
-    await registerSession(sessionIdFromInput(input), workspaceRootFromInput(input));
+    const sessionId = sessionIdFromInput(input);
+    const root = await workspaceRootFromInput(input);
+    const canonicalRoot = await realpath(root).catch(() => root);
+    await persistCursorSession(canonicalRoot, sessionId);
+    await registerSession(sessionId, canonicalRoot);
   } catch {
     // Cloud agents skip sessionStart; a registration failure keeps the gate closed.
   }
   const result = await checkPreToolUse(input);
-  if (result !== null) process.stdout.write(`${JSON.stringify(result)}\n`);
+  process.stdout.write(`${JSON.stringify(result ?? ALLOW)}\n`);
 }
 
 export async function runPostEditHook(): Promise<void> {
@@ -454,12 +561,13 @@ export async function runRecordCommand(): Promise<void> {
 export async function runSessionStartHook(): Promise<void> {
   const warnings: string[] = [];
   try {
-    const result = await handleSessionStart(JSON.parse(await stdinText()) as unknown, {
+    const input = JSON.parse(await stdinText()) as unknown;
+    const result = await handleSessionStart(input, {
       onRegistrationError: (error) => {
         warnings.push(error instanceof Error ? error.message : String(error));
       },
     });
-    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.stdout.write(`${JSON.stringify(sessionStartOutput(input, result))}\n`);
     if (warnings.length > 0) process.stderr.write(`${warnings.join("\n")}\n`);
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

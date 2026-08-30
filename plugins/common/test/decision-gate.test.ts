@@ -71,6 +71,23 @@ describe("decision gate", () => {
     })).toBe(false);
   });
 
+  test("finds the newest matching permit when several still apply", async () => {
+    const current = await repository();
+    const gateRoot = join(current.root, ".gate-state");
+    const normalized = await normalizeDecisionProposal(proposal(current.root, current.hash), {
+      sessionId: "session-newest",
+    });
+    await grantDecisionPermits(normalized, { recordId: "record-older", gateRoot, ttlMs: 60_000 });
+    await grantDecisionPermits(normalized, { recordId: "record-newer", gateRoot, ttlMs: 120_000 });
+
+    expect(await findDecisionPermit({
+      sessionId: "session-newest",
+      repositoryRoot: current.root,
+      filePath: current.file,
+      gateRoot,
+    })).toMatchObject({ recordId: "record-newer" });
+  });
+
   test("rejects a permit when the target changed after the judgment", async () => {
     const current = await repository();
     const normalized = await normalizeDecisionProposal(proposal(current.root, current.hash), {

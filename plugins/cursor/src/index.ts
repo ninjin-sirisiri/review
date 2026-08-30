@@ -16,6 +16,7 @@ export {
   handleSessionStart,
   recordDecision,
   registerSession,
+  sessionStartOutput,
 } from "./gate";
 export { dispatchMcpMessage } from "./mcp";
 
