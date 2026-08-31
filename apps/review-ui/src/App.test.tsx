@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { App } from "./App";
+import { App, currentPathEvidence } from "./App";
+import type { JudgmentEntry } from "./components/JudgmentPanel";
 import { ReviewApi, type DecisionRecordDetail, type DecisionRecordSummary } from "./api";
 import type { SnapshotDiffResponse } from "../../../packages/contracts/src/index";
 
@@ -260,11 +261,31 @@ function detailFixtureB(): DecisionRecordDetail {
   };
 }
 
+const defaultBranchList = {
+  repository_id: "repo-1",
+  head_branch: "main",
+  branches: [{ name: "main", sha: "a".repeat(40) }],
+};
+
+const twoBranchList = {
+  repository_id: "repo-1",
+  head_branch: "main",
+  branches: [
+    { name: "feat/x", sha: "1".repeat(40) },
+    { name: "main", sha: "2".repeat(40) },
+  ],
+};
+
+function requestPath(url: string): string {
+  return url.split("?")[0] ?? url;
+}
+
 function createFetch(
   hold?: (url: string) => boolean,
   fail?: (url: string) => boolean,
   snapshotResponse?: (url: string) => Response | undefined,
   overrideResponse?: (url: string, init?: RequestInit) => Response | undefined,
+  branchList = defaultBranchList,
 ) {
   // Recorderと同じく、PATCHで保存されたuser_dispositionを以後のGETが返す。
   // DecisionCardは「サーバー応答を表示してから更新する」契約(Task 6)であり楽順更新を持たないため、
@@ -277,7 +298,12 @@ function createFetch(
     if (override !== undefined) return override;
     if (url.endsWith("/v1/repositories")) return json({ success: true, data: [repository] });
     if (url.includes("/v1/decision-records?repository_id=")) return json({ success: true, data: [summaryFixture(), summaryFixtureB()] });
-    if (url.endsWith("/v1/repositories/repo-1/files")) return json({ success: true, data: { repository_id: "repo-1", paths: ["src/a.ts", "src/b.ts"] } });
+    if (url.endsWith("/v1/repositories/repo-1/branches")) {
+      return json({ success: true, data: branchList });
+    }
+    if (requestPath(url).endsWith("/v1/repositories/repo-1/files")) {
+      return json({ success: true, data: { repository_id: "repo-1", view: { kind: "working-tree" }, paths: ["src/a.ts", "src/b.ts"] } });
+    }
     if (url.startsWith("/v1/repositories/repo-1/diff?")) {
       return url.includes("path=src%2Fb.ts") ? json({ success: true, data: fileBDiff }) : json({ success: true, data: fileDiff });
     }
@@ -342,6 +368,7 @@ describe("App", () => {
       headers: expect.objectContaining({ Authorization: "Bearer owner-token" }),
     }));
     expect(screen.getByText("/work/repo-one")).toBeTruthy();
+    expect(screen.queryByLabelText("Review view")).toBeNull();
   });
 
   it("recovers from an empty repository response without reloading", async () => {
@@ -755,7 +782,12 @@ describe("App", () => {
       const url = String(input);
       if (url.endsWith("/v1/repositories")) return json({ success: true, data: [repository] });
       if (url.includes("/v1/decision-records?repository_id=")) return json({ success: true, data: [workingTreeSummary] });
-      if (url.endsWith("/v1/repositories/repo-1/files")) return json({ success: true, data: { repository_id: "repo-1", paths: ["src/a.ts"] } });
+      if (url.endsWith("/v1/repositories/repo-1/branches")) {
+        return json({ success: true, data: { repository_id: "repo-1", head_branch: null, branches: [] } });
+      }
+      if (url.endsWith("/v1/repositories/repo-1/files")) {
+        return json({ success: true, data: { repository_id: "repo-1", view: { kind: "working-tree" }, paths: ["src/a.ts"] } });
+      }
       if (url.startsWith("/v1/repositories/repo-1/diff?")) {
         return json({ success: false, error: { code: "REVISION_NOT_FOUND", message: "revision was not found" } }, 404);
       }
@@ -841,10 +873,13 @@ describe("App", () => {
         return currentRepositories.promise;
       }
       if (url.includes("/v1/decision-records?repository_id=")) return json({ success: true, data: [] });
+      if (url.endsWith("/v1/repositories/repo-1/branches")) {
+        return json({ success: true, data: { repository_id: "repo-1", head_branch: "main", branches: [] } });
+      }
       if (url.endsWith("/v1/repositories/repo-1/files")) {
         fileCalls += 1;
         if (fileCalls === 1) return initialFiles.promise;
-        return json({ success: true, data: { repository_id: "repo-1", paths: ["current.ts"] } });
+        return json({ success: true, data: { repository_id: "repo-1", view: { kind: "working-tree" }, paths: ["current.ts"] } });
       }
       throw new Error(`unexpected request: ${url}`);
     });
@@ -983,5 +1018,233 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Guard the empty input" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Retry rec-1" })).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("renders Review view with working tree default and checked-out suffix when two local branches exist", async () => {
+    const fetchImpl = createFetch(undefined, undefined, undefined, undefined, twoBranchList);
+    await openWorkspace(fetchImpl);
+
+    const select = await screen.findByLabelText("Review view");
+    expect(select).toHaveProperty("value", "");
+    expect([...select.querySelectorAll("option")].map((option) => option.textContent)).toEqual([
+      "Working tree",
+      "feat/x",
+      "main (checked out)",
+    ]);
+  });
+
+  it("reloads files and the open diff with the selected branch query", async () => {
+    const fetchImpl = createFetch(undefined, undefined, undefined, undefined, twoBranchList);
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    await screen.findByRole("heading", { name: "Guard the empty input" });
+    fireEvent.change(await screen.findByLabelText("Review view"), { target: { value: "feat/x" } });
+
+    await waitFor(() => {
+      expect(fetchImpl).toHaveBeenCalledWith("/v1/repositories/repo-1/files?branch=feat%2Fx", expect.anything());
+    });
+    await waitFor(() => {
+      expect(fetchImpl.mock.calls.some(([url]) => {
+        const href = String(url);
+        return href.includes("/diff?") && href.includes("branch=feat%2Fx");
+      })).toBe(true);
+    });
+  });
+
+  it.each([
+    { label: "zero local branches", branches: [] as typeof twoBranchList.branches },
+    { label: "one local branch", branches: defaultBranchList.branches },
+  ])("does not render Review view for $label", async ({ branches }) => {
+    const fetchImpl = createFetch(undefined, undefined, undefined, undefined, {
+      repository_id: "repo-1",
+      head_branch: "main",
+      branches,
+    });
+    await openWorkspace(fetchImpl);
+
+    expect(screen.queryByLabelText("Review view")).toBeNull();
+  });
+
+  it("returns to the working tree when a selected branch files request is not found", async () => {
+    const fetchImpl = createFetch(undefined, undefined, undefined, (url) => {
+      if (url.includes("/v1/repositories/repo-1/files?") && url.includes("branch=")) {
+        return json({ success: false, error: { code: "REVISION_NOT_FOUND", message: "revision was not found" } }, 404);
+      }
+      return undefined;
+    }, twoBranchList);
+    await openWorkspace(fetchImpl);
+
+    fireEvent.change(await screen.findByLabelText("Review view"), { target: { value: "feat/x" } });
+
+    expect((await screen.findByRole("alert")).textContent).toContain("revision was not found");
+    expect(screen.getByLabelText("Review view")).toHaveProperty("value", "");
+    await waitFor(() => {
+      const fileUrls = fetchImpl.mock.calls
+        .map(([url]) => String(url))
+        .filter((url) => url.includes("/v1/repositories/repo-1/files"));
+      expect(fileUrls.at(-1)).toBe("/v1/repositories/repo-1/files");
+    });
+  });
+
+  it("keeps the open working-tree diff when a branch files request is unavailable", async () => {
+    const fetchImpl = createFetch(undefined, undefined, undefined, (url) => {
+      if (url.includes("/v1/repositories/repo-1/files?") && url.includes("branch=")) {
+        return json({ success: false, error: { code: "SOURCE_UNAVAILABLE", message: "Git repository data is unavailable" } }, 422);
+      }
+      return undefined;
+    }, twoBranchList);
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    await screen.findByRole("heading", { name: "Guard the empty input" });
+    expect(screen.getByText("const head = 0;")).toBeTruthy();
+
+    fireEvent.change(await screen.findByLabelText("Review view"), { target: { value: "feat/x" } });
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Git repository data is unavailable");
+    expect(screen.getByLabelText("Review view")).toHaveProperty("value", "");
+    expect(screen.getByText("a.ts")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Guard the empty input" })).toBeTruthy();
+    expect(screen.getByText("const head = 0;")).toBeTruthy();
+    expect(screen.queryByText("Select a file in the explorer to see its diff.")).toBeNull();
+  });
+
+  it("reloads the open working-tree diff after a branch disappears during the file request", async () => {
+    const fetchImpl = createFetch(undefined, undefined, undefined, (url) => {
+      if (url.includes("/diff?") && url.includes("branch=")) {
+        return json({ success: false, error: { code: "REVISION_NOT_FOUND", message: "revision was not found" } }, 404);
+      }
+      return undefined;
+    }, twoBranchList);
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    await screen.findByRole("heading", { name: "Guard the empty input" });
+
+    fireEvent.change(await screen.findByLabelText("Review view"), { target: { value: "feat/x" } });
+
+    expect((await screen.findByRole("alert")).textContent).toContain("revision was not found");
+    expect(screen.getByLabelText("Review view")).toHaveProperty("value", "");
+    await waitFor(() => {
+      const diffUrls = fetchImpl.mock.calls
+        .map(([url]) => String(url))
+        .filter((url) => url.includes("/diff?"));
+      expect(diffUrls.at(-1)).not.toContain("branch=");
+    });
+    expect(await screen.findByRole("heading", { name: "Guard the empty input" })).toBeTruthy();
+    expect(screen.getByText("const head = 0;")).toBeTruthy();
+    expect(screen.queryByText("Select a file in the explorer to see its diff.")).toBeNull();
+  });
+
+  it("keeps a saved disposition after the review view changes while the PATCH is in flight", async () => {
+    const fetchImpl = createFetch(
+      (url) => url.includes("/disposition"),
+      undefined,
+      undefined,
+      undefined,
+      twoBranchList,
+    );
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    const accept = await screen.findByRole("button", { name: "Accept" });
+    fireEvent.click(accept);
+    await screen.findByText("Saving disposition…");
+    expect(document.querySelector(".app-header__progress")?.textContent).toContain("2 unreviewed");
+
+    fireEvent.change(screen.getByLabelText("Review view"), { target: { value: "feat/x" } });
+    fetchImpl.releaseAll();
+
+    await waitFor(() => {
+      expect(document.querySelector(".app-header__progress")?.textContent).toContain("1 unreviewed");
+    });
+  });
+
+  it("shows the workspace heading even if the branches request is held", async () => {
+    const fetchImpl = createFetch((url) => url.endsWith("/v1/repositories/repo-1/branches"), undefined, undefined, undefined, twoBranchList);
+    await openWorkspace(fetchImpl);
+
+    expect(screen.getByRole("heading", { name: "Decision review" })).toBeTruthy();
+    expect(screen.queryByLabelText("Review view")).toBeNull();
+    expect(fetchImpl).toHaveBeenCalledWith("/v1/repositories/repo-1/branches", expect.anything());
+  });
+
+  it("does not attach working-tree source content as fullText when the review view is a local branch", () => {
+    const entries: JudgmentEntry[] = [{ recordId: "rec-1", status: "ready", detail: detailFixture() }];
+
+    expect(currentPathEvidence(entries, "src/a.ts", "local-branch").fullText).toBeNull();
+    expect(currentPathEvidence(entries, "src/a.ts", "working-tree").fullText?.content).toBe("const value = input ?? {};");
+  });
+
+  it("discards a stale branch files response after the review view changes again", async () => {
+    let holdBranchFiles = false;
+    const fetchImpl = createFetch(
+      (url) => holdBranchFiles && url.includes("/v1/repositories/repo-1/files?") && url.includes("branch="),
+      undefined,
+      undefined,
+      (url) => {
+        if (!requestPath(url).endsWith("/v1/repositories/repo-1/files") || !url.includes("branch=")) return undefined;
+        if (url.includes("branch=feat%2Fx")) {
+          return json({
+            success: true,
+            data: {
+              repository_id: "repo-1",
+              view: { kind: "local-branch", name: "feat/x", sha: "1".repeat(40) },
+              paths: ["src/a.ts", "feat-only.ts"],
+            },
+          });
+        }
+        if (url.includes("branch=main")) {
+          return json({
+            success: true,
+            data: {
+              repository_id: "repo-1",
+              view: { kind: "local-branch", name: "main", sha: "2".repeat(40) },
+              paths: ["src/a.ts", "main-only.ts"],
+            },
+          });
+        }
+        return undefined;
+      },
+      twoBranchList,
+    );
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    await screen.findByRole("heading", { name: "Guard the empty input" });
+
+    holdBranchFiles = true;
+    fireEvent.change(await screen.findByLabelText("Review view"), { target: { value: "feat/x" } });
+    await waitFor(() => {
+      expect(fetchImpl).toHaveBeenCalledWith("/v1/repositories/repo-1/files?branch=feat%2Fx", expect.anything());
+    });
+
+    fireEvent.change(screen.getByLabelText("Review view"), { target: { value: "main" } });
+    await waitFor(() => {
+      expect(fetchImpl).toHaveBeenCalledWith("/v1/repositories/repo-1/files?branch=main", expect.anything());
+    });
+    expect(screen.getByLabelText("Review view")).toHaveProperty("value", "main");
+
+    // feat/x is still in flight when main starts. Releasing it first is the window where
+    // loadFiles can apply feat/x and openFile("feat/x") while the select already shows main.
+    fetchImpl.releaseOne();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    holdBranchFiles = false;
+    fetchImpl.releaseAll();
+    await waitFor(() => {
+      expect(screen.getByText("main-only.ts")).toBeTruthy();
+    });
+
+    expect(screen.getByLabelText("Review view")).toHaveProperty("value", "main");
+    expect(screen.queryByText("feat-only.ts")).toBeNull();
+    const lastDiff = fetchImpl.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes("/diff?"))
+      .at(-1);
+    expect(lastDiff).toContain("branch=main");
+    expect(lastDiff).not.toContain("feat");
   });
 });

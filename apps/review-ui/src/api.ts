@@ -1,9 +1,11 @@
 import { ContractValidationError, isRecord, parseSnapshotDiffResponse } from "../../../packages/contracts/src/index";
 import type {
   ApiResponse,
+  BranchList,
   CheckEvidence,
   DecisionRecord,
   FileDiff,
+  RepositoryFiles,
   RevisionRef,
   SnapshotDiff,
   SnapshotDiffResponse,
@@ -223,22 +225,36 @@ export class ReviewApi {
     return this.request<RegisteredRepositorySummary[]>("/v1/repositories");
   }
 
-  listRepositoryFiles(repositoryId: string): Promise<{ repository_id: string; paths: string[] }> {
+  listBranches(repositoryId: string): Promise<BranchList> {
     const normalizedRepositoryId = repositoryId.trim();
     if (normalizedRepositoryId.length === 0) {
       return Promise.reject(new ReviewApiError("Repository ID is required", { status: 422, code: "INVALID_RECORD" }));
     }
-    return this.request<{ repository_id: string; paths: string[] }>(
-      `/v1/repositories/${encodeURIComponent(normalizedRepositoryId)}/files`,
+    return this.request<BranchList>(
+      `/v1/repositories/${encodeURIComponent(normalizedRepositoryId)}/branches`,
     );
   }
 
-  getFileDiff(repositoryId: string, path: string, base = "HEAD"): Promise<FileDiff> {
+  listRepositoryFiles(repositoryId: string, branch?: string): Promise<RepositoryFiles> {
+    const normalizedRepositoryId = repositoryId.trim();
+    if (normalizedRepositoryId.length === 0) {
+      return Promise.reject(new ReviewApiError("Repository ID is required", { status: 422, code: "INVALID_RECORD" }));
+    }
+    const params = new URLSearchParams();
+    if (typeof branch === "string") params.set("branch", branch);
+    const query = params.toString();
+    return this.request<RepositoryFiles>(
+      `/v1/repositories/${encodeURIComponent(normalizedRepositoryId)}/files${query.length === 0 ? "" : `?${query}`}`,
+    );
+  }
+
+  getFileDiff(repositoryId: string, path: string, base = "HEAD", branch?: string): Promise<FileDiff> {
     const normalizedRepositoryId = repositoryId.trim();
     if (normalizedRepositoryId.length === 0) {
       return Promise.reject(new ReviewApiError("Repository ID is required", { status: 422, code: "INVALID_RECORD" }));
     }
     const params = new URLSearchParams({ path, base });
+    if (typeof branch === "string") params.set("branch", branch);
     return this.request<FileDiff>(`/v1/repositories/${encodeURIComponent(normalizedRepositoryId)}/diff?${params.toString()}`);
   }
 

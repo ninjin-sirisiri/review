@@ -29,8 +29,15 @@ export function buildDecisionIndex(decisions: DecisionRecordSummary[]): Map<stri
 }
 
 /** Spec §5: commit revisions anchor unconditionally on the old side; verified
- * working-tree revisions anchor on the new side; everything else never anchors. */
-export function targetAnchor(source: SourceReferenceData): DecisionAnchor | null {
+ * working-tree revisions anchor on the new side only for the working-tree review
+ * view; everything else never anchors. */
+export function targetAnchor(
+  source: SourceReferenceData,
+  reviewView: "working-tree" | "local-branch" = "working-tree",
+): DecisionAnchor | null {
+  if (reviewView === "local-branch" && source.revision.kind !== "commit") {
+    return null;
+  }
   if (source.revision.kind === "commit") {
     return { side: "old", start: source.target.line_start, end: source.target.line_end };
   }
@@ -40,9 +47,12 @@ export function targetAnchor(source: SourceReferenceData): DecisionAnchor | null
   return null;
 }
 
-export function decisionAnchors(detail: DecisionRecordDetail): DecisionAnchor[] {
+export function decisionAnchors(
+  detail: DecisionRecordDetail,
+  reviewView: "working-tree" | "local-branch" = "working-tree",
+): DecisionAnchor[] {
   return detail.sources
-    .map((source) => targetAnchor(source))
+    .map((source) => targetAnchor(source, reviewView))
     .filter((anchor): anchor is DecisionAnchor => anchor !== null);
 }
 

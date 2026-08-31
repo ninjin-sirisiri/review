@@ -1,4 +1,5 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, type ChangeEvent } from "react";
+import type { BranchList, RepositoryFiles } from "../../../packages/contracts/src/index";
 import {
   ReviewApi,
   ReviewApiError,
@@ -54,9 +55,10 @@ function assertSnapshotTransitionMatchesSelection(result: SnapshotDiff, recordId
   return result;
 }
 
-function currentPathEvidence(
+export function currentPathEvidence(
   entries: Iterable<JudgmentEntry>,
   path: string | null,
+  reviewView: "working-tree" | "local-branch" = "working-tree",
 ): { anchors: DecisionAnchor[]; fullText: { content: string; anchors: DecisionAnchor[] } | null } {
   if (path === null) return { anchors: [], fullText: null };
 
@@ -70,10 +72,10 @@ function currentPathEvidence(
     const detail = sources.length === entry.detail.sources.length
       ? entry.detail
       : { ...entry.detail, sources };
-    const entryAnchors = decisionAnchors(detail);
+    const entryAnchors = decisionAnchors(detail, reviewView);
     anchors.push(...entryAnchors);
 
-    if (fullText === null) {
+    if (fullText === null && reviewView === "working-tree") {
       const source = sources.find((candidate) => candidate.state === "resolved" || candidate.state === "snapshot-resolved");
       if (source !== undefined && "content" in source) {
         fullText = { content: source.content, anchors: entryAnchors };
@@ -93,6 +95,9 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [decisions, setDecisions] = useState<DecisionRecordSummary[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [branchList, setBranchList] = useState<BranchList | null>(null);
+  const [reviewBranch, setReviewBranchState] = useState<string | null>(null);
+  const reviewBranchRef = useRef<string | null>(null);
 
   // Explorer state
   const [filePaths, setFilePaths] = useState<string[]>([]);
@@ -112,11 +117,38 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [snapshotDiffLoading, setSnapshotDiffLoading] = useState(false);
   const [snapshotDiffError, setSnapshotDiffError] = useState<ReviewApiError | Error | null>(null);
   const [recordStates, setRecordStates] = useState<Record<string, JudgmentEntry>>({});
-  // M31: openFileが進める単調トークン。後発のファイル選択は先行ロードの非同期完了を無効化し、
-  // 遅れて着いた応答が新しい選択の状態を上書きしないようにする。
+  // M31: openFile が進める単調トークン。後発のファイル選択は先行ロードの非同期完了を無効化する。
+  // loadFiles は filesRequestTokenRef。review view 切替で disposition 保存を捨てない。
   const requestTokenRef = useRef(0);
+  const filesRequestTokenRef = useRef(0);
   const sessionGenerationRef = useRef(0);
   const snapshotRequestTokenRef = useRef(0);
+
+  function assignReviewBranch(next: string | null) {
+    reviewBranchRef.current = next;
+    setReviewBranchState(next);
+  }
+
+  function clearOpenFile() {
+    resetSnapshotTransition();
+    setSelectedPath(null);
+    setFileIsLoading(false);
+    setFileError(null);
+    setFileBaseMissing(false);
+    setDiff(null);
+    setRecordStates({});
+  }
+
+  async function syncSelectedPath(data: RepositoryFiles, branch: string | null) {
+    if (selectedPath === null) return;
+    const known = new Set(data.paths);
+    for (const path of decisionIndex.keys()) known.add(path);
+    if (known.has(selectedPath)) {
+      await openFile(selectedPath, branch);
+    } else {
+      clearOpenFile();
+    }
+  }
 
   const decisionIndex = useMemo(() => buildDecisionIndex(decisions), [decisions]);
   const tree = useMemo(() => {
@@ -137,9 +169,10 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     });
   }, [selectedPath, decisionIndex, recordStates]);
 
+  const reviewView = reviewBranch !== null ? "local-branch" as const : "working-tree" as const;
   const evidence = useMemo(
-    () => currentPathEvidence(Object.values(recordStates), selectedPath),
-    [recordStates, selectedPath],
+    () => currentPathEvidence(Object.values(recordStates), selectedPath, reviewView),
+    [recordStates, selectedPath, reviewView],
   );
 
   const selectedTransitionAnchors = selectedRecordId !== null && selectedPath !== null
@@ -179,13 +212,25 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
       }
 
       const client = api ?? apiFactory(tokenInput.trim());
-      const records = await client.listDecisions(repository);
+      const recordsPromise = client.listDecisions(repository);
+      const filesPromise = loadFiles(client, repository, sessionGeneration, null);
+      void client.listBranches(repository).then(
+        (list) => {
+          if (sessionGenerationRef.current !== sessionGeneration) return;
+          setBranchList(list);
+        },
+        (requestError: unknown) => {
+          if (sessionGenerationRef.current !== sessionGeneration) return;
+          setError(apiMessage(requestError));
+        },
+      );
+      const records = await recordsPromise;
       if (sessionGenerationRef.current !== sessionGeneration) return;
       setApi(client);
       setRepositoryId(repository);
       setDecisions(records);
       if (sessionGenerationRef.current !== sessionGeneration) return;
-      await loadFiles(client, repository, sessionGeneration);
+      await filesPromise;
     } catch (requestError) {
       if (sessionGenerationRef.current !== sessionGeneration) return;
       if (repositories === null) {
@@ -198,26 +243,55 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     }
   }
 
-  async function loadFiles(client: ReviewApi, repository: string, sessionGeneration: number) {
-    const fileToken = requestTokenRef.current;
+  async function loadFiles(
+    client: ReviewApi,
+    repository: string,
+    sessionGeneration: number,
+    branch: string | null,
+  ): Promise<RepositoryFiles | undefined> {
+    const fileToken = ++filesRequestTokenRef.current;
     const isCurrent = () =>
-      sessionGenerationRef.current === sessionGeneration && requestTokenRef.current === fileToken;
-    if (!isCurrent()) return;
+      sessionGenerationRef.current === sessionGeneration
+      && filesRequestTokenRef.current === fileToken
+      && reviewBranchRef.current === branch;
+    if (!isCurrent()) return undefined;
     setExplorerIsLoading(true);
     setExplorerError(null);
     try {
-      const data = await client.listRepositoryFiles(repository);
-      if (!isCurrent()) return;
+      const data = await client.listRepositoryFiles(repository, branch ?? undefined);
+      if (!isCurrent()) return undefined;
       setFilePaths(data.paths);
+      return data;
     } catch (requestError) {
-      if (!isCurrent()) return;
-      setExplorerError(asError(requestError));
+      if (!isCurrent()) return undefined;
+      if (branch !== null && requestError instanceof ReviewApiError && requestError.code === "REVISION_NOT_FOUND") {
+        assignReviewBranch(null);
+        setError(apiMessage(requestError));
+        return await loadFiles(client, repository, sessionGeneration, null);
+      }
+      setError(apiMessage(requestError));
+      return undefined;
     } finally {
       if (isCurrent()) setExplorerIsLoading(false);
     }
   }
 
-  async function openFile(path: string) {
+  async function handleReviewViewChange(event: ChangeEvent<HTMLSelectElement>) {
+    const previous = reviewBranchRef.current;
+    const next = event.target.value === "" ? null : event.target.value;
+    assignReviewBranch(next);
+    if (api === null || repositoryId === null) return;
+    const sessionGeneration = sessionGenerationRef.current;
+    const data = await loadFiles(api, repositoryId, sessionGeneration, next);
+    if (sessionGenerationRef.current !== sessionGeneration) return;
+    if (data === undefined) {
+      if (reviewBranchRef.current === next) assignReviewBranch(previous);
+      return;
+    }
+    await syncSelectedPath(data, reviewBranchRef.current);
+  }
+
+  async function openFile(path: string, branch: string | null) {
     if (api === null || repositoryId === null) return;
     const token = ++requestTokenRef.current;
     resetSnapshotTransition();
@@ -233,7 +307,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
       related.map((summary) => [summary.record_id, { recordId: summary.record_id, status: "loading" as const }]),
     ));
 
-    const diffAttempt = api.getFileDiff(repositoryId, path, base).then(
+    const diffAttempt = api.getFileDiff(repositoryId, path, base, branch ?? undefined).then(
       (value) => ({ ok: true as const, value }),
       (error: unknown) => ({ ok: false as const, error }),
     );
@@ -247,9 +321,31 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
     // トークンが進んでいれば、この完了は後発のファイル選択に負けている。何も状態を触らず破棄する。
     if (requestTokenRef.current !== token) return;
+    if (branch !== reviewBranchRef.current) return;
 
     if (diffResult.ok) {
       setDiff(diffResult.value);
+    } else if (
+      branch !== null &&
+      diffResult.error instanceof ReviewApiError &&
+      diffResult.error.code === "REVISION_NOT_FOUND"
+    ) {
+      assignReviewBranch(null);
+      setError(apiMessage(diffResult.error));
+      const files = await loadFiles(api, repositoryId, sessionGenerationRef.current, null);
+      if (requestTokenRef.current !== token) return;
+      if (files === undefined) {
+        setFileIsLoading(false);
+        return;
+      }
+      const known = new Set(files.paths);
+      for (const candidate of decisionIndex.keys()) known.add(candidate);
+      if (known.has(path)) {
+        await openFile(path, null);
+        return;
+      }
+      clearOpenFile();
+      return;
     } else if (
       base === "HEAD" &&
       diffResult.error instanceof ReviewApiError &&
@@ -324,10 +420,10 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     if (api === null) throw new ReviewApiError("Not connected to Recorder", { code: "UNKNOWN" });
     const token = requestTokenRef.current;
     const updated = await api.setDisposition(recordId, disposition);
-    if (requestTokenRef.current !== token) return updated;
     setDecisions((current) => current.map((decision) => (
       decision.record_id === updated.record.record_id ? updated.record : decision
     )));
+    if (requestTokenRef.current !== token) return updated;
     setRecordStates((current) => ({
       ...current,
       [recordId]: { recordId, status: "ready", detail: updated },
@@ -356,6 +452,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
   function resetSession() {
     requestTokenRef.current += 1;
+    filesRequestTokenRef.current += 1;
     sessionGenerationRef.current += 1;
     resetSnapshotTransition();
     setApi(null);
@@ -364,6 +461,8 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     setSelectedRepositoryId("");
     setDecisions([]);
     setFilePaths([]);
+    setBranchList(null);
+    assignReviewBranch(null);
     setIsLoading(false);
     setExplorerIsLoading(false);
     setExplorerError(null);
@@ -403,6 +502,23 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
         <div className="app-header__identity">
           <h1>Decision review</h1>
           <p className="app-header__repo"><code>{activeRepository?.root ?? repositoryId}</code></p>
+          {branchList !== null && branchList.branches.length >= 2 ? (
+            <div className="app-header__view">
+              <label htmlFor="review-view">Review view</label>
+              <select
+                id="review-view"
+                value={reviewBranch ?? ""}
+                onChange={(event) => void handleReviewViewChange(event)}
+              >
+                <option value="">Working tree</option>
+                {branchList.branches.map((branch) => (
+                  <option key={branch.name} value={branch.name}>
+                    {branch.name === branchList.head_branch ? `${branch.name} (checked out)` : branch.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
         </div>
         <p className="app-header__progress" aria-live="polite">
           {unreviewedCount} unreviewed
@@ -420,9 +536,9 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
         explorerIsLoading={explorerIsLoading}
         explorerError={explorerError}
         onExplorerRetry={() => api !== null && repositoryId !== null
-          ? void loadFiles(api, repositoryId, sessionGenerationRef.current)
+          ? void loadFiles(api, repositoryId, sessionGenerationRef.current, reviewBranch)
           : undefined}
-        onOpenFile={(path) => void openFile(path)}
+        onOpenFile={(path) => void openFile(path, reviewBranch)}
         fileIsLoading={fileIsLoading}
         fileError={fileError}
         fileBaseMissing={fileBaseMissing}
@@ -432,7 +548,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
           if (selectedRecordId !== null && snapshotDiffError !== null) {
             void selectJudgment(selectedRecordId, true);
           } else if (selectedPath !== null) {
-            void openFile(selectedPath);
+            void openFile(selectedPath, reviewBranch);
           }
         }}
         judgments={judgments}
