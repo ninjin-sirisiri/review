@@ -82,6 +82,24 @@ describe("DecisionCard", () => {
     expect(screen.getByText(/snapshot @a1b2c3d4/)).toBeTruthy();
   });
 
+  it("shortens long record ids and working-tree hashes in the card chrome", () => {
+    const longId = "a".repeat(64);
+    const longHash = "b".repeat(64);
+    const longDetail: DecisionRecordDetail = {
+      ...detail,
+      record: {
+        ...detail.record,
+        record_id: longId,
+        revision: { kind: "working-tree", contentHash: longHash },
+      },
+    };
+    render(<DecisionCard detail={longDetail} />);
+
+    expect(screen.getByTitle(longId).textContent).toBe(`Decision ${longId.slice(0, 8)}`);
+    expect(screen.getByTitle(longHash).textContent).toBe(longHash.slice(0, 8));
+    expect(screen.queryByText(longHash)).toBeNull();
+  });
+
   it("hides provenance when a git snapshot has no base SHA", () => {
     render(<DecisionCard detail={detailWithSnapshot("git")} />);
 

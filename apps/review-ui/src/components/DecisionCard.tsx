@@ -92,11 +92,14 @@ export function DecisionCard({ detail, selected = false, onSelect = () => {}, on
             <span className={`disposition-badge disposition-badge--${displayedRecord.user_disposition}`}>
               {dispositionStatusLabel(displayedRecord.user_disposition)}
             </span>
-            <span className="eyebrow">Decision {displayedRecord.record_id}</span>
+            <span className="eyebrow" title={displayedRecord.record_id}>
+              Decision {shortRef(displayedRecord.record_id)}
+            </span>
           </p>
           <h3 id={`decision-${displayedRecord.record_id}`}>{displayedRecord.judgment}</h3>
           <p className="decision-card__meta">
-            {displayedRecord.agent_type} · {new Date(displayedRecord.created_at).toLocaleString()} · revision {revisionText(displayedRecord.revision)}
+            {displayedRecord.agent_type} · {new Date(displayedRecord.created_at).toLocaleString()} · revision{" "}
+            <code title={revisionValue(displayedRecord.revision)}>{revisionText(displayedRecord.revision)}</code>
             {provenance !== undefined && (
               <span className="snapshot-provenance" title="Snapshot stored as a git reference">
                 {" · "}snapshot @{provenance}
@@ -200,6 +203,14 @@ export function DecisionCard({ detail, selected = false, onSelect = () => {}, on
   );
 }
 
-function revisionText(revision: DecisionRecordDetail["record"]["revision"]): string {
+function revisionValue(revision: DecisionRecordDetail["record"]["revision"]): string {
   return revision.kind === "commit" ? revision.sha : revision.contentHash;
+}
+
+function revisionText(revision: DecisionRecordDetail["record"]["revision"]): string {
+  return shortRef(revisionValue(revision));
+}
+
+function shortRef(value: string, length = 8): string {
+  return value.length <= length ? value : value.slice(0, length);
 }
