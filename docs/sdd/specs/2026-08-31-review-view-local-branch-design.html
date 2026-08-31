@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="und">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src &#x27;none&#x27;; img-src &#x27;self&#x27; data:; style-src &#x27;self&#x27;; base-uri &#x27;none&#x27;; form-action &#x27;none&#x27;; frame-ancestors &#x27;none&#x27;">
+<title>Review UI ローカルブランチの review view</title>
+<link rel="stylesheet" href="../assets/sdd.css">
+</head>
+<body>
+<main>
+<h1>Review UI ローカルブランチの review view</h1>
+<ul>
+<li>日付: 2026-08-31</li>
+<li>状態: 設計承認待ち</li>
+<li>分類: architectural</li>
+<li>用語: <a href="../../../CONTEXT.md">CONTEXT.md</a></li>
+<li>上位仕様: <a href="../../superpowers/specs/2026-08-22-review-ui-two-pane-design.md">Review UI 2ペイン</a>、<a href="../../superpowers/specs/2026-08-20-ai-code-review-evidence-design.md">AI Code Review Evidence</a></li>
+</ul>
+<p>登録リポジトリにローカルブランチが2本以上あるとき、Review UI からブランチ tip を読み取り専用で閲覧できるようにする。checkout しない。判断記録の形は変えない。</p>
+<p>2ペイン仕様の「現在の作業ツリー」を、この仕様では <strong>review view</strong>（作業ツリー、または選んだローカルブランチ tip）に置き換える。review view が作業ツリーのときは 2ペイン仕様どおり。</p>
+<h2>1. 目的</h2>
+<p>レビュー中に、同じ登録ルートの別ローカルブランチ tip のファイルツリーと内容を見られるようにする。初期表示と未コミット確認は今と同じ作業ツリーのままにする。</p>
+<h2>2. Goals</h2>
+<ul>
+<li>ローカルブランチが2本以上ある登録リポジトリで、ローカルブランチ tip を読み取り専用で見られる。</li>
+<li>初期 review view は作業ツリー。切替はワークスペースヘッダー。</li>
+<li>2ペインの比較形を保つ。旧側は diff base、新側は diff current。</li>
+<li>checkout しない。判断記録、プラグイン、edit gate は変えない。</li>
+</ul>
+<h2>3. Non-goals</h2>
+<ul>
+<li>remote-tracking / tag / 任意 SHA を review view にする。</li>
+<li>実ブランチの checkout・作成・削除。</li>
+<li>判断をブランチで絞り込む。記録にブランチ名を足す。</li>
+<li>review view を URL / cookie / localStorage / sessionStorage に残す。</li>
+<li>ブートストラップ画面でのブランチ選択。</li>
+<li>Git 履歴の自動取得、log、blame。</li>
+<li>スナップショット遷移の意味変更。</li>
+<li>ブランチごとの別 <code>repository_id</code>。</li>
+<li>新しい <code>ERROR_CODES</code>。</li>
+</ul>
+<h2>4. 採用したアプローチ</h2>
+<table>
+<thead>
+<tr>
+  <th>案</th>
+  <th>概要</th>
+  <th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong>1（採用）</strong></td>
+  <td>既存の <code>files</code> / <code>diff</code> に省略可能な <code>branch</code> を足し、ローカルブランチ一覧の GET を1本追加する</td>
+  <td>checkout せず tip を読める。記録形式を変えない</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td>ブランチごとに登録ルートや worktree を増やす</td>
+  <td>実 checkout か <code>repository_id</code> の意味変更が要る。不採用</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td>UI にブランチ名だけ出し、<code>files</code> / <code>diff</code> の新側は常に作業ツリー</td>
+  <td>tip 閲覧を満たさない。不採用</td>
+</tr>
+</tbody>
+</table>
+<p>ADR は書かない。API 追加は後方互換のフィールド追加であり、3条件（覆しにくい・文脈なしでは意外・トレードオフの結果）を同時に満たさない。既定値と禁止事項はこの仕様に置く。</p>
+<h2>5. 用語との対応</h2>
+<ul>
+<li><strong>Review view</strong>: 作業ツリー（既定）またはローカルブランチ tip。checkout しない。</li>
+<li><strong>Local branch</strong>: <code>refs/heads</code> の名前付きブランチ。短い名前で識別する。</li>
+<li><strong>Diff base</strong>: そのファイルの最新 commit-revision 判断。無ければ review view の tip commit。</li>
+<li><strong>Diff current</strong>: review view のそのパスの内容。</li>
+</ul>
+<h2>6. アーキテクチャ</h2>
+<p>Recorder は登録ルートを読んだままにする。ユーザー入力のブランチ名を、そのリクエスト時点の <code>refs/heads</code> 一覧と完全一致させてから使う。一致しない文字列を <code>rev-parse</code> しない。クライアントから tip SHA を受け取って view にしない。各 <code>files</code> / <code>diff</code> はその時点の tip を読む。</p>
+<pre><code>Review UI
+  → GET /v1/repositories/:id/branches
+  → GET /v1/repositories/:id/files[?branch=&lt;short-name&gt;]
+  → GET /v1/repositories/:id/diff?path=&amp;base=&amp;[branch=&lt;short-name&gt;]
+GitReader（既存の読み取り専用 git 実行）
+  → for-each-ref refs/heads / ls-tree / show blob
+  → 作業ツリー時のみ ls-files と作業ツリー読み
+</code></pre>
+<p><code>branch</code> クエリを省略した <code>files</code> / <code>diff</code> は、今の作業ツリー挙動のままにする。<code>working-tree</code> という予約ブランチ名は使わない。</p>
+<p>判断カード、source 解決、snapshot-diff は今のエンドポイントのままにする。</p>
+<h2>7. API</h2>
+<p>認証、Origin、登録ルート検証は既存 <code>/v1</code> と同じ。新しい error code は足さない。</p>
+<h3>7.1 <code>GET /v1/repositories/:id/branches</code></h3>
+<pre><code class="language-jsonc">{
+  &quot;repository_id&quot;: &quot;…&quot;,
+  &quot;head_branch&quot;: &quot;main&quot;, // いま checkout されているローカルブランチの短い名前。detached または未誕生、あるいはその名前が一覧に無いときは null
+  &quot;branches&quot;: [
+    { &quot;name&quot;: &quot;feat/x&quot;, &quot;sha&quot;: &quot;0123456789abcdef0123456789abcdef01234567&quot; },
+    { &quot;name&quot;: &quot;main&quot;, &quot;sha&quot;: &quot;89abcdef0123456789abcdef0123456789abcdef&quot; }
+  ]
+}
+</code></pre>
+<ul>
+<li>対象は <code>refs/heads</code> のみ。remote-tracking と tag は含めない。</li>
+<li><code>name</code> は <code>refname:short</code>（<code>refs/heads/</code> を付けない）。</li>
+<li><code>sha</code> は 40 桁 hex の tip commit。</li>
+<li><code>branches</code> は短い名前の辞書順（既存 <code>files</code> の <code>paths.sort()</code> と同じ文字列順）。</li>
+<li>短い名前が既存の安全な revision 文字規則（長さ 1–128、先頭 <code>-</code> 禁止、<code>..</code> / <code>@{</code> / NUL 禁止、<code>[A-Za-z0-9._/-]+</code>）を満たさないブランチは一覧から省略する。一件の省略でエンドポイント全体を失敗させない。</li>
+<li><code>head_branch</code> は、HEAD が指すローカルブランチの短い名前が一覧に含まれるときだけその名前。それ以外は <code>null</code>。</li>
+</ul>
+<p>エラー: <code>401 UNAUTHORIZED</code> / <code>404 REPOSITORY_NOT_REGISTERED</code> / <code>422 SOURCE_UNAVAILABLE</code> / <code>413 PAYLOAD_TOO_LARGE</code>。</p>
+<p>未誕生リポジトリは <code>branches: []</code> かつ <code>head_branch: null</code> で 200。</p>
+<h3>7.2 <code>GET /v1/repositories/:id/files</code></h3>
+<p>既存の <code>repository_id</code> と <code>paths</code> に <code>view</code> を足す。</p>
+<pre><code class="language-jsonc">{
+  &quot;repository_id&quot;: &quot;…&quot;,
+  &quot;view&quot;: { &quot;kind&quot;: &quot;working-tree&quot; },
+  &quot;paths&quot;: [&quot;src/api.ts&quot;]
+}
+</code></pre>
+<p>または</p>
+<pre><code class="language-jsonc">{
+  &quot;repository_id&quot;: &quot;…&quot;,
+  &quot;view&quot;: { &quot;kind&quot;: &quot;local-branch&quot;, &quot;name&quot;: &quot;feat/x&quot;, &quot;sha&quot;: &quot;0123456789abcdef0123456789abcdef01234567&quot; },
+  &quot;paths&quot;: [&quot;src/api.ts&quot;]
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+  <th><code>branch</code> クエリ</th>
+  <th>パスの出どころ</th>
+  <th><code>view</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>省略</td>
+  <td>今どおり <code>ls-files</code>（作業ツリー）</td>
+  <td><code>{ kind: &quot;working-tree&quot; }</code></td>
+</tr>
+<tr>
+  <td>一覧にある短い名前</td>
+  <td>その tip の <code>ls-tree</code></td>
+  <td><code>{ kind: &quot;local-branch&quot;, name, sha }</code></td>
+</tr>
+<tr>
+  <td>空または空白のみ</td>
+  <td>—</td>
+  <td><code>422 INVALID_RECORD</code>（field: <code>branch</code>）</td>
+</tr>
+<tr>
+  <td>それ以外</td>
+  <td>—</td>
+  <td><code>404 REVISION_NOT_FOUND</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>paths</code> はルート相対・POSIX 区切り・辞書順。既存のパス検証（ルート外・nested repository）を維持する。</p>
+<p>その他のエラーは今の <code>files</code> と同じ: <code>401</code> / <code>404 REPOSITORY_NOT_REGISTERED</code> / <code>422 SOURCE_UNAVAILABLE</code> / <code>413 PAYLOAD_TOO_LARGE</code>。</p>
+<h3>7.3 <code>GET /v1/repositories/:id/diff?path=&amp;base=&amp;branch=</code></h3>
+<p>構造化 <code>FileDiff</code> を返す。フィールド名は今と同じ。<code>new_missing</code> の意味だけ次に固定する: <strong>diff current にそのパスが無い</strong>。</p>
+<table>
+<thead>
+<tr>
+  <th>条件</th>
+  <th>旧側（diff base）</th>
+  <th>新側（diff current）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>branch</code> 省略</td>
+  <td><code>base</code> 省略時または <code>HEAD</code> → 作業ツリーの HEAD。それ以外は今どおりその revision</td>
+  <td>作業ツリーのファイル</td>
+</tr>
+<tr>
+  <td><code>branch</code> が一覧にある</td>
+  <td><code>base</code> 省略時または <code>HEAD</code> → そのローカルブランチ tip。それ以外は今どおりその revision</td>
+  <td>その tip の blob</td>
+</tr>
+</tbody>
+</table>
+<p><code>path</code> 検証は今どおり <code>normalizeSourcePath</code> と <code>registry.assertTarget</code>。</p>
+<p><code>branch</code> の空文字・未知名・危険文字列の扱いは <code>files</code> と同じ（空は 422、それ以外の不正は 404）。</p>
+<p><code>base</code> が解決できないときは今どおり <code>404 REVISION_NOT_FOUND</code>。未誕生で <code>branch</code> 省略かつ <code>base=HEAD</code> のときは、UI が今どおり「比較対象なし」として扱う。</p>
+<p>その他のエラーは今の <code>diff</code> と同じ: <code>401</code> / <code>404 REPOSITORY_NOT_REGISTERED</code> / <code>422 PATH_OUTSIDE_ROOT</code> / <code>422 SOURCE_UNAVAILABLE</code> / <code>413 PAYLOAD_TOO_LARGE</code>。</p>
+<h2>8. データフローと順序</h2>
+<ol>
+<li>トークン入力とリポジトリ選択は今のまま。</li>
+<li>ワークスペース開始時、次を並行取得する: 判断一覧、<code>files</code>（<code>branch</code> なし）、<code>branches</code>。</li>
+<li><code>files</code> が返った時点で Explorer を出す。<code>branches</code> を待ってワークスペース表示を遅らせない。</li>
+<li><code>branches.length &gt;= 2</code> のときだけヘッダーに選択 UI を出す。0 または 1 のときは出さない。初期選択は作業ツリー。</li>
+<li>選択 UI の先頭は作業ツリー。続けて <code>branches</code> の順（辞書順）でローカルブランチ。<code>name === head_branch</code> の項目に、checkout されていることだけが分かる印を付ける。ラベルに <code>HEAD</code> や &quot;current branch&quot; は使わない。</li>
+<li>ユーザーがローカルブランチを選んだら、同じ <code>branch</code> で <code>files</code> と、開いているファイルがあれば <code>diff</code> を取り直す。</li>
+<li>Explorer のパス集合は、その応答の <code>paths</code> ∪ 判断索引のパス（2ペイン仕様と同じ和集合）。</li>
+<li>開いていたパスが新しい集合に無ければ選択を外す。あればそのパスの diff を新しい review view で出す。</li>
+<li>review view は React のメモリだけ。リロードと Clear session で作業ツリーに戻す。</li>
+</ol>
+<p>判断カードはパス単位の全件のまま。ブランチ名でも Git 祖先でも絞らない。</p>
+<h2>9. 行アンカー</h2>
+<table>
+<thead>
+<tr>
+  <th>判断の revision</th>
+  <th>review view</th>
+  <th>アンカー</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>commit</td>
+  <td>作業ツリーまたはローカルブランチ</td>
+  <td>今どおり diff の旧側</td>
+</tr>
+<tr>
+  <td>working-tree かつ source が <code>resolved</code> / <code>snapshot-resolved</code></td>
+  <td>作業ツリー</td>
+  <td>今どおり diff の新側</td>
+</tr>
+<tr>
+  <td>working-tree</td>
+  <td>ローカルブランチ</td>
+  <td>アンカーしない。カードは出す</td>
+</tr>
+<tr>
+  <td>working-tree かつ source 失敗</td>
+  <td>どちらでも</td>
+  <td>今どおりアンカーしない</td>
+</tr>
+</tbody>
+</table>
+<p>スナップショット遷移は今のまま。ブランチ view 中でも撮影同士、または撮影 vs 作業ツリーを中央に出してよい。ヘッダーの review view は変えない。</p>
+<h2>10. コンポーネント</h2>
+<p><strong>GitReader</strong><br />
+既存の読み取り専用 <code>execute</code> だけを使う。追加責務は次に限る。</p>
+<ul>
+<li>ローカルブランチ一覧（<code>for-each-ref refs/heads</code> と HEAD が指すローカルブランチ）</li>
+<li>コミット tree のパス一覧（既存 private <code>listTreePaths</code> を公開する）</li>
+<li><code>readPathDiff</code> の新側を作業ツリーまたは指定 commit blob にする</li>
+</ul>
+<p>view 用に、一覧に無い文字列を <code>rev-parse</code> しない。view 用にクライアント提出の SHA を使わない。</p>
+<p><strong>HTTP</strong><br />
+<code>GET /v1/repositories/:id/branches</code> を追加する。既存 <code>files</code> / <code>diff</code> に省略可能な <code>branch</code> を追加する。プラグインが使う POST / PATCH / source / snapshot-diff は変えない。</p>
+<p><strong>contracts</strong><br />
+ブランチ一覧型と <code>files</code> の <code>view</code> を追加する。<code>FileDiff</code> のフィールドは維持し、<code>new_missing</code> の説明だけ diff current に合わせる。判断記録型は触らない。</p>
+<p><strong>Review UI</strong><br />
+<code>ReviewApi</code> に <code>listBranches</code> と、<code>listRepositoryFiles</code> / <code>getFileDiff</code> への <code>branch</code> を追加する。<code>App</code> が review view をタブ内 state で持つ。ヘッダーの選択は <code>branches.length &gt;= 2</code> のときだけ。<code>BootstrapScreen</code>、Explorer のツリー描画、JudgmentPanel、スナップショット遷移の API は今のまま。</p>
+<p><strong>触らないもの</strong><br />
+RecordStore、RepositoryRegistry、判断の source 解決、git-backed snapshot、全プラグイン、edit gate。</p>
+<h2>11. エラー処理</h2>
+<table>
+<thead>
+<tr>
+  <th>状況</th>
+  <th>挙動</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>branch</code> 省略</td>
+  <td>作業ツリー。既存の files/diff</td>
+</tr>
+<tr>
+  <td><code>branch</code> が空または空白のみ</td>
+  <td><code>422 INVALID_RECORD</code>（field: <code>branch</code>）</td>
+</tr>
+<tr>
+  <td><code>branch</code> が一覧に無い（削除済み、remote 名、tag、危険文字列を含む）</td>
+  <td><code>404 REVISION_NOT_FOUND</code></td>
+</tr>
+<tr>
+  <td>選択中のブランチが再取得や files/diff で <code>REVISION_NOT_FOUND</code></td>
+  <td>UI は作業ツリーへ戻し、インラインエラーを出す。消えた tip に居残らない</td>
+</tr>
+<tr>
+  <td>未誕生</td>
+  <td><code>branches: []</code>。選択 UI なし。<code>base=HEAD</code> の diff は今どおり比較対象なし</td>
+</tr>
+<tr>
+  <td>detached HEAD</td>
+  <td><code>head_branch: null</code>。一覧は出す。選択 UI は2本以上なら出す</td>
+</tr>
+<tr>
+  <td>for-each-ref / ls-tree がサイズ上限超え</td>
+  <td><code>413 PAYLOAD_TOO_LARGE</code></td>
+</tr>
+<tr>
+  <td>Git が読めない</td>
+  <td><code>422 SOURCE_UNAVAILABLE</code></td>
+</tr>
+<tr>
+  <td>diff の <code>path</code> がルート外</td>
+  <td><code>422 PATH_OUTSIDE_ROOT</code></td>
+</tr>
+</tbody>
+</table>
+<p>checkout 失敗は起きない（checkout しない）。</p>
+<h2>12. テスト</h2>
+<p>既存 runner 配置に従う（Recorder は bun test、Review UI は vitest、E2E は Playwright）。<code>branch</code> を付けない既存 files/diff/source/snapshot テストは回帰させる。</p>
+<ul>
+<li><strong>GitReader</strong>: ローカルブランチのみ（<code>feat/x</code> を含む）、remote と tag を含めない、安全規則外の名前は省略、detached で <code>head_branch</code> 相当が無い、未誕生は空、サイズ上限、ブランチ tip を新側にした diff（追加・削除・同一・binary・片側 missing）。<code>branch</code> 省略の <code>readPathDiff</code> は今と同じ作業ツリー新側。</li>
+<li><strong>HTTP</strong>: <code>branches</code> の 401 と未登録 404。<code>files</code> / <code>diff</code> は <code>branch</code> 省略で今と同じ。一致するローカル名は 200 で <code>view.kind === &quot;local-branch&quot;</code>。不一致は 404。空文字は 422。<code>base</code> 省略 + <code>branch</code> ありの旧側はその tip。</li>
+<li><strong>contracts</strong>: 一覧と <code>files.view</code> の型。</li>
+<li><strong>Review UI</strong>: 0本と1本で選択 UI なし、2本以上でヘッダーに出る、初期は作業ツリー、切替で files と開いている diff を取り直す、パスが新しい集合に無ければ選択解除、<code>REVISION_NOT_FOUND</code> で作業ツリーへ戻す、ブランチ view では作業ツリー判断を新側にアンカーしない。</li>
+<li><strong>E2E</strong>: ローカルブランチが2本ある fixture でヘッダーから切替し、Explorer がその tip の tree になる。作業ツリーにだけある未コミットファイルはブランチ view の tree に出ない。</li>
+</ul>
+<h2>13. 消費経路</h2>
+<ul>
+<li>Review UI ワークスペースヘッダー → <code>GET .../branches</code> と <code>files</code> / <code>diff</code> の <code>branch</code>。</li>
+<li>Recorder の GitReader と HTTP。contracts の型を Recorder と Review UI が共有する。</li>
+<li>E2E のレビューフロー。</li>
+</ul>
+<p>プラグイン、判断 POST、source 解決、snapshot-diff のクエリは消費しない。</p>
+<h2>14. 既定値・禁止・順序保証</h2>
+<ul>
+<li>選択 UI を出す条件は <code>branches.length &gt;= 2</code> のみ。</li>
+<li>初期 review view は作業ツリー。</li>
+<li>ブランチ名の表示順はサーバーが一覧を辞書順にした結果。</li>
+<li>review view はタブ内メモリのみ。リロードと Clear session で作業ツリー。</li>
+<li><code>branch</code> 省略は作業ツリー。予約名 <code>working-tree</code> は使わない。</li>
+<li>view 用に一覧外の文字列を <code>rev-parse</code> しない。view 用にクライアント提出の SHA を使わない。</li>
+<li>remote-tracking と tag を review view にしない。</li>
+<li>新しい <code>ERROR_CODES</code> を足さない。</li>
+<li>判断をブランチで絞らない。</li>
+<li>checkout しない。</li>
+<li>ワークスペース表示は <code>files</code> 到着で開始し、<code>branches</code> 完了を待たない。</li>
+<li>選択変更後の Explorer は <code>paths</code> ∪ 判断索引。</li>
+</ul>
+<h2>15. セキュリティ</h2>
+<ul>
+<li>Git 実行は既存の hooksPath / fsmonitor / 環境変数制限のまま。</li>
+<li>履歴全体の walk や fetch を追加しない。</li>
+<li><code>branch</code> 値は、そのリクエスト時点の <code>refs/heads</code> 一覧との完全一致後にだけ使う。クライアント提出の SHA を view にしない。</li>
+<li>トークンは今どおりメモリのみ。ブランチ名もストレージに書かない。</li>
+<li><code>--ui-root</code> と data dir の非重複、登録ルート外拒否は維持する。</li>
+</ul>
+
+</main>
+</body>
+</html>

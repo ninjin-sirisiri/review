@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="und">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src &#x27;none&#x27;; img-src &#x27;self&#x27; data:; style-src &#x27;self&#x27;; base-uri &#x27;none&#x27;; form-action &#x27;none&#x27;; frame-ancestors &#x27;none&#x27;">
+<title>AI Code Review Evidence</title>
+<link rel="stylesheet" href="docs/sdd/assets/sdd.css">
+</head>
+<body>
+<main>
+<h1>AI Code Review Evidence</h1>
+<p>Local-first recording and review of AI agent judgments bound to files, line ranges, and git revisions.</p>
+<h2>Terms</h2>
+<p><strong>Review view</strong>:
+The read-only source the Review UI is currently showing for a registered repository. It is either the working tree or a local branch tip. The working tree is the default. Choosing a local branch does not check that branch out.</p>
+<p><em>Avoid</em>: checkout, current branch, HEAD</p>
+<p><strong>Working tree</strong>:
+The registered repository root's current files, including uncommitted changes. It is the default review view.</p>
+<p><em>Avoid</em>: HEAD, current branch, checkout</p>
+<p><strong>Local branch</strong>:
+A named branch under <code>refs/heads</code> in the registered repository. When it is the review view, the Review UI shows that branch's tip tree.</p>
+<p><em>Avoid</em>: remote-tracking branch, tag</p>
+<p><strong>Diff base</strong>:
+The old side of a file comparison. It is the newest commit-revision judgment for that file, or the tip commit of the review view when no such judgment exists.</p>
+<p><em>Avoid</em>: HEAD</p>
+<p><strong>Diff current</strong>:
+The new side of a file comparison. It is the review view's current content for that path: the working-tree file, or the blob at the selected local branch tip.</p>
+<p><em>Avoid</em>: HEAD, working tree</p>
+
+</main>
+</body>
+</html>

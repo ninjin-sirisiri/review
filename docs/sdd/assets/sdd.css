@@ -1,0 +1,14 @@
+:root { color-scheme: light dark; }
+body {
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  line-height: 1.55;
+  max-width: 48rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+pre, code { font-family: ui-monospace, Menlo, monospace; }
+pre { overflow: auto; padding: 1rem; background: #f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  pre { background: #1f2328; }
+}
+a { color: inherit; }
