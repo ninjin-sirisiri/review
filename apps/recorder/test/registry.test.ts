@@ -113,6 +113,43 @@ describe("RepositoryRegistry", () => {
     await expect(registry.assertTarget(registered.repository_id, "nested/module.ts")).rejects.toMatchObject({ code: "REPOSITORY_NOT_REGISTERED" });
     store.close();
   });
+
+  test("allows a linked worktree of the registered repository and still rejects a submodule gitdir", async () => {
+    const fixture = await createFixture();
+    const worktree = join(fixture.root, ".worktrees", "timeline-ui");
+    await mkdir(join(fixture.root, ".worktrees"), { recursive: true });
+    await runGit(fixture.root, ["worktree", "add", "--detach", "--quiet", worktree]);
+    const progress = ".worktrees/timeline-ui/.sdd/progress.md";
+    await mkdir(join(worktree, ".sdd"), { recursive: true });
+    await writeFile(join(fixture.root, progress), "# progress\n", "utf8");
+
+    const submodule = join(fixture.root, "vendor", "lib");
+    await mkdir(join(fixture.root, ".git", "modules", "lib"), { recursive: true });
+    await mkdir(submodule, { recursive: true });
+    await writeFile(join(submodule, ".git"), `gitdir: ${join(fixture.root, ".git", "modules", "lib")}\n`, "utf8");
+    await writeFile(join(submodule, "module.ts"), "export const nested = true;\n", "utf8");
+
+    const decoy = join(fixture.root, "decoy");
+    await mkdir(decoy, { recursive: true });
+    await writeFile(join(decoy, ".git"), `gitdir: ${join(fixture.root, ".git", "worktrees", "timeline-ui")}\n`, "utf8");
+    await writeFile(join(decoy, "module.ts"), "export const decoy = true;\n", "utf8");
+
+    const nested = join(worktree, "nested");
+    await mkdir(nested, { recursive: true });
+    await runGit(nested, ["init", "--quiet"]);
+    await writeFile(join(nested, "module.ts"), "export const nested = true;\n", "utf8");
+
+    const store = new RecordStore(new Database(":memory:"));
+    const registry = new RepositoryRegistry(store);
+    const registered = await registry.register(fixture.root);
+
+    expect(await registry.assertTarget(registered.repository_id, progress)).toBe(await realpath(join(fixture.root, progress)));
+    await expect(registry.assertTarget(registered.repository_id, "vendor/lib/module.ts")).rejects.toMatchObject({ code: "REPOSITORY_NOT_REGISTERED" });
+    await expect(registry.assertTarget(registered.repository_id, "decoy/module.ts")).rejects.toMatchObject({ code: "REPOSITORY_NOT_REGISTERED" });
+    await expect(registry.assertTarget(registered.repository_id, ".worktrees/timeline-ui/nested/module.ts")).rejects.toMatchObject({ code: "REPOSITORY_NOT_REGISTERED" });
+    store.close();
+  });
+
   test("rejects oversized Git discovery output before buffering", async () => {
     const fixture = await createFixture();
     const store = new RecordStore(new Database(":memory:"), { maxSourceContentLength: 8 });

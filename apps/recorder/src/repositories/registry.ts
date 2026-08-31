@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, realpath, stat } from "node:fs/promises";
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
   ERROR_CODES,
@@ -87,11 +87,90 @@ async function canonicalizeTarget(root: string, lexicalTarget: string): Promise<
   }
 }
 
+const MAX_GITFILE_BYTES = 8_192;
+
+function gitdirPointer(contents: string): string | null {
+  for (const line of contents.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("gitdir:")) continue;
+    const pointer = trimmed.slice("gitdir:".length).trim();
+    if (pointer.length === 0 || pointer.includes("\0")) return null;
+    return pointer;
+  }
+  return null;
+}
+
+async function readGitMetadataFile(path: string, size: number): Promise<string | null> {
+  if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_GITFILE_BYTES) return null;
+  let contents: string;
+  try {
+    contents = await readFile(path, "utf8");
+  } catch {
+    return null;
+  }
+  if (new TextEncoder().encode(contents).byteLength > MAX_GITFILE_BYTES) return null;
+  return contents;
+}
+
+async function canonicalPath(base: string, candidate: string): Promise<string | null> {
+  if (candidate.includes("\0")) return null;
+  const lexical = isAbsolute(candidate) ? candidate : resolve(base, candidate);
+  try {
+    return await realpath(lexical);
+  } catch {
+    return null;
+  }
+}
+
+async function isLinkedWorktreeOfRoot(root: string, worktreeRoot: string, gitFile: string, size: number): Promise<boolean> {
+  const contents = await readGitMetadataFile(gitFile, size);
+  if (contents === null) return false;
+  const pointer = gitdirPointer(contents);
+  if (pointer === null) return false;
+  const canonicalGitdir = await canonicalPath(worktreeRoot, pointer);
+  if (canonicalGitdir === null) return false;
+  let gitdirInformation;
+  try {
+    gitdirInformation = await lstat(canonicalGitdir);
+  } catch {
+    return false;
+  }
+  if (!gitdirInformation.isDirectory()) return false;
+  let canonicalWorktrees: string;
+  try {
+    const gitDirectory = resolve(root, ".git");
+    const information = await lstat(gitDirectory);
+    if (!information.isDirectory()) return false;
+    canonicalWorktrees = await realpath(resolve(gitDirectory, "worktrees"));
+  } catch {
+    return false;
+  }
+  if (!isContained(canonicalWorktrees, canonicalGitdir) || canonicalGitdir === canonicalWorktrees) return false;
+  const backPointerPath = resolve(canonicalGitdir, "gitdir");
+  let backPointerInformation;
+  try {
+    backPointerInformation = await lstat(backPointerPath);
+  } catch {
+    return false;
+  }
+  if (!backPointerInformation.isFile()) return false;
+  const backPointer = await readGitMetadataFile(backPointerPath, backPointerInformation.size);
+  if (backPointer === null) return false;
+  const canonicalBackPointer = await canonicalPath(canonicalGitdir, backPointer.trim());
+  const canonicalGitFile = await canonicalPath(worktreeRoot, gitFile);
+  return canonicalBackPointer !== null && canonicalGitFile !== null && canonicalBackPointer === canonicalGitFile;
+}
+
 async function rejectNestedRepository(root: string, target: string): Promise<void> {
   let current = dirname(target);
   while (isContained(root, current) && current !== root) {
+    const gitPath = resolve(current, ".git");
     try {
-      await lstat(resolve(current, ".git"));
+      const information = await lstat(gitPath);
+      if (information.isFile() && await isLinkedWorktreeOfRoot(root, current, gitPath, information.size)) {
+        current = dirname(current);
+        continue;
+      }
       throw new SourceResolutionError(ERROR_CODES.REPOSITORY_NOT_REGISTERED, "target is inside an unregistered nested repository");
     } catch (error) {
       if (error instanceof SourceResolutionError) throw error;
