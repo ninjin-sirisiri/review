@@ -5,7 +5,9 @@ import {
   type DecisionRecordInput,
   type SnapshotDiffResponse,
   type UserDisposition,
+  validateBranchList,
   validateDecisionRecordInput,
+  validateRepositoryFiles,
   validateRevisionRef,
   validateReviewSession,
   validateSnapshotDiffResponse,
@@ -445,4 +447,75 @@ test.each([
   const result = validateSnapshotDiffResponse(mutate(value));
   expect(result.success).toBe(false);
   expect(() => parseSnapshotDiffResponse(mutate(value))).toThrow();
+});
+
+const shaA = "0123456789abcdef0123456789abcdef01234567";
+const shaB = "89abcdef0123456789abcdef0123456789abcdef";
+
+describe("branch list and repository files", () => {
+  test("accepts a sorted local-branch list with a matching head_branch", () => {
+    const result = validateBranchList({
+      repository_id: "repo-1",
+      head_branch: "main",
+      branches: [
+        { name: "feat/x", sha: shaA },
+        { name: "main", sha: shaB },
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test("accepts an unborn repository list", () => {
+    const result = validateBranchList({
+      repository_id: "repo-1",
+      head_branch: null,
+      branches: [],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test("rejects head_branch that is not in branches", () => {
+    const result = validateBranchList({
+      repository_id: "repo-1",
+      head_branch: "missing",
+      branches: [{ name: "main", sha: shaA }],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.code).toBe(ERROR_CODES.INVALID_RECORD);
+  });
+
+  test("rejects a remote-style extra field and a short sha", () => {
+    expect(validateBranchList({
+      repository_id: "repo-1",
+      head_branch: null,
+      branches: [{ name: "main", sha: shaA }],
+      remotes: [],
+    }).success).toBe(false);
+    expect(validateBranchList({
+      repository_id: "repo-1",
+      head_branch: null,
+      branches: [{ name: "main", sha: "abc" }],
+    }).success).toBe(false);
+  });
+
+  test("accepts working-tree and local-branch files payloads", () => {
+    expect(validateRepositoryFiles({
+      repository_id: "repo-1",
+      view: { kind: "working-tree" },
+      paths: ["src/a.ts"],
+    }).success).toBe(true);
+    expect(validateRepositoryFiles({
+      repository_id: "repo-1",
+      view: { kind: "local-branch", name: "feat/x", sha: shaA },
+      paths: ["src/a.ts"],
+    }).success).toBe(true);
+  });
+
+  test("rejects a files payload without view", () => {
+    const result = validateRepositoryFiles({
+      repository_id: "repo-1",
+      paths: ["src/a.ts"],
+    });
+    expect(result.success).toBe(false);
+  });
 });

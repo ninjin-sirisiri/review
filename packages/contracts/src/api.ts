@@ -18,10 +18,31 @@ export interface FileDiff {
   hunks: DiffHunk[];
   /** The base commit does not contain this file (created after base). */
   old_missing: boolean;
-  /** The working tree no longer contains this file. */
+  /** The diff current does not contain this file. */
   new_missing: boolean;
   /** A NUL byte was detected on either side; hunks is empty when true. */
   binary: boolean;
+}
+
+export type ReviewView =
+  | { kind: "working-tree" }
+  | { kind: "local-branch"; name: string; sha: string };
+
+export interface LocalBranch {
+  name: string;
+  sha: string;
+}
+
+export interface BranchList {
+  repository_id: string;
+  head_branch: string | null;
+  branches: LocalBranch[];
+}
+
+export interface RepositoryFiles {
+  repository_id: string;
+  view: ReviewView;
+  paths: string[];
 }
 
 export interface SnapshotEndpoint {
