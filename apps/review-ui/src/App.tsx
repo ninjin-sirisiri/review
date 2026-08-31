@@ -117,15 +117,37 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [snapshotDiffLoading, setSnapshotDiffLoading] = useState(false);
   const [snapshotDiffError, setSnapshotDiffError] = useState<ReviewApiError | Error | null>(null);
   const [recordStates, setRecordStates] = useState<Record<string, JudgmentEntry>>({});
-  // M31: openFile と loadFiles が進める単調トークン。後発のファイル選択や review view 変更は
-  // 先行ロードの非同期完了を無効化し、遅れて着いた応答が新しい選択の状態を上書きしないようにする。
+  // M31: openFile が進める単調トークン。後発のファイル選択は先行ロードの非同期完了を無効化する。
+  // loadFiles は filesRequestTokenRef。review view 切替で disposition 保存を捨てない。
   const requestTokenRef = useRef(0);
+  const filesRequestTokenRef = useRef(0);
   const sessionGenerationRef = useRef(0);
   const snapshotRequestTokenRef = useRef(0);
 
   function assignReviewBranch(next: string | null) {
     reviewBranchRef.current = next;
     setReviewBranchState(next);
+  }
+
+  function clearOpenFile() {
+    resetSnapshotTransition();
+    setSelectedPath(null);
+    setFileIsLoading(false);
+    setFileError(null);
+    setFileBaseMissing(false);
+    setDiff(null);
+    setRecordStates({});
+  }
+
+  async function syncSelectedPath(data: RepositoryFiles, branch: string | null) {
+    if (selectedPath === null) return;
+    const known = new Set(data.paths);
+    for (const path of decisionIndex.keys()) known.add(path);
+    if (known.has(selectedPath)) {
+      await openFile(selectedPath, branch);
+    } else {
+      clearOpenFile();
+    }
   }
 
   const decisionIndex = useMemo(() => buildDecisionIndex(decisions), [decisions]);
@@ -227,10 +249,10 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     sessionGeneration: number,
     branch: string | null,
   ): Promise<RepositoryFiles | undefined> {
-    const fileToken = ++requestTokenRef.current;
+    const fileToken = ++filesRequestTokenRef.current;
     const isCurrent = () =>
       sessionGenerationRef.current === sessionGeneration
-      && requestTokenRef.current === fileToken
+      && filesRequestTokenRef.current === fileToken
       && reviewBranchRef.current === branch;
     if (!isCurrent()) return undefined;
     setExplorerIsLoading(true);
@@ -245,10 +267,9 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
       if (branch !== null && requestError instanceof ReviewApiError && requestError.code === "REVISION_NOT_FOUND") {
         assignReviewBranch(null);
         setError(apiMessage(requestError));
-        await loadFiles(client, repository, sessionGeneration, null);
-        return undefined;
+        return await loadFiles(client, repository, sessionGeneration, null);
       }
-      setExplorerError(asError(requestError));
+      setError(apiMessage(requestError));
       return undefined;
     } finally {
       if (isCurrent()) setExplorerIsLoading(false);
@@ -256,28 +277,18 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   }
 
   async function handleReviewViewChange(event: ChangeEvent<HTMLSelectElement>) {
+    const previous = reviewBranchRef.current;
     const next = event.target.value === "" ? null : event.target.value;
     assignReviewBranch(next);
     if (api === null || repositoryId === null) return;
     const sessionGeneration = sessionGenerationRef.current;
     const data = await loadFiles(api, repositoryId, sessionGeneration, next);
     if (sessionGenerationRef.current !== sessionGeneration) return;
-    if (reviewBranchRef.current !== next) return;
-    if (data === undefined) return;
-    if (selectedPath === null) return;
-    const known = new Set(data.paths);
-    for (const path of decisionIndex.keys()) known.add(path);
-    if (known.has(selectedPath)) {
-      await openFile(selectedPath, next);
-    } else {
-      resetSnapshotTransition();
-      setSelectedPath(null);
-      setFileIsLoading(false);
-      setFileError(null);
-      setFileBaseMissing(false);
-      setDiff(null);
-      setRecordStates({});
+    if (data === undefined) {
+      if (reviewBranchRef.current === next) assignReviewBranch(previous);
+      return;
     }
+    await syncSelectedPath(data, reviewBranchRef.current);
   }
 
   async function openFile(path: string, branch: string | null) {
@@ -321,7 +332,20 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     ) {
       assignReviewBranch(null);
       setError(apiMessage(diffResult.error));
-      void loadFiles(api, repositoryId, sessionGenerationRef.current, null);
+      const files = await loadFiles(api, repositoryId, sessionGenerationRef.current, null);
+      if (requestTokenRef.current !== token) return;
+      if (files === undefined) {
+        setFileIsLoading(false);
+        return;
+      }
+      const known = new Set(files.paths);
+      for (const candidate of decisionIndex.keys()) known.add(candidate);
+      if (known.has(path)) {
+        await openFile(path, null);
+        return;
+      }
+      clearOpenFile();
+      return;
     } else if (
       base === "HEAD" &&
       diffResult.error instanceof ReviewApiError &&
@@ -396,10 +420,10 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     if (api === null) throw new ReviewApiError("Not connected to Recorder", { code: "UNKNOWN" });
     const token = requestTokenRef.current;
     const updated = await api.setDisposition(recordId, disposition);
-    if (requestTokenRef.current !== token) return updated;
     setDecisions((current) => current.map((decision) => (
       decision.record_id === updated.record.record_id ? updated.record : decision
     )));
+    if (requestTokenRef.current !== token) return updated;
     setRecordStates((current) => ({
       ...current,
       [recordId]: { recordId, status: "ready", detail: updated },
@@ -428,6 +452,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
   function resetSession() {
     requestTokenRef.current += 1;
+    filesRequestTokenRef.current += 1;
     sessionGenerationRef.current += 1;
     resetSnapshotTransition();
     setApi(null);

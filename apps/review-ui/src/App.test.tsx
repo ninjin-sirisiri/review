@@ -1087,6 +1087,80 @@ describe("App", () => {
     });
   });
 
+  it("keeps the open working-tree diff when a branch files request is unavailable", async () => {
+    const fetchImpl = createFetch(undefined, undefined, undefined, (url) => {
+      if (url.includes("/v1/repositories/repo-1/files?") && url.includes("branch=")) {
+        return json({ success: false, error: { code: "SOURCE_UNAVAILABLE", message: "Git repository data is unavailable" } }, 422);
+      }
+      return undefined;
+    }, twoBranchList);
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    await screen.findByRole("heading", { name: "Guard the empty input" });
+    expect(screen.getByText("const head = 0;")).toBeTruthy();
+
+    fireEvent.change(await screen.findByLabelText("Review view"), { target: { value: "feat/x" } });
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Git repository data is unavailable");
+    expect(screen.getByLabelText("Review view")).toHaveProperty("value", "");
+    expect(screen.getByText("a.ts")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Guard the empty input" })).toBeTruthy();
+    expect(screen.getByText("const head = 0;")).toBeTruthy();
+    expect(screen.queryByText("Select a file in the explorer to see its diff.")).toBeNull();
+  });
+
+  it("reloads the open working-tree diff after a branch disappears during the file request", async () => {
+    const fetchImpl = createFetch(undefined, undefined, undefined, (url) => {
+      if (url.includes("/diff?") && url.includes("branch=")) {
+        return json({ success: false, error: { code: "REVISION_NOT_FOUND", message: "revision was not found" } }, 404);
+      }
+      return undefined;
+    }, twoBranchList);
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    await screen.findByRole("heading", { name: "Guard the empty input" });
+
+    fireEvent.change(await screen.findByLabelText("Review view"), { target: { value: "feat/x" } });
+
+    expect((await screen.findByRole("alert")).textContent).toContain("revision was not found");
+    expect(screen.getByLabelText("Review view")).toHaveProperty("value", "");
+    await waitFor(() => {
+      const diffUrls = fetchImpl.mock.calls
+        .map(([url]) => String(url))
+        .filter((url) => url.includes("/diff?"));
+      expect(diffUrls.at(-1)).not.toContain("branch=");
+    });
+    expect(await screen.findByRole("heading", { name: "Guard the empty input" })).toBeTruthy();
+    expect(screen.getByText("const head = 0;")).toBeTruthy();
+    expect(screen.queryByText("Select a file in the explorer to see its diff.")).toBeNull();
+  });
+
+  it("keeps a saved disposition after the review view changes while the PATCH is in flight", async () => {
+    const fetchImpl = createFetch(
+      (url) => url.includes("/disposition"),
+      undefined,
+      undefined,
+      undefined,
+      twoBranchList,
+    );
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    const accept = await screen.findByRole("button", { name: "Accept" });
+    fireEvent.click(accept);
+    await screen.findByText("Saving disposition…");
+    expect(document.querySelector(".app-header__progress")?.textContent).toContain("2 unreviewed");
+
+    fireEvent.change(screen.getByLabelText("Review view"), { target: { value: "feat/x" } });
+    fetchImpl.releaseAll();
+
+    await waitFor(() => {
+      expect(document.querySelector(".app-header__progress")?.textContent).toContain("1 unreviewed");
+    });
+  });
+
   it("shows the workspace heading even if the branches request is held", async () => {
     const fetchImpl = createFetch((url) => url.endsWith("/v1/repositories/repo-1/branches"), undefined, undefined, undefined, twoBranchList);
     await openWorkspace(fetchImpl);
