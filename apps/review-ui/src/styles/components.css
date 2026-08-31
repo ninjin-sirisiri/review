@@ -92,6 +92,26 @@ h4 { color: var(--text-primary); font-size: 0.85rem; margin-bottom: var(--space-
   color: var(--text-muted);
 }
 .app-header__repo code { color: var(--accent); font-size: 0.82rem; }
+.app-header__view {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.app-header__view label {
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.app-header__view select {
+  min-width: 10rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  background: var(--surface-inset);
+}
 .app-header__progress {
   margin: 0;
   color: var(--text-secondary);

@@ -117,7 +117,7 @@ describe("ReviewApi", () => {
 
   it("lists repository files under the owner bearer token", async () => {
     const fetchImpl = vi.fn(async () =>
-      response({ success: true, data: { repository_id: "repo-1", paths: ["src/a.ts", "src/b.ts"] } }),
+      response({ success: true, data: { repository_id: "repo-1", view: { kind: "working-tree" }, paths: ["src/a.ts", "src/b.ts"] } }),
     );
     const api = new ReviewApi("owner-token", { fetchImpl });
 
@@ -127,7 +127,40 @@ describe("ReviewApi", () => {
       "/v1/repositories/repo-1/files",
       expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer owner-token" }) }),
     );
-    expect(files).toEqual({ repository_id: "repo-1", paths: ["src/a.ts", "src/b.ts"] });
+    expect(files).toEqual({
+      repository_id: "repo-1",
+      view: { kind: "working-tree" },
+      paths: ["src/a.ts", "src/b.ts"],
+    });
+  });
+
+  it("lists local branches and passes branch on files and diff", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/branches")) {
+        return response({
+          success: true,
+          data: { repository_id: "repo-1", head_branch: "main", branches: [{ name: "feat/x", sha: "a".repeat(40) }, { name: "main", sha: "b".repeat(40) }] },
+        });
+      }
+      if (url.includes("/files")) {
+        return response({
+          success: true,
+          data: { repository_id: "repo-1", view: { kind: "local-branch", name: "feat/x", sha: "a".repeat(40) }, paths: ["src/a.ts"] },
+        });
+      }
+      return response({
+        success: true,
+        data: { path: "src/a.ts", base_sha: "a".repeat(40), hunks: [], old_missing: false, new_missing: false, binary: false },
+      });
+    });
+    const api = new ReviewApi("owner-token", { baseUrl: "http://recorder.test/", fetchImpl });
+    await api.listBranches("repo-1");
+    await api.listRepositoryFiles("repo-1", "feat/x");
+    await api.getFileDiff("repo-1", "src/a.ts", "HEAD", "feat/x");
+    expect(fetchImpl).toHaveBeenCalledWith("http://recorder.test/v1/repositories/repo-1/branches", expect.anything());
+    expect(fetchImpl).toHaveBeenCalledWith("http://recorder.test/v1/repositories/repo-1/files?branch=feat%2Fx", expect.anything());
+    expect(String(fetchImpl.mock.calls[2]![0])).toContain("branch=feat%2Fx");
   });
 
   it("fetches a structured path diff with an explicit base", async () => {

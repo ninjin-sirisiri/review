@@ -78,6 +78,20 @@ describe("targetAnchor", () => {
     expect(targetAnchor(snapshot)).toEqual({ side: "new", start: 4, end: 6 });
   });
 
+  it("does not new-side anchor a resolved working-tree source when the review view is a local branch", () => {
+    const source: SourceReferenceData = {
+      state: "resolved",
+      repository_id: "repo-1",
+      path: "src/a.ts",
+      revision: { kind: "working-tree", contentHash: "hash-a" },
+      target: { repository_id: "repo-1", path: "src/a.ts", line_start: 2, line_end: 2, revision: { kind: "working-tree", contentHash: "hash-a" }, content_hash: "hash-a" },
+      content: "x",
+      content_hash: "hash-a",
+    };
+    expect(targetAnchor(source, "local-branch")).toBeNull();
+    expect(targetAnchor(source, "working-tree")?.side).toBe("new");
+  });
+
   it.each([
     ["hash-mismatch"],
     ["revision-not-found"],
