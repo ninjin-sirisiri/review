@@ -76,7 +76,7 @@ export function Workspace(props: WorkspaceProps) {
   }
 
   return (
-    <div className="workspace">
+    <main id="review-workspace" className="workspace" tabIndex={-1}>
       <Explorer
         tree={tree}
         selectedPath={selectedPath}
@@ -114,6 +114,6 @@ export function Workspace(props: WorkspaceProps) {
         onRetry={onJudgmentRetry}
         onTargetClick={handleTargetClick}
       />
-    </div>
+    </main>
   );
 }

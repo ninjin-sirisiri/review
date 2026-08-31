@@ -40,6 +40,12 @@ function checkStatusLabel(status: "passed" | "failed" | "not-run"): string {
   return "Not run";
 }
 
+function dispositionStatusLabel(value: UserDisposition): string {
+  if (value === "accepted") return "Accepted";
+  if (value === "rejected") return "Rejected";
+  return "Unreviewed";
+}
+
 export function DecisionCard({ detail, selected = false, onSelect = () => {}, onDispositionChange, onTargetClick }: DecisionCardProps) {
   const [displayedRecord, setDisplayedRecord] = useState(detail.record);
   const [isUpdating, setIsUpdating] = useState(false);
@@ -72,12 +78,22 @@ export function DecisionCard({ detail, selected = false, onSelect = () => {}, on
       typeof source.snapshot.base_sha === "string",
   );
   const provenance = gitSnapshot?.snapshot?.base_sha?.slice(0, 8);
+  const cardClass = [
+    "decision-card",
+    selected ? "decision-card--selected" : "",
+    `decision-card--${displayedRecord.user_disposition}`,
+  ].filter(Boolean).join(" ");
 
   return (
-    <article className={`decision-card${selected ? " decision-card--selected" : ""}`} aria-labelledby={`decision-${displayedRecord.record_id}`}>
+    <article className={cardClass} aria-labelledby={`decision-${displayedRecord.record_id}`}>
       <header className="decision-card__header">
-        <div>
-          <p className="eyebrow">Decision {displayedRecord.record_id}</p>
+        <div className="decision-card__heading">
+          <p className="decision-card__kicker">
+            <span className={`disposition-badge disposition-badge--${displayedRecord.user_disposition}`}>
+              {dispositionStatusLabel(displayedRecord.user_disposition)}
+            </span>
+            <span className="eyebrow">Decision {displayedRecord.record_id}</span>
+          </p>
           <h3 id={`decision-${displayedRecord.record_id}`}>{displayedRecord.judgment}</h3>
           <p className="decision-card__meta">
             {displayedRecord.agent_type} · {new Date(displayedRecord.created_at).toLocaleString()} · revision {revisionText(displayedRecord.revision)}
@@ -87,9 +103,6 @@ export function DecisionCard({ detail, selected = false, onSelect = () => {}, on
               </span>
               )}
           </p>
-          <button type="button" className="decision-card__select" aria-pressed={selected} onClick={onSelect}>
-            {selected ? "Viewing subsequent changes" : "View subsequent changes"}
-          </button>
         </div>
         <fieldset className="disposition-controls" disabled={isUpdating || onDispositionChange === undefined}>
           <legend>Disposition</legend>
@@ -97,6 +110,7 @@ export function DecisionCard({ detail, selected = false, onSelect = () => {}, on
             <button
               key={option.value}
               type="button"
+              data-disposition={option.value}
               aria-pressed={displayedRecord.user_disposition === option.value}
               onClick={() => void changeDisposition(option.value)}
             >
@@ -104,6 +118,9 @@ export function DecisionCard({ detail, selected = false, onSelect = () => {}, on
             </button>
           ))}
         </fieldset>
+        <button type="button" className="decision-card__select" aria-pressed={selected} onClick={onSelect}>
+          {selected ? "Viewing subsequent changes" : "View subsequent changes"}
+        </button>
       </header>
       {isUpdating && <p role="status">Saving disposition…</p>}
       {mutationError !== null && <p className="inline-error" role="alert">{mutationError}</p>}

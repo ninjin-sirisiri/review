@@ -87,6 +87,24 @@ describe("Explorer", () => {
     expect(utilButton?.querySelector(".explorer__badge")).toBeNull();
   });
 
+  it("names files with their decision counts for assistive tech", () => {
+    render(<Explorer {...baseProps} />);
+
+    expect(screen.getByRole("button", { name: "api.ts, 2 decisions" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "README.md, 1 decision" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "util.ts" })).toBeTruthy();
+  });
+
+  it("filters the tree to files that have judgments", () => {
+    render(<Explorer {...baseProps} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "With judgments" }));
+    expect(screen.getByRole("button", { name: "With judgments" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByText("api.ts")).toBeTruthy();
+    expect(screen.getByText("README.md")).toBeTruthy();
+    expect(screen.queryByText("util.ts")).toBeNull();
+  });
+
   it("shows the loading state", () => {
     render(<Explorer {...baseProps} isLoading tree={node({ name: "", path: "", isFile: false })} />);
     expect(screen.getByRole("status").textContent).toContain("Loading repository tree");

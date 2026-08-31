@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildFileTree } from "./file-tree";
+import { buildFileTree, filterTreeToDecisions, treeHasDecisions } from "./file-tree";
 
 describe("buildFileTree", () => {
   it("converts a flat sorted path list into a nested tree with directories first", () => {
@@ -29,5 +29,18 @@ describe("buildFileTree", () => {
   it("returns an empty root for an empty path list", () => {
     const root = buildFileTree([]);
     expect(root.children).toEqual([]);
+  });
+});
+
+describe("filterTreeToDecisions", () => {
+  it("keeps files with judgments and prunes empty directories", () => {
+    const counts = new Map([["src/api.ts", 2], ["README.md", 1]]);
+    const root = buildFileTree(["src/api.ts", "src/util.ts", "docs/guide.md", "README.md"], counts);
+    const filtered = filterTreeToDecisions(root);
+
+    expect(filtered.children.map((child) => child.name)).toEqual(["src", "README.md"]);
+    expect(filtered.children[0]!.children.map((child) => child.name)).toEqual(["api.ts"]);
+    expect(treeHasDecisions(root)).toBe(true);
+    expect(treeHasDecisions(buildFileTree(["src/util.ts"]))).toBe(false);
   });
 });

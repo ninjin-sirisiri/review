@@ -45,10 +45,19 @@ export function JudgmentPanel({
   onRetry,
   onTargetClick,
 }: JudgmentPanelProps) {
+  const isLoading = entries.some((entry) => entry.status === "loading");
+
   if (path === null) {
     return (
       <section className="judgment-panel" aria-label="Judgments">
-        <p className="empty-state">Select a file in the explorer to review its judgments.</p>
+        <header className="pane-header">
+          <div className="section-heading">
+            <h2>Judgments</h2>
+          </div>
+        </header>
+        <div className="pane-body">
+          <p className="empty-state">Select a file in the explorer to review its judgments.</p>
+        </div>
       </section>
     );
   }
@@ -60,49 +69,56 @@ export function JudgmentPanel({
       );
 
   return (
-    <section className="judgment-panel" aria-label="Judgments">
-      <div className="section-heading">
-        <h2>Judgments</h2>
-        <span>
-          {visibleEntries.length} of {entries.length}
-          {selectedBlock !== null && (
+    <section className="judgment-panel" aria-label="Judgments" aria-busy={isLoading || undefined}>
+      <header className="pane-header">
+        <div className="section-heading">
+          <h2>Judgments</h2>
+          <span>
+            {visibleEntries.length} of {entries.length}
+          </span>
+        </div>
+        {selectedBlock !== null && (
+          <div className="filter-banner">
+            <p>Filtered to the selected lines</p>
             <button type="button" className="button-secondary" onClick={() => onSelectBlock(null)}>
               Clear block filter
             </button>
-          )}
-        </span>
-      </div>
+          </div>
+        )}
+      </header>
 
-      <div className="judgment-stack">
-        {visibleEntries.map((entry) => {
-          if (entry.status === "loading") {
-            return <p key={entry.recordId} role="status">Loading decision…</p>;
-          }
-          if (entry.status === "error") {
+      <div className="pane-body">
+        <div className="judgment-stack">
+          {visibleEntries.map((entry) => {
+            if (entry.status === "loading") {
+              return <p key={entry.recordId} role="status">Loading decision…</p>;
+            }
+            if (entry.status === "error") {
+              return (
+                <div key={entry.recordId} className="inline-error" role="alert">
+                  <p>{entry.message ?? "Unable to load this decision."}</p>
+                  <button type="button" onClick={() => onRetry(entry.recordId)}>Retry {entry.recordId}</button>
+                </div>
+              );
+            }
             return (
-              <div key={entry.recordId} className="inline-error" role="alert">
-                <p>{entry.message ?? "Unable to load this decision."}</p>
-                <button type="button" onClick={() => onRetry(entry.recordId)}>Retry {entry.recordId}</button>
-              </div>
+              <DecisionCard
+                key={entry.recordId}
+                detail={entry.detail}
+                selected={selectedRecordId === entry.recordId}
+                onSelect={() => onSelectJudgment(entry.recordId)}
+                onDispositionChange={(disposition) => onDispositionChange(entry.recordId, disposition)}
+                onTargetClick={onTargetClick}
+              />
             );
-          }
-           return (
-            <DecisionCard
-              key={entry.recordId}
-              detail={entry.detail}
-              selected={selectedRecordId === entry.recordId}
-              onSelect={() => onSelectJudgment(entry.recordId)}
-              onDispositionChange={(disposition) => onDispositionChange(entry.recordId, disposition)}
-              onTargetClick={onTargetClick}
-            />
-          );
-        })}
-        {entries.length > 0 && visibleEntries.length === 0 && (
-          <p className="empty-state">No judgments overlap the selected lines.</p>
-        )}
-        {entries.length === 0 && (
-          <p className="empty-state">No decisions have been recorded for this file.</p>
-        )}
+          })}
+          {entries.length > 0 && visibleEntries.length === 0 && (
+            <p className="empty-state">No judgments overlap the selected lines.</p>
+          )}
+          {entries.length === 0 && (
+            <p className="empty-state">No decisions have been recorded for this file.</p>
+          )}
+        </div>
       </div>
     </section>
   );

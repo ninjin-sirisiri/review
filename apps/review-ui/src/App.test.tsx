@@ -375,6 +375,8 @@ describe("App", () => {
     await openWorkspace(fetchImpl);
 
     expect(screen.getByRole("heading", { name: "Decision review" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Skip to workspace" })).toBeTruthy();
+    expect(document.querySelector(".app-header__progress")?.textContent).toMatch(/\d+ unreviewed of \d+/);
     expect(screen.getByRole("button", { name: /Color scheme/ })).toBeTruthy();
   });
 

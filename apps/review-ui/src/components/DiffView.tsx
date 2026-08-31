@@ -92,8 +92,8 @@ function FullTextLines(props: { content: string; anchors: DecisionAnchor[] }) {
             <span className="diff-line__static" aria-hidden="true">
               <span className="line-number">{lineNumber}</span>
               <span className="line-sign">{" "}</span>
+              <code>{content}</code>
             </span>
-            <code>{content}</code>
           </li>
         );
       })}
@@ -110,7 +110,6 @@ function LineRow(props: {
   const { row, anchored, selected, onSelect } = props;
   const tone =
     row.type === "add" ? "diff-line--add" : row.type === "del" ? "diff-line--del" : "diff-line--context";
-  const gutter = row.type === "del" ? row.oldLine : row.newLine;
   const operation = row.type === "add" ? "Added" : row.type === "del" ? "Deleted" : "Context";
   const lineNumbers = [
     row.oldLine === null ? null : `old line ${row.oldLine}`,
@@ -142,8 +141,11 @@ function LineRow(props: {
         aria-pressed={row.type === "context" ? undefined : selected}
         onClick={onSelect}
       >
-        <span className="line-number" aria-hidden="true">
-          {gutter ?? ""}
+        <span className="line-number line-number--old" aria-hidden="true">
+          {row.oldLine ?? ""}
+        </span>
+        <span className="line-number line-number--new" aria-hidden="true">
+          {row.newLine ?? ""}
         </span>
         <span className="line-sign" aria-hidden="true">
           {row.type === "add" ? "+" : row.type === "del" ? "-" : " "}
@@ -163,21 +165,24 @@ function HunkLines(props: {
   return (
     <>
       {props.hunks.map((hunk, hunkIndex) => (
-        <ol className="diff-lines" key={`${hunk.oldStart}:${hunk.newStart}:${hunkIndex}`}>
-          {hunk.lines.map((row, index) => {
-            const run = blockRun(hunk.lines, index);
-            const selected = sameBlock(run, props.selectedBlock);
-            return (
-              <LineRow
-                key={`${index}-${row.content}`}
-                row={row}
-                anchored={lineAnchored(row, props.anchors)}
-                selected={selected}
-                onSelect={() => props.onSelectBlock(run === null || selected ? null : run)}
-              />
-            );
-          })}
-        </ol>
+        <div className="diff-hunk" key={`${hunk.oldStart}:${hunk.newStart}:${hunkIndex}`}>
+          <p className="diff-hunk__header">{`@@ -${hunk.oldStart} +${hunk.newStart} @@`}</p>
+          <ol className="diff-lines">
+            {hunk.lines.map((row, index) => {
+              const run = blockRun(hunk.lines, index);
+              const selected = sameBlock(run, props.selectedBlock);
+              return (
+                <LineRow
+                  key={`${index}-${row.content}`}
+                  row={row}
+                  anchored={lineAnchored(row, props.anchors)}
+                  selected={selected}
+                  onSelect={() => props.onSelectBlock(run === null || selected ? null : run)}
+                />
+              );
+            })}
+          </ol>
+        </div>
       ))}
     </>
   );
@@ -234,22 +239,25 @@ export function DiffView({
     transitionActive,
   ]);
 
-  const shell = (children: ReactNode, heading = true, metadata?: ReactNode) => (
-    <section ref={rootRef} className="diff-view" aria-label="Source diff">
-      {heading && (
-        <header className="diff-view__header">
-          <h2>{path}</h2>
-          {metadata ?? (diff !== null && !diff.binary && diff.base_sha.length > 0 && (
-            <code className="diff-view__base">vs {diff.base_sha.slice(0, 12)}</code>
-          ))}
-        </header>
-      )}
-      {children}
+  const shell = (children: ReactNode, metadata?: ReactNode) => (
+    <section
+      ref={rootRef}
+      className="diff-view"
+      aria-label="Source diff"
+      aria-busy={isLoading || snapshotDiffLoading || undefined}
+    >
+      <header className="pane-header diff-view__header">
+        <h2>{path ?? "Diff"}</h2>
+        {metadata ?? (diff !== null && !diff.binary && !transitionActive && diff.base_sha.length > 0 && (
+          <code className="diff-view__base">vs {diff.base_sha.slice(0, 12)}</code>
+        ))}
+      </header>
+      <div className="pane-body">{children}</div>
     </section>
   );
 
   if (path === null) {
-    return shell(<p className="empty-state">Select a file in the explorer to see its diff.</p>, false);
+    return shell(<p className="empty-state">Select a file in the explorer to see its diff.</p>);
   }
   if (transitionActive) {
     const retryTransition = () => {
@@ -282,7 +290,7 @@ export function DiffView({
       </div>
     );
     if (snapshotDiff.binary) {
-      return shell(<p className="empty-state">Binary files cannot be shown in the diff view.</p>, true, metadata);
+      return shell(<p className="empty-state">Binary files cannot be shown in the diff view.</p>, metadata);
     }
     if (snapshotDiff.hunks.length === 0) {
       if (snapshotDiff.old_missing !== snapshotDiff.new_missing) {
@@ -292,13 +300,11 @@ export function DiffView({
               ? "File was created after the selected judgment."
               : "File was deleted after the selected judgment."}
           </p>,
-          true,
           metadata,
         );
       }
       return shell(
         <p className="empty-state">No changes between the selected judgment and the next state.</p>,
-        true,
         metadata,
       );
     }
@@ -309,7 +315,6 @@ export function DiffView({
         selectedBlock={selectedBlock}
         onSelectBlock={onSelectBlock}
       />,
-      true,
       metadata,
     );
   }
@@ -318,7 +323,6 @@ export function DiffView({
       <p role="status" className="empty-state">
         Loading diff…
       </p>,
-      false,
     );
   }
   // spec §4.3-3: コミットが一つもないリポジトリではdiff baseが存在しない。これはエラーではなく、
@@ -342,7 +346,7 @@ export function DiffView({
     );
   }
   if (diff === null) {
-    return shell(<p className="empty-state">Select a file in the explorer to see its diff.</p>, false);
+    return shell(<p className="empty-state">Select a file in the explorer to see its diff.</p>);
   }
   if (diff.binary) {
     return shell(<p className="empty-state">Binary files cannot be shown in the diff view.</p>);

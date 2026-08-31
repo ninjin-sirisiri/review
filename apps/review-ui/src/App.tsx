@@ -112,7 +112,6 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [snapshotDiffLoading, setSnapshotDiffLoading] = useState(false);
   const [snapshotDiffError, setSnapshotDiffError] = useState<ReviewApiError | Error | null>(null);
   const [recordStates, setRecordStates] = useState<Record<string, JudgmentEntry>>({});
-  const [workspaceKey, setWorkspaceKey] = useState(0);
   // M31: openFileが進める単調トークン。後発のファイル選択は先行ロードの非同期完了を無効化し、
   // 遅れて着いた応答が新しい選択の状態を上書きしないようにする。
   const requestTokenRef = useRef(0);
@@ -223,7 +222,6 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     const token = ++requestTokenRef.current;
     resetSnapshotTransition();
     setSelectedPath(path);
-    setSelectedBlockReset();
 
     const related = decisionIndex.get(path) ?? [];
     const base = diffBaseFor(related);
@@ -322,11 +320,6 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     setSnapshotDiffError(null);
   }
 
-  function setSelectedBlockReset() {
-    // ブロック選択はWorkspace内部state。ファイル切替時に解除してもらうためkeyでリセットする。
-    setWorkspaceKey((current) => current + 1);
-  }
-
   async function handleDisposition(recordId: string, disposition: UserDisposition): Promise<DecisionRecordDetail> {
     if (api === null) throw new ReviewApiError("Not connected to Recorder", { code: "UNKNOWN" });
     const token = requestTokenRef.current;
@@ -401,15 +394,20 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   }
 
   const activeRepository = repositories?.find((candidate) => candidate.repository_id === repositoryId);
+  const unreviewedCount = decisions.filter((decision) => decision.user_disposition === "unreviewed").length;
 
   return (
-    <main className="app-shell">
+    <div className="app-shell">
+      <a className="skip-link" href="#review-workspace">Skip to workspace</a>
       <header className="app-header">
-        <div>
-          <p className="eyebrow">Local review evidence</p>
+        <div className="app-header__identity">
           <h1>Decision review</h1>
-          <p className="app-header__repo">Repository <code>{activeRepository?.root ?? repositoryId}</code></p>
+          <p className="app-header__repo"><code>{activeRepository?.root ?? repositoryId}</code></p>
         </div>
+        <p className="app-header__progress" aria-live="polite">
+          {unreviewedCount} unreviewed
+          <span className="app-header__progress-total"> of {decisions.length}</span>
+        </p>
         <div className="app-header__actions">
           <ThemeToggle />
           <button type="button" className="button-secondary" onClick={resetSession}>Clear session</button>
@@ -417,7 +415,6 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
       </header>
       {error !== null && <p className="inline-error" role="alert">{error}</p>}
       <Workspace
-        key={workspaceKey}
         tree={tree}
         selectedPath={selectedPath}
         explorerIsLoading={explorerIsLoading}
@@ -449,6 +446,6 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
         onDispositionChange={(recordId, disposition) => handleDisposition(recordId, disposition)}
         onJudgmentRetry={(recordId) => void retryJudgment(recordId)}
       />
-    </main>
+    </div>
   );
 }

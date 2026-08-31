@@ -31,3 +31,23 @@ export function buildFileTree(paths: string[], decisionCounts: ReadonlyMap<strin
   sortChildren(root);
   return root;
 }
+
+/** Directories that would be empty after dropping files without judgments are omitted. */
+export function filterTreeToDecisions(node: FileTreeNode): FileTreeNode {
+  if (node.isFile) return node;
+  const children: FileTreeNode[] = [];
+  for (const child of node.children) {
+    if (child.isFile) {
+      if (child.decisionCount > 0) children.push(child);
+      continue;
+    }
+    const filtered = filterTreeToDecisions(child);
+    if (filtered.children.length > 0) children.push(filtered);
+  }
+  return { ...node, children };
+}
+
+export function treeHasDecisions(node: FileTreeNode): boolean {
+  if (node.isFile) return node.decisionCount > 0;
+  return node.children.some(treeHasDecisions);
+}
