@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="und">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src &#x27;none&#x27;; img-src &#x27;self&#x27; data:; style-src &#x27;self&#x27;; base-uri &#x27;none&#x27;; form-action &#x27;none&#x27;; frame-ancestors &#x27;none&#x27;">
+<title>Review view local branch Implementation Plan</title>
+<link rel="stylesheet" href="../assets/sdd.css">
+</head>
+<body>
+<main>
+<h1>Review view local branch Implementation Plan</h1>
+<p><strong>Goal:</strong> Let Review UI browse a local branch tip read-only when a registered repository has two or more local branches, without checkout and without changing decision records.</p>
+<p><strong>Architecture:</strong> Recorder keeps the registered root. A new <code>GET /v1/repositories/:id/branches</code> lists <code>refs/heads</code> only. Existing <code>files</code> and <code>diff</code> accept an optional <code>branch</code> short name, re-matched against <code>refs/heads</code> on that request, and use that tip as diff current. The working tree remains the default review view. The header select appears only when <code>branches.length &gt;= 2</code>.</p>
+<p><strong>Tech Stack:</strong> Bun, TypeScript, contracts in <code>packages/contracts</code>, Recorder <code>GitReader</code> + HTTP, React 19 Review UI, Vitest, Playwright.</p>
+<p><strong>Spec:</strong> docs/sdd/specs/2026-08-31-review-view-local-branch-design.md</p>
+<h2>Global Constraints</h2>
+<ul>
+<li>選択 UI を出す条件は <code>branches.length &gt;= 2</code> のみ。</li>
+<li>初期 review view は作業ツリー。</li>
+<li>ブランチ名の表示順はサーバーが一覧を辞書順にした結果。</li>
+<li>review view はタブ内メモリのみ。リロードと Clear session で作業ツリー。</li>
+<li><code>branch</code> 省略は作業ツリー。予約名 <code>working-tree</code> は使わない。</li>
+<li>view 用に一覧外の文字列を <code>rev-parse</code> しない。view 用にクライアント提出の SHA を使わない。</li>
+<li>remote-tracking と tag を review view にしない。</li>
+<li>新しい <code>ERROR_CODES</code> を足さない。</li>
+<li>判断をブランチで絞らない。</li>
+<li>checkout しない。</li>
+<li>ワークスペース表示は <code>files</code> 到着で開始し、<code>branches</code> 完了を待たない。</li>
+<li>選択変更後の Explorer は <code>paths</code> ∪ 判断索引。</li>
+<li>Git 実行は既存の hooksPath / fsmonitor / 環境変数制限のまま。</li>
+<li>履歴全体の walk や fetch を追加しない。</li>
+<li><code>branch</code> 値は、そのリクエスト時点の <code>refs/heads</code> 一覧との完全一致後にだけ使う。クライアント提出の SHA を view にしない。</li>
+<li>トークンは今どおりメモリのみ。ブランチ名もストレージに書かない。</li>
+<li><code>--ui-root</code> と data dir の非重複、登録ルート外拒否は維持する。</li>
+<li>RecordStore、RepositoryRegistry、判断の source 解決、git-backed snapshot、全プラグイン、edit gate は変えない。</li>
+</ul>
+<h2>File structure</h2>
+<table>
+<thead>
+<tr>
+  <th>Path</th>
+  <th>Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>packages/contracts/src/api.ts</code></td>
+  <td><code>ReviewView</code>, <code>LocalBranch</code>, <code>BranchList</code>, <code>RepositoryFiles</code>; <code>FileDiff.new_missing</code> comment</td>
+</tr>
+<tr>
+  <td><code>packages/contracts/src/validation.ts</code></td>
+  <td><code>validateReviewView</code>, <code>validateBranchList</code>, <code>validateRepositoryFiles</code></td>
+</tr>
+<tr>
+  <td><code>packages/contracts/test/validation.test.ts</code></td>
+  <td>Contract tests for those payloads</td>
+</tr>
+<tr>
+  <td><code>apps/recorder/src/source/git.ts</code></td>
+  <td><code>listLocalBranches</code>, <code>resolveLocalBranch</code>, <code>listCommitFiles</code>, <code>readPathDiff</code> current side</td>
+</tr>
+<tr>
+  <td><code>apps/recorder/test/source-resolution.test.ts</code></td>
+  <td>GitReader tests</td>
+</tr>
+<tr>
+  <td><code>apps/recorder/src/http/server.ts</code></td>
+  <td><code>GET .../branches</code>; <code>files</code>/<code>diff</code> <code>branch</code> query</td>
+</tr>
+<tr>
+  <td><code>apps/recorder/test/http.test.ts</code></td>
+  <td>HTTP tests</td>
+</tr>
+<tr>
+  <td><code>apps/review-ui/src/api.ts</code></td>
+  <td><code>listBranches</code>, <code>listRepositoryFiles</code>/<code>getFileDiff</code> <code>branch</code></td>
+</tr>
+<tr>
+  <td><code>apps/review-ui/src/api.test.ts</code></td>
+  <td>Client tests</td>
+</tr>
+<tr>
+  <td><code>apps/review-ui/src/lib/decision-index.ts</code></td>
+  <td>Working-tree anchors only when review view is the working tree</td>
+</tr>
+<tr>
+  <td><code>apps/review-ui/src/lib/decision-index.test.ts</code></td>
+  <td>Anchor tests</td>
+</tr>
+<tr>
+  <td><code>apps/review-ui/src/App.tsx</code></td>
+  <td>Review view state, header select, reload files/diff</td>
+</tr>
+<tr>
+  <td><code>apps/review-ui/src/App.test.tsx</code></td>
+  <td>Picker visibility, switch, fallback</td>
+</tr>
+<tr>
+  <td><code>apps/review-ui/src/styles/components.css</code></td>
+  <td>Header select layout</td>
+</tr>
+<tr>
+  <td><code>tests/e2e/review-view-branch.spec.ts</code></td>
+  <td>Two-branch explorer switch</td>
+</tr>
+</tbody>
+</table>
+<p>Do not add plugin, RecordStore, or snapshot-diff query changes.</p>
+<h2>Task 1: Contracts for branch list and files view</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>packages/contracts/src/api.ts</code></li>
+<li>Modify: <code>packages/contracts/src/validation.ts</code></li>
+<li>Modify: <code>packages/contracts/test/validation.test.ts</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li><p><code>ReviewView</code> = <code>{ kind: &quot;working-tree&quot; }</code> or <code>{ kind: &quot;local-branch&quot;; name: string; sha: string }</code></p>
+</li>
+<li><p><code>LocalBranch</code> = <code>{ name: string; sha: string }</code></p>
+</li>
+<li><p><code>BranchList</code> = <code>{ repository_id: string; head_branch: string | null; branches: LocalBranch[] }</code></p>
+</li>
+<li><p><code>RepositoryFiles</code> = <code>{ repository_id: string; view: ReviewView; paths: string[] }</code></p>
+</li>
+<li><p><code>sha</code> is 40 lowercase hex. <code>name</code> is a non-empty string. If <code>head_branch</code> is a string, it must equal some <code>branches[].name</code>. If <code>branches</code> is empty, <code>head_branch</code> is <code>null</code>.</p>
+</li>
+<li><p><code>validateBranchList</code> / <code>validateRepositoryFiles</code> return the same <code>ValidationResult&lt;T&gt;</code> as <code>validateSnapshotDiffResponse</code>.</p>
+</li>
+<li><p>Do not add error codes. Do not change decision-record types.</p>
+</li>
+<li><p>[ ] <strong>Step 1: Write the failing tests</strong></p>
+</li>
+</ul>
+<p>In <code>packages/contracts/src/api.ts</code> add the types (tests import them). In <code>packages/contracts/src/validation.ts</code> add the three validate functions so the tests compile, but make them <code>return failure(ERROR_CODES.INVALID_RECORD, &quot;not implemented&quot;)</code> until Step 2, or omit them so Step 1 fails to compile — prefer exporting stubs that always fail so <code>bun test packages/contracts/test/validation.test.ts</code> runs red.</p>
+<p>Add to <code>packages/contracts/test/validation.test.ts</code>:</p>
+<pre><code class="language-ts">import {
+  validateBranchList,
+  validateRepositoryFiles,
+} from &quot;../src/index&quot;;
+
+const shaA = &quot;0123456789abcdef0123456789abcdef01234567&quot;;
+const shaB = &quot;89abcdef0123456789abcdef0123456789abcdef&quot;;
+
+describe(&quot;branch list and repository files&quot;, () =&gt; {
+  test(&quot;accepts a sorted local-branch list with a matching head_branch&quot;, () =&gt; {
+    const result = validateBranchList({
+      repository_id: &quot;repo-1&quot;,
+      head_branch: &quot;main&quot;,
+      branches: [
+        { name: &quot;feat/x&quot;, sha: shaA },
+        { name: &quot;main&quot;, sha: shaB },
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test(&quot;accepts an unborn repository list&quot;, () =&gt; {
+    const result = validateBranchList({
+      repository_id: &quot;repo-1&quot;,
+      head_branch: null,
+      branches: [],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test(&quot;rejects head_branch that is not in branches&quot;, () =&gt; {
+    const result = validateBranchList({
+      repository_id: &quot;repo-1&quot;,
+      head_branch: &quot;missing&quot;,
+      branches: [{ name: &quot;main&quot;, sha: shaA }],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.code).toBe(ERROR_CODES.INVALID_RECORD);
+  });
+
+  test(&quot;rejects a remote-style extra field and a short sha&quot;, () =&gt; {
+    expect(validateBranchList({
+      repository_id: &quot;repo-1&quot;,
+      head_branch: null,
+      branches: [{ name: &quot;main&quot;, sha: shaA }],
+      remotes: [],
+    }).success).toBe(false);
+    expect(validateBranchList({
+      repository_id: &quot;repo-1&quot;,
+      head_branch: null,
+      branches: [{ name: &quot;main&quot;, sha: &quot;abc&quot; }],
+    }).success).toBe(false);
+  });
+
+  test(&quot;accepts working-tree and local-branch files payloads&quot;, () =&gt; {
+    expect(validateRepositoryFiles({
+      repository_id: &quot;repo-1&quot;,
+      view: { kind: &quot;working-tree&quot; },
+      paths: [&quot;src/a.ts&quot;],
+    }).success).toBe(true);
+    expect(validateRepositoryFiles({
+      repository_id: &quot;repo-1&quot;,
+      view: { kind: &quot;local-branch&quot;, name: &quot;feat/x&quot;, sha: shaA },
+      paths: [&quot;src/a.ts&quot;],
+    }).success).toBe(true);
+  });
+
+  test(&quot;rejects a files payload without view&quot;, () =&gt; {
+    const result = validateRepositoryFiles({
+      repository_id: &quot;repo-1&quot;,
+      paths: [&quot;src/a.ts&quot;],
+    });
+    expect(result.success).toBe(false);
+  });
+});
+</code></pre>
+<p>Also change the <code>FileDiff</code> comment in <code>api.ts</code> from “The working tree no longer contains this file.” to “The diff current does not contain this file.”</p>
+<p>Run:</p>
+<pre><code class="language-bash">bun test packages/contracts/test/validation.test.ts
+</code></pre>
+<p>Expected: FAIL — validators missing or always invalid.</p>
+<ul>
+<li>[ ] <strong>Step 2: Implement the types and validators</strong></li>
+</ul>
+<p>Add to <code>packages/contracts/src/api.ts</code> (next to <code>FileDiff</code>):</p>
+<pre><code class="language-ts">export type ReviewView =
+  | { kind: &quot;working-tree&quot; }
+  | { kind: &quot;local-branch&quot;; name: string; sha: string };
+
+export interface LocalBranch {
+  name: string;
+  sha: string;
+}
+
+export interface BranchList {
+  repository_id: string;
+  head_branch: string | null;
+  branches: LocalBranch[];
+}
+
+export interface RepositoryFiles {
+  repository_id: string;
+  view: ReviewView;
+  paths: string[];
+}
+</code></pre>
+<p>Implement validators with <code>isRecord</code>, <code>hasOnlyKeys</code>, <code>repository_id</code> as non-empty string, <code>name</code> as non-empty string, <code>sha</code> matching <code>/^[0-9a-f]{40}$/</code>, <code>paths</code> as an array of non-empty strings. <code>view.kind === &quot;working-tree&quot;</code> allows only <code>{ kind }</code>. <code>view.kind === &quot;local-branch&quot;</code> requires <code>name</code> and <code>sha</code>. Export the new functions from <code>validation.ts</code> (already re-exported by <code>src/index.ts</code> via <code>export * from &quot;./validation&quot;</code>).</p>
+<p>Run:</p>
+<pre><code class="language-bash">bun test packages/contracts/test/validation.test.ts
+</code></pre>
+<p>Expected: PASS.</p>
+<ul>
+<li>[ ] <strong>Step 3: Regression</strong></li>
+</ul>
+<pre><code class="language-bash">bun test packages/contracts/test
+</code></pre>
+<p>Expected: PASS. Do not edit plugins or Recorder in this task.</p>
+<h2>Task 2: GitReader local branches and commit trees</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>apps/recorder/src/source/git.ts</code></li>
+<li>Modify: <code>apps/recorder/test/source-resolution.test.ts</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li><p><code>listLocalBranches(root: string): Promise&lt;{ head_branch: string | null; branches: LocalBranch[] }&gt;</code></p>
+</li>
+<li><p><code>resolveLocalBranch(root: string, name: string): Promise&lt;LocalBranch&gt;</code></p>
+</li>
+<li><p><code>listCommitFiles(root: string, sha: string): Promise&lt;string[]&gt;</code> (public form of private <code>listTreePaths</code>)</p>
+</li>
+<li><p>Listing uses <code>for-each-ref</code> with <code>refs/heads</code> only, through existing <code>execute</code> (hooksPath <code>/dev/null</code>, fsmonitor false, same env).</p>
+</li>
+<li><p>Do not <code>rev-parse</code> the user-supplied name. <code>resolveLocalBranch</code> calls <code>listLocalBranches</code> and returns the entry whose <code>name</code> equals <code>name</code> exactly, or throws <code>GitReaderError(REVISION_NOT_FOUND)</code>.</p>
+</li>
+<li><p>Omit a ref whose short name fails the existing <code>isSafeRevision</code> predicate (<code>length</code> 1–128, no leading <code>-</code>, no NUL, <code>^[A-Za-z0-9._/-]+$</code>, no <code>..</code>, no <code>@{</code>). One omitted name does not fail the whole list.</p>
+</li>
+<li><p>Sort <code>branches</code> with the same algorithm as <code>files</code>: <code>branches.sort((a, b) =&gt; (a.name &lt; b.name ? -1 : a.name &gt; b.name ? 1 : 0))</code>.</p>
+</li>
+<li><p><code>head_branch</code> is the short name of the currently checked-out local branch when that name remains in <code>branches</code>; otherwise <code>null</code>.</p>
+</li>
+<li><p>Do not checkout. Do not list <code>refs/remotes</code> or tags.</p>
+</li>
+<li><p>[ ] <strong>Step 1: Write the failing tests</strong></p>
+</li>
+</ul>
+<p>Add tests to <code>apps/recorder/test/source-resolution.test.ts</code> using the existing <code>runGit</code> helper. Initialize with <code>git init -b main --quiet</code>.</p>
+<pre><code class="language-ts">test(&quot;listLocalBranches returns only refs/heads, sorted, with head_branch&quot;, async () =&gt; {
+  const root = await mkdtemp(join(tmpdir(), &quot;ai-review-branches-&quot;));
+  temporaryDirectories.push(root);
+  await runGit(root, [&quot;init&quot;, &quot;-b&quot;, &quot;main&quot;, &quot;--quiet&quot;]);
+  await runGit(root, [&quot;config&quot;, &quot;user.email&quot;, &quot;fixture@example.test&quot;]);
+  await runGit(root, [&quot;config&quot;, &quot;user.name&quot;, &quot;Fixture&quot;]);
+  await writeFile(join(root, &quot;README.md&quot;), &quot;main\n&quot;, &quot;utf8&quot;);
+  await runGit(root, [&quot;add&quot;, &quot;--&quot;, &quot;README.md&quot;]);
+  await runGit(root, [&quot;commit&quot;, &quot;--quiet&quot;, &quot;-m&quot;, &quot;main&quot;]);
+  const mainSha = await runGit(root, [&quot;rev-parse&quot;, &quot;HEAD&quot;]);
+  await runGit(root, [&quot;branch&quot;, &quot;feat/x&quot;]);
+  await runGit(root, [&quot;tag&quot;, &quot;v1&quot;]);
+  await mkdir(join(root, &quot;.git&quot;, &quot;refs&quot;, &quot;remotes&quot;, &quot;origin&quot;), { recursive: true });
+  await writeFile(join(root, &quot;.git&quot;, &quot;refs&quot;, &quot;remotes&quot;, &quot;origin&quot;, &quot;main&quot;), `${mainSha}\n`, &quot;utf8&quot;);
+  await runGit(root, [&quot;update-ref&quot;, &quot;refs/heads/weird@name&quot;, mainSha]);
+
+  const listed = await new GitReader().listLocalBranches(root);
+  expect(listed.branches.map((branch) =&gt; branch.name)).toEqual([&quot;feat/x&quot;, &quot;main&quot;]);
+  expect(listed.head_branch).toBe(&quot;main&quot;);
+  expect(listed.branches.find((branch) =&gt; branch.name === &quot;main&quot;)?.sha).toBe(mainSha);
+  await expect(new GitReader().resolveLocalBranch(root, &quot;feat/x&quot;)).resolves.toMatchObject({ name: &quot;feat/x&quot; });
+  await expect(new GitReader().resolveLocalBranch(root, &quot;origin/main&quot;)).rejects.toMatchObject({ code: &quot;REVISION_NOT_FOUND&quot; });
+  await expect(new GitReader().resolveLocalBranch(root, &quot;v1&quot;)).rejects.toMatchObject({ code: &quot;REVISION_NOT_FOUND&quot; });
+  await expect(new GitReader().resolveLocalBranch(root, &quot;weird@name&quot;)).rejects.toMatchObject({ code: &quot;REVISION_NOT_FOUND&quot; });
+});
+
+test(&quot;listLocalBranches is empty for an unborn repository and has null head_branch when detached&quot;, async () =&gt; {
+  const unborn = await mkdtemp(join(tmpdir(), &quot;ai-review-unborn-&quot;));
+  temporaryDirectories.push(unborn);
+  await runGit(unborn, [&quot;init&quot;, &quot;-b&quot;, &quot;main&quot;, &quot;--quiet&quot;]);
+  expect(await new GitReader().listLocalBranches(unborn)).toEqual({ head_branch: null, branches: [] });
+
+  const detached = await mkdtemp(join(tmpdir(), &quot;ai-review-detached-&quot;));
+  temporaryDirectories.push(detached);
+  await runGit(detached, [&quot;init&quot;, &quot;-b&quot;, &quot;main&quot;, &quot;--quiet&quot;]);
+  await runGit(detached, [&quot;config&quot;, &quot;user.email&quot;, &quot;fixture@example.test&quot;]);
+  await runGit(detached, [&quot;config&quot;, &quot;user.name&quot;, &quot;Fixture&quot;]);
+  await writeFile(join(detached, &quot;README.md&quot;), &quot;x\n&quot;, &quot;utf8&quot;);
+  await runGit(detached, [&quot;add&quot;, &quot;--&quot;, &quot;README.md&quot;]);
+  await runGit(detached, [&quot;commit&quot;, &quot;--quiet&quot;, &quot;-m&quot;, &quot;main&quot;]);
+  await runGit(detached, [&quot;branch&quot;, &quot;other&quot;]);
+  await runGit(detached, [&quot;switch&quot;, &quot;--detach&quot;, &quot;--quiet&quot;, &quot;HEAD&quot;]);
+  const listed = await new GitReader().listLocalBranches(detached);
+  expect(listed.head_branch).toBe(null);
+  expect(listed.branches.map((branch) =&gt; branch.name).sort()).toEqual([&quot;main&quot;, &quot;other&quot;]);
+});
+
+test(&quot;listCommitFiles lists the tree at a commit, not the working tree&quot;, async () =&gt; {
+  const context = await createResolverFixture();
+  await writeFile(join(context.fixture.root, &quot;src/only-worktree.ts&quot;), &quot;x\n&quot;, &quot;utf8&quot;);
+  const git = new GitReader();
+  const commitPaths = await git.listCommitFiles(context.fixture.root, context.fixture.commitSha);
+  const worktreePaths = await git.listWorktreeFiles(context.fixture.root);
+  expect(commitPaths).toContain(context.fixture.path);
+  expect(commitPaths).not.toContain(&quot;src/only-worktree.ts&quot;);
+  expect(worktreePaths).toContain(&quot;src/only-worktree.ts&quot;);
+  context.store.close();
+});
+</code></pre>
+<p>Run:</p>
+<pre><code class="language-bash">bun test apps/recorder/test/source-resolution.test.ts
+</code></pre>
+<p>Expected: FAIL — <code>listLocalBranches</code> / <code>resolveLocalBranch</code> / <code>listCommitFiles</code> missing.</p>
+<ul>
+<li>[ ] <strong>Step 2: Implement listing</strong></li>
+</ul>
+<p>In <code>git.ts</code>:</p>
+<ol>
+<li>Keep <code>isSafeRevision</code> as the single predicate. Use it when filtering listed names.</li>
+<li><code>listLocalBranches</code>: <code>verifyRepository</code>, then <code>execute(root, [&quot;for-each-ref&quot;, &quot;--format=%(refname:short)%00%(objectname)%00%(HEAD)&quot;, &quot;refs/heads&quot;])</code>. On oversized throw <code>PAYLOAD_TOO_LARGE</code>. On non-zero exit throw <code>SOURCE_UNAVAILABLE</code> (empty unborn repo still exits 0 with empty stdout). Parse records as newline-separated triples split on <code>\0</code>. Keep entries whose name passes <code>isSafeRevision</code> and whose object name matches <code>/^[0-9a-f]{40}$/</code>. <code>head_branch</code> is the kept name whose HEAD field is <code>*</code>, else <code>null</code>. Sort as specified.</li>
+<li><code>resolveLocalBranch</code>: <code>const listed = await this.listLocalBranches(root); const found = listed.branches.find((branch) =&gt; branch.name === name); if (!found) throw new GitReaderError(ERROR_CODES.REVISION_NOT_FOUND, &quot;revision was not found&quot;); return found;</code></li>
+<li><code>listCommitFiles</code>: <code>verifyRepository</code>, <code>verifyRevision</code>, then the current <code>listTreePaths</code> body. Replace internal <code>listTreePaths</code> call sites with <code>listCommitFiles</code> or make <code>listTreePaths</code> call <code>listCommitFiles</code>.</li>
+</ol>
+<p>Do not pass <code>name</code> to <code>rev-parse</code>.</p>
+<p>Run:</p>
+<pre><code class="language-bash">bun test apps/recorder/test/source-resolution.test.ts
+</code></pre>
+<p>Expected: PASS for the new tests. Existing <code>readPathDiff</code> tests still pass (signature unchanged in this task).</p>
+<h2>Task 3: GitReader diff current from a commit</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>apps/recorder/src/source/git.ts</code></li>
+<li>Modify: <code>apps/recorder/test/source-resolution.test.ts</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li><p>Extend <code>readPathDiff(root, baseSha, relativePath, current?: { kind: &quot;working-tree&quot; } | { kind: &quot;commit&quot;; sha: string })</code>.</p>
+</li>
+<li><p>Omit <code>current</code> or <code>kind: &quot;working-tree&quot;</code>: existing behavior (new side is the working tree).</p>
+</li>
+<li><p><code>kind: &quot;commit&quot;</code>: new side is <code>readCommitBlob</code> at <code>current.sha</code> when that path exists in <code>listCommitFiles(root, current.sha)</code>; otherwise <code>new_missing: true</code> and empty new side. Do not read the working tree.</p>
+</li>
+<li><p><code>new_missing</code> means the diff current does not contain the path.</p>
+</li>
+<li><p>Existing callers (HTTP <code>readPathDiff</code> without fourth argument, <code>readDiff</code>) stay on the working tree.</p>
+</li>
+<li><p>[ ] <strong>Step 1: Write the failing tests</strong></p>
+</li>
+</ul>
+<pre><code class="language-ts">test(&quot;readPathDiff can use a commit tree as the new side instead of the working tree&quot;, async () =&gt; {
+  const root = await mkdtemp(join(tmpdir(), &quot;ai-review-diff-current-&quot;));
+  temporaryDirectories.push(root);
+  await runGit(root, [&quot;init&quot;, &quot;-b&quot;, &quot;main&quot;, &quot;--quiet&quot;]);
+  await runGit(root, [&quot;config&quot;, &quot;user.email&quot;, &quot;fixture@example.test&quot;]);
+  await runGit(root, [&quot;config&quot;, &quot;user.name&quot;, &quot;Fixture&quot;]);
+  await mkdir(join(root, &quot;src&quot;), { recursive: true });
+  await writeFile(join(root, &quot;src/file.ts&quot;), &quot;main-version\n&quot;, &quot;utf8&quot;);
+  await runGit(root, [&quot;add&quot;, &quot;--&quot;, &quot;src/file.ts&quot;]);
+  await runGit(root, [&quot;commit&quot;, &quot;--quiet&quot;, &quot;-m&quot;, &quot;main&quot;]);
+  const mainSha = await runGit(root, [&quot;rev-parse&quot;, &quot;HEAD&quot;]);
+  await runGit(root, [&quot;switch&quot;, &quot;-c&quot;, &quot;feat/x&quot;, &quot;--quiet&quot;]);
+  await writeFile(join(root, &quot;src/file.ts&quot;), &quot;feature-version\n&quot;, &quot;utf8&quot;);
+  await writeFile(join(root, &quot;src/only-on-feature.ts&quot;), &quot;feature-only\n&quot;, &quot;utf8&quot;);
+  await runGit(root, [&quot;add&quot;, &quot;--&quot;, &quot;src/file.ts&quot;, &quot;src/only-on-feature.ts&quot;]);
+  await runGit(root, [&quot;commit&quot;, &quot;--quiet&quot;, &quot;-m&quot;, &quot;feature&quot;]);
+  const featureSha = await runGit(root, [&quot;rev-parse&quot;, &quot;HEAD&quot;]);
+  await runGit(root, [&quot;switch&quot;, &quot;--quiet&quot;, &quot;main&quot;]);
+  await writeFile(join(root, &quot;src/file.ts&quot;), &quot;dirty-worktree\n&quot;, &quot;utf8&quot;);
+
+  const git = new GitReader();
+  const vsFeature = await git.readPathDiff(root, mainSha, &quot;src/file.ts&quot;, { kind: &quot;commit&quot;, sha: featureSha });
+  expect(vsFeature.base_sha).toBe(mainSha);
+  expect(vsFeature.old_missing).toBe(false);
+  expect(vsFeature.new_missing).toBe(false);
+  expect(vsFeature.hunks.some((hunk) =&gt; hunk.lines.some((line) =&gt; line.type === &quot;add&quot; &amp;&amp; line.content === &quot;feature-version&quot;))).toBe(true);
+  expect(vsFeature.hunks.some((hunk) =&gt; hunk.lines.some((line) =&gt; line.content === &quot;dirty-worktree&quot;))).toBe(false);
+
+  const missingOnMain = await git.readPathDiff(root, mainSha, &quot;src/only-on-feature.ts&quot;, { kind: &quot;commit&quot;, sha: featureSha });
+  expect(missingOnMain.old_missing).toBe(true);
+  expect(missingOnMain.new_missing).toBe(false);
+
+  const missingOnFeature = await git.readPathDiff(root, featureSha, &quot;src/only-on-feature.ts&quot;, { kind: &quot;commit&quot;, sha: mainSha });
+  expect(missingOnFeature.old_missing).toBe(false);
+  expect(missingOnFeature.new_missing).toBe(true);
+
+  const worktree = await git.readPathDiff(root, mainSha, &quot;src/file.ts&quot;);
+  expect(worktree.hunks.some((hunk) =&gt; hunk.lines.some((line) =&gt; line.content === &quot;dirty-worktree&quot;))).toBe(true);
+});
+</code></pre>
+<p>Run:</p>
+<pre><code class="language-bash">bun test apps/recorder/test/source-resolution.test.ts
+</code></pre>
+<p>Expected: FAIL — fourth argument ignored or missing; new side still the worktree.</p>
+<ul>
+<li>[ ] <strong>Step 2: Implement commit current</strong></li>
+</ul>
+<p>In <code>readPathDiff</code>, after reading the base blob from <code>baseSha</code>:</p>
+<pre><code class="language-ts">type DiffCurrent = { kind: &quot;working-tree&quot; } | { kind: &quot;commit&quot;; sha: string };
+
+async readPathDiff(
+  root: string,
+  sha: string,
+  relativePath: string,
+  current: DiffCurrent = { kind: &quot;working-tree&quot; },
+): Promise&lt;FileDiff&gt; {
+  // existing base-side read using listCommitFiles(root, sha)
+  if (current.kind === &quot;commit&quot;) {
+    await this.verifyRevision(root, current.sha);
+    const currentPaths = new Set(await this.listCommitFiles(root, current.sha));
+    if (currentPaths.has(normalizedPath)) {
+      currentContent = await this.readCommitBlob(root, current.sha, normalizedPath);
+      newMissing = false;
+    } else {
+      currentContent = &quot;&quot;;
+      newMissing = true;
+    }
+  } else {
+    // existing WorkingTreeReader path
+  }
+}
+</code></pre>
+<p>Do not call <code>WorkingTreeReader</code> when <code>current.kind === &quot;commit&quot;</code>.</p>
+<p>Run:</p>
+<pre><code class="language-bash">bun test apps/recorder/test/source-resolution.test.ts
+</code></pre>
+<p>Expected: PASS.</p>
+<h2>Task 4: HTTP branches, files view, and diff branch</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>apps/recorder/src/http/server.ts</code></li>
+<li>Modify: <code>apps/recorder/test/http.test.ts</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li><p><code>GET /v1/repositories/:id/branches</code> → <code>success(BranchList)</code> with <code>repository_id</code> from the registered repo.</p>
+</li>
+<li><p><code>GET /v1/repositories/:id/files</code> includes <code>view</code>. Omit <code>branch</code> → <code>{ kind: &quot;working-tree&quot; }</code> and <code>listWorktreeFiles</code>. Present <code>branch</code> after <code>trim()</code>: empty → <code>422 INVALID_RECORD</code> field <code>branch</code>. Else <code>resolveLocalBranch</code> then <code>listCommitFiles</code> at that sha and <code>view: { kind: &quot;local-branch&quot;, name, sha }</code>.</p>
+</li>
+<li><p><code>GET /v1/repositories/:id/diff</code>: same <code>branch</code> rules. When <code>branch</code> resolves, <code>readPathDiff(..., { kind: &quot;commit&quot;, sha: branch.sha })</code>. When <code>branch</code> is set and <code>base</code> is omitted or <code>HEAD</code>, resolve the old side to <code>branch.sha</code> (not worktree HEAD). When <code>branch</code> is omitted, keep today’s <code>base</code> default <code>HEAD</code> and working-tree new side.</p>
+</li>
+<li><p>Unknown <code>branch</code> → <code>404 REVISION_NOT_FOUND</code> via existing <code>errorResponse</code>.</p>
+</li>
+<li><p>Auth and registry lookup stay as today’s <code>files</code> handler.</p>
+</li>
+<li><p>Do not accept a client SHA as the view. Do not add error codes.</p>
+</li>
+<li><p>Update the existing exact <code>files</code> assertion to include <code>view: { kind: &quot;working-tree&quot; }</code>.</p>
+</li>
+<li><p>[ ] <strong>Step 1: Write the failing tests</strong></p>
+</li>
+</ul>
+<p>In <code>apps/recorder/test/http.test.ts</code>, change the current files success assertion to expect <code>view: { kind: &quot;working-tree&quot; }</code> (this fails until the handler adds <code>view</code>).</p>
+<p>Add:</p>
+<pre><code class="language-ts">test(&quot;lists local branches and serves files and diff for a named branch&quot;, async () =&gt; {
+  await runGit([&quot;init&quot;, &quot;-b&quot;, &quot;main&quot;, &quot;--quiet&quot;]);
+  await runGit([&quot;config&quot;, &quot;user.email&quot;, &quot;fixture@example.test&quot;]);
+  await runGit([&quot;config&quot;, &quot;user.name&quot;, &quot;Fixture&quot;]);
+  await runGit([&quot;add&quot;, &quot;--&quot;, &quot;src/example.ts&quot;]);
+  await runGit([&quot;commit&quot;, &quot;--quiet&quot;, &quot;-m&quot;, &quot;main&quot;]);
+  await runGit([&quot;switch&quot;, &quot;-c&quot;, &quot;feat/x&quot;, &quot;--quiet&quot;]);
+  await writeFile(join(root, &quot;src&quot;, &quot;feature-only.ts&quot;), &quot;feature\n&quot;, &quot;utf8&quot;);
+  await runGit([&quot;add&quot;, &quot;--&quot;, &quot;src/feature-only.ts&quot;]);
+  await runGit([&quot;commit&quot;, &quot;--quiet&quot;, &quot;-m&quot;, &quot;feature&quot;]);
+  await runGit([&quot;switch&quot;, &quot;--quiet&quot;, &quot;main&quot;]);
+  await writeFile(join(root, &quot;src&quot;, &quot;worktree-only.ts&quot;), &quot;dirty\n&quot;, &quot;utf8&quot;);
+  await request(&quot;/v1/repositories&quot;, { method: &quot;POST&quot;, headers: { &quot;Content-Type&quot;: &quot;application/json&quot; }, body: JSON.stringify({ root, repository_id: &quot;repo-1&quot; }) });
+
+  const unauthorized = await fetch(`${app.server.url}/v1/repositories/repo-1/branches`);
+  expect(unauthorized.status).toBe(401);
+
+  const missing = await request(&quot;/v1/repositories/repo-missing/branches&quot;);
+  expect(missing.status).toBe(404);
+
+  const listed = await request(&quot;/v1/repositories/repo-1/branches&quot;);
+  expect(listed.status).toBe(200);
+  const listBody = await json&lt;{ success: true; data: { head_branch: string | null; branches: Array&lt;{ name: string; sha: string }&gt; } }&gt;(listed);
+  expect(listBody.data.head_branch).toBe(&quot;main&quot;);
+  expect(listBody.data.branches.map((branch) =&gt; branch.name)).toEqual([&quot;feat/x&quot;, &quot;main&quot;]);
+
+  const defaultFiles = await request(&quot;/v1/repositories/repo-1/files&quot;);
+  const defaultBody = await json&lt;{ success: true; data: { view: { kind: string }; paths: string[] } }&gt;(defaultFiles);
+  expect(defaultBody.data.view).toEqual({ kind: &quot;working-tree&quot; });
+  expect(defaultBody.data.paths).toContain(&quot;src/worktree-only.ts&quot;);
+  expect(defaultBody.data.paths).not.toContain(&quot;src/feature-only.ts&quot;);
+
+  const emptyBranch = await request(&quot;/v1/repositories/repo-1/files?branch=&quot;);
+  expect(emptyBranch.status).toBe(422);
+  expect(await json&lt;{ success: false; error: { code: string; field?: string } }&gt;(emptyBranch)).toMatchObject({
+    success: false,
+    error: { code: &quot;INVALID_RECORD&quot;, field: &quot;branch&quot; },
+  });
+
+  const unknown = await request(&quot;/v1/repositories/repo-1/files?branch=origin/main&quot;);
+  expect(unknown.status).toBe(404);
+  expect(await json&lt;{ success: false; error: { code: string } }&gt;(unknown)).toMatchObject({
+    success: false,
+    error: { code: &quot;REVISION_NOT_FOUND&quot; },
+  });
+
+  const branchFiles = await request(&quot;/v1/repositories/repo-1/files?branch=feat%2Fx&quot;);
+  expect(branchFiles.status).toBe(200);
+  const branchBody = await json&lt;{ success: true; data: { view: { kind: string; name?: string }; paths: string[] } }&gt;(branchFiles);
+  expect(branchBody.data.view).toMatchObject({ kind: &quot;local-branch&quot;, name: &quot;feat/x&quot; });
+  expect(branchBody.data.paths).toContain(&quot;src/feature-only.ts&quot;);
+  expect(branchBody.data.paths).not.toContain(&quot;src/worktree-only.ts&quot;);
+
+  const branchDiff = await request(`/v1/repositories/repo-1/diff?path=src%2Fexample.ts&amp;branch=feat%2Fx`);
+  expect(branchDiff.status).toBe(200);
+  const diffBody = await json&lt;{ success: true; data: { base_sha: string; new_missing: boolean } }&gt;(branchDiff);
+  const featureSha = listBody.data.branches.find((branch) =&gt; branch.name === &quot;feat/x&quot;)!.sha;
+  expect(diffBody.data.base_sha).toBe(featureSha);
+});
+</code></pre>
+<p>This test uses the existing <code>http.test.ts</code> <code>root</code>, <code>request</code>, <code>json</code>, <code>runGit</code> (<code>runGit</code> there takes only git args and uses <code>cwd: root</code>). Register after creating commits.</p>
+<p>Run:</p>
+<pre><code class="language-bash">bun test apps/recorder/test/http.test.ts
+</code></pre>
+<p>Expected: FAIL — no <code>/branches</code> route; <code>files</code> has no <code>view</code>; <code>branch</code> ignored.</p>
+<ul>
+<li>[ ] <strong>Step 2: Wire the handlers</strong></li>
+</ul>
+<p>In <code>handleRequest</code>, add <code>GET</code> when <code>parts[2] === &quot;branches&quot;</code> next to the <code>files</code> route:</p>
+<pre><code class="language-ts">if (request.method === &quot;GET&quot; &amp;&amp; parts.length === 3 &amp;&amp; parts[0] === &quot;repositories&quot; &amp;&amp; parts[2] === &quot;branches&quot;) {
+  const repository = await registry.get(parts[1] ?? &quot;&quot;);
+  if (repository === null) return failure(ERROR_CODES.REPOSITORY_NOT_REGISTERED, &quot;repository is not registered&quot;, 404);
+  const listed = await resolver.git.listLocalBranches(repository.root);
+  return success({
+    repository_id: repository.repository_id,
+    head_branch: listed.head_branch,
+    branches: listed.branches,
+  });
+}
+</code></pre>
+<p>Shared parse for <code>files</code> and <code>diff</code>:</p>
+<pre><code class="language-ts">function parseBranchQuery(url: URL): { ok: &quot;omitted&quot; } | { ok: &quot;empty&quot; } | { ok: &quot;name&quot;; name: string } {
+  if (!url.searchParams.has(&quot;branch&quot;)) return { ok: &quot;omitted&quot; };
+  const name = url.searchParams.get(&quot;branch&quot;) ?? &quot;&quot;;
+  if (name.trim().length === 0) return { ok: &quot;empty&quot; };
+  return { ok: &quot;name&quot;, name: name.trim() };
+}
+</code></pre>
+<p><code>files</code>: on <code>empty</code> return <code>failure(ERROR_CODES.INVALID_RECORD, &quot;branch query parameter must be a local branch name&quot;, 422, &quot;branch&quot;)</code>. On <code>omitted</code>, <code>listWorktreeFiles</code> + <code>view: { kind: &quot;working-tree&quot; }</code>. On <code>name</code>, <code>resolveLocalBranch</code> then <code>listCommitFiles(root, branch.sha)</code> + local-branch <code>view</code>. Sort <code>paths</code> as today.</p>
+<p><code>diff</code>: after <code>assertTarget</code>, parse <code>branch</code>. Empty → same 422. Omitted → <code>base = url.searchParams.get(&quot;base&quot;) ?? &quot;HEAD&quot;</code>, <code>resolveRevision</code>, <code>readPathDiff(root, baseSha, path)</code> (three args). Named → <code>resolveLocalBranch</code>; <code>rawBase = url.searchParams.get(&quot;base&quot;)</code>; <code>baseInput = rawBase === null || rawBase === &quot;HEAD&quot; ? branch.sha : rawBase</code>; <code>readPathDiff(root, await resolveRevision(root, baseInput), path, { kind: &quot;commit&quot;, sha: branch.sha })</code>.</p>
+<p>Run:</p>
+<pre><code class="language-bash">bun test apps/recorder/test/http.test.ts
+bun test apps/recorder/test/source-resolution.test.ts
+</code></pre>
+<p>Expected: PASS.</p>
+<h2>Task 5: Review UI client, header select, and anchors</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>apps/review-ui/src/api.ts</code></li>
+<li>Modify: <code>apps/review-ui/src/api.test.ts</code></li>
+<li>Modify: <code>apps/review-ui/src/lib/decision-index.ts</code></li>
+<li>Modify: <code>apps/review-ui/src/lib/decision-index.test.ts</code></li>
+<li>Modify: <code>apps/review-ui/src/App.tsx</code></li>
+<li>Modify: <code>apps/review-ui/src/App.test.tsx</code></li>
+<li>Modify: <code>apps/review-ui/src/styles/components.css</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li><p>Import <code>BranchList</code> and <code>RepositoryFiles</code> from contracts.</p>
+</li>
+<li><p><code>listBranches(repositoryId: string): Promise&lt;BranchList&gt;</code></p>
+</li>
+<li><p><code>listRepositoryFiles(repositoryId: string, branch?: string): Promise&lt;RepositoryFiles&gt;</code> — omit the query when <code>branch</code> is undefined.</p>
+</li>
+<li><p><code>getFileDiff(repositoryId, path, base = &quot;HEAD&quot;, branch?: string)</code> — append <code>branch</code> only when defined.</p>
+</li>
+<li><p>Review view state is <code>string | null</code> (<code>null</code> = working tree). Memory only. Clear session and full remount (reload) reset it.</p>
+</li>
+<li><p>Fetch <code>listBranches</code> in parallel with decisions and files after repository open. Show the workspace when files arrive; do not block on branches.</p>
+</li>
+<li><p>Render <code>&lt;label htmlFor=&quot;review-view&quot;&gt;Review view&lt;/label&gt;</code> and a <code>&lt;select id=&quot;review-view&quot;&gt;</code> only when <code>branches.length &gt;= 2</code>. First option value <code>&quot;&quot;</code> label <code>Working tree</code>. Then each <code>branches[].name</code>. If <code>name === head_branch</code>, append <code> (checked out)</code> to the option label. Do not put <code>HEAD</code> or <code>current branch</code> in labels.</p>
+</li>
+<li><p>Changing the select reloads files with that <code>branch</code> and, if a path is selected, reloads diff with the same <code>branch</code>. Explorer paths = response <code>paths</code> ∪ decision index keys. If the selected path is not in that set, clear the file selection.</p>
+</li>
+<li><p><code>diffBaseFor</code> stays as today (<code>HEAD</code> or newest commit sha). Pass <code>branch</code> as a separate argument so the server remaps omitted/<code>HEAD</code> base when a branch is selected.</p>
+</li>
+<li><p><code>targetAnchor(source, reviewView: &quot;working-tree&quot; | &quot;local-branch&quot; = &quot;working-tree&quot;)</code>: if <code>reviewView === &quot;local-branch&quot;</code> and <code>source.revision.kind !== &quot;commit&quot;</code>, return <code>null</code>. Commit anchors stay old-side. Working-tree resolved anchors stay new-side only for <code>&quot;working-tree&quot;</code>.</p>
+</li>
+<li><p>If files or diff returns <code>REVISION_NOT_FOUND</code> while a branch is selected, set view to working tree, show the existing inline error, and reload files without <code>branch</code>.</p>
+</li>
+<li><p>Snapshot-diff calls stay unchanged.</p>
+</li>
+<li><p>Default <code>createFetch</code> mock must answer <code>GET /v1/repositories/repo-1/branches</code> with one branch (or <code>[]</code>) so existing tests do not see the select, and must include <code>view: { kind: &quot;working-tree&quot; }</code> on files payloads.</p>
+</li>
+<li><p>[ ] <strong>Step 1: Write the failing tests</strong></p>
+</li>
+</ul>
+<p><code>apps/review-ui/src/api.test.ts</code>:</p>
+<pre><code class="language-ts">it(&quot;lists local branches and passes branch on files and diff&quot;, async () =&gt; {
+  const fetchImpl = vi.fn(async (input: RequestInfo | URL) =&gt; {
+    const url = String(input);
+    if (url.endsWith(&quot;/branches&quot;)) {
+      return response({
+        success: true,
+        data: { repository_id: &quot;repo-1&quot;, head_branch: &quot;main&quot;, branches: [{ name: &quot;feat/x&quot;, sha: &quot;a&quot;.repeat(40) }, { name: &quot;main&quot;, sha: &quot;b&quot;.repeat(40) }] },
+      });
+    }
+    if (url.includes(&quot;/files&quot;)) {
+      return response({
+        success: true,
+        data: { repository_id: &quot;repo-1&quot;, view: { kind: &quot;local-branch&quot;, name: &quot;feat/x&quot;, sha: &quot;a&quot;.repeat(40) }, paths: [&quot;src/a.ts&quot;] },
+      });
+    }
+    return response({
+      success: true,
+      data: { path: &quot;src/a.ts&quot;, base_sha: &quot;a&quot;.repeat(40), hunks: [], old_missing: false, new_missing: false, binary: false },
+    });
+  });
+  const api = new ReviewApi(&quot;owner-token&quot;, { baseUrl: &quot;http://recorder.test/&quot;, fetchImpl });
+  await api.listBranches(&quot;repo-1&quot;);
+  await api.listRepositoryFiles(&quot;repo-1&quot;, &quot;feat/x&quot;);
+  await api.getFileDiff(&quot;repo-1&quot;, &quot;src/a.ts&quot;, &quot;HEAD&quot;, &quot;feat/x&quot;);
+  expect(fetchImpl).toHaveBeenCalledWith(&quot;http://recorder.test/v1/repositories/repo-1/branches&quot;, expect.anything());
+  expect(fetchImpl).toHaveBeenCalledWith(&quot;http://recorder.test/v1/repositories/repo-1/files?branch=feat%2Fx&quot;, expect.anything());
+  expect(String(fetchImpl.mock.calls[2]![0])).toContain(&quot;branch=feat%2Fx&quot;);
+});
+</code></pre>
+<p>Update the existing <code>listRepositoryFiles</code> expectation URL to stay without <code>branch</code> when the second argument is omitted. Update its mock payload to include <code>view: { kind: &quot;working-tree&quot; }</code> if the client starts returning <code>RepositoryFiles</code>.</p>
+<p><code>decision-index.test.ts</code>:</p>
+<pre><code class="language-ts">it(&quot;does not new-side anchor a resolved working-tree source when the review view is a local branch&quot;, () =&gt; {
+  const source: SourceReferenceData = {
+    state: &quot;resolved&quot;,
+    repository_id: &quot;repo-1&quot;,
+    path: &quot;src/a.ts&quot;,
+    revision: { kind: &quot;working-tree&quot;, contentHash: &quot;hash-a&quot; },
+    target: { repository_id: &quot;repo-1&quot;, path: &quot;src/a.ts&quot;, line_start: 2, line_end: 2, revision: { kind: &quot;working-tree&quot;, contentHash: &quot;hash-a&quot; }, content_hash: &quot;hash-a&quot; },
+    content: &quot;x&quot;,
+    content_hash: &quot;hash-a&quot;,
+  };
+  expect(targetAnchor(source, &quot;local-branch&quot;)).toBeNull();
+  expect(targetAnchor(source, &quot;working-tree&quot;)?.side).toBe(&quot;new&quot;);
+});
+</code></pre>
+<p>In <code>App.test.tsx</code> <code>createFetch</code>, add:</p>
+<pre><code class="language-ts">if (url.endsWith(&quot;/v1/repositories/repo-1/branches&quot;)) {
+  return json({ success: true, data: { repository_id: &quot;repo-1&quot;, head_branch: &quot;main&quot;, branches: [{ name: &quot;main&quot;, sha: &quot;a&quot;.repeat(40) }] } });
+}
+</code></pre>
+<p>and add <code>view: { kind: &quot;working-tree&quot; }</code> to files JSON. Existing tests must still find no <code>Review view</code> combobox.</p>
+<p>Add tests (extend <code>createFetch</code> via <code>overrideResponse</code> or a <code>branches</code> argument):</p>
+<ol>
+<li>Two branches <code>{ name: &quot;feat/x&quot;, sha: &quot;1&quot;.repeat(40) }</code> and <code>{ name: &quot;main&quot;, sha: &quot;2&quot;.repeat(40) }</code> → after <code>openWorkspace</code>, <code>getByLabelText(&quot;Review view&quot;)</code> exists. Value is <code>&quot;&quot;</code>. Options include <code>Working tree</code>, <code>feat/x</code>, <code>main (checked out)</code> when <code>head_branch</code> is <code>main</code>.</li>
+<li>Change select to <code>feat/x</code> → <code>listRepositoryFiles</code> URL includes <code>branch=feat%2Fx</code>. If <code>a.ts</code> is open, diff URL includes <code>branch=feat%2Fx</code>.</li>
+<li>Zero or one branch → no <code>Review view</code> label.</li>
+<li>After selecting <code>feat/x</code>, files mock returns <code>REVISION_NOT_FOUND</code> → error alert, select returns to working tree, next files request has no <code>branch</code>.</li>
+<li>Workspace heading appears even if <code>/branches</code> is held (reuse the <code>hold</code> helper on the branches URL).</li>
+</ol>
+<p>Run:</p>
+<pre><code class="language-bash">bun run --cwd apps/review-ui test src/api.test.ts src/lib/decision-index.test.ts src/App.test.tsx
+</code></pre>
+<p>Expected: FAIL.</p>
+<ul>
+<li>[ ] <strong>Step 2: Implement the client, anchors, and header</strong></li>
+</ul>
+<p><code>api.ts</code>: add <code>listBranches</code>. Add optional <code>branch</code> to files/diff using <code>URLSearchParams</code> only when <code>typeof branch === &quot;string&quot;</code>. Keep token in memory; do not write the branch name to storage.</p>
+<p><code>decision-index.ts</code>: add the second argument to <code>targetAnchor</code> and thread it through <code>decisionAnchors(detail, reviewView)</code>. <code>App</code> <code>currentPathEvidence</code> / <code>evidence</code> must pass <code>&quot;local-branch&quot;</code> when <code>reviewBranch !== null</code>.</p>
+<p><code>App.tsx</code>:</p>
+<ul>
+<li><code>const [branchList, setBranchList] = useState&lt;BranchList | null&gt;(null);</code></li>
+<li><code>const [reviewBranch, setReviewBranch] = useState&lt;string | null&gt;(null);</code></li>
+<li>After selecting a repository, <code>Promise.all</code> of <code>listDecisions</code>, <code>listRepositoryFiles(id)</code> (no branch), <code>listBranches(id)</code>. Apply files even if branches reject; store branch error in <code>error</code> without blocking explorer.</li>
+<li>Header select as specified. <code>onChange</code>: <code>const next = event.target.value === &quot;&quot; ? null : event.target.value; setReviewBranch(next);</code> then <code>loadFiles(..., next)</code> and if <code>selectedPath</code> still in the upcoming set, <code>openFile</code> with <code>next</code>. Compute the new path set from the files response plus <code>decisionIndex</code> keys after files return; clear <code>selectedPath</code> when absent.</li>
+<li><code>loadFiles</code> / <code>openFile</code> take <code>branch: string | null</code> and pass it to the API.</li>
+<li>On <code>ReviewApiError</code> with <code>code === &quot;REVISION_NOT_FOUND&quot;</code> and <code>reviewBranch !== null</code>: <code>setReviewBranch(null)</code>, <code>setError(...)</code>, <code>loadFiles(..., null)</code>.</li>
+<li><code>resetSession</code> clears <code>branchList</code> and <code>reviewBranch</code>.</li>
+</ul>
+<p>CSS: <code>.app-header__view</code> inline-flex next to <code>.app-header__repo</code>, select uses existing input/select tokens (<code>min-width</code> ~10rem).</p>
+<p>Run:</p>
+<pre><code class="language-bash">bun run --cwd apps/review-ui test
+</code></pre>
+<p>Expected: PASS, including prior workspace tests.</p>
+<h2>Task 6: E2E branch switch</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>tests/e2e/review-view-branch.spec.ts</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li><p>Playwright against a Recorder with <code>--ui-root</code> pointing at <code>apps/review-ui/dist</code> (same as <code>tests/e2e/review-flow.spec.ts</code>).</p>
+</li>
+<li><p>Fixture: <code>git init -b main</code>, commit <code>src/main-only.ts</code>, branch <code>feat/x</code>, commit <code>src/feature-only.ts</code> on <code>feat/x</code>, switch back to <code>main</code>, write uncommitted <code>src/worktree-only.ts</code>.</p>
+</li>
+<li><p>Register that root. Open the UI with the owner token. Review view select is visible. Default explorer contains <code>worktree-only.ts</code> and not <code>feature-only.ts</code>. Select <code>feat/x</code>. Explorer contains <code>feature-only.ts</code> and not <code>worktree-only.ts</code>.</p>
+</li>
+<li><p>Do not checkout <code>feat/x</code> in the fixture after creating it; the registered worktree stays on <code>main</code>.</p>
+</li>
+<li><p>[ ] <strong>Step 1: Write the failing spec</strong></p>
+</li>
+</ul>
+<p>Copy helpers (<code>runCommand</code>, <code>startRecorder</code>, <code>apiRequest</code>, <code>postJson</code>) from <code>tests/e2e/review-flow.spec.ts</code> or import nothing and duplicate the small startup block so this file stays independent.</p>
+<pre><code class="language-ts">test(&quot;switches explorer from the working tree to a local branch tip&quot;, async ({ page }) =&gt; {
+  // start recorder, create two-branch repo, POST /v1/repositories
+  await page.goto(app.url);
+  await page.getByLabel(&quot;Owner bearer token&quot;).fill(token);
+  await page.getByRole(&quot;button&quot;, { name: &quot;Load repositories&quot; }).click();
+  await page.getByLabel(&quot;Repository&quot;).selectOption(repositoryId);
+  await page.getByRole(&quot;button&quot;, { name: &quot;Open review timeline&quot; }).click();
+  await expect(page.getByRole(&quot;heading&quot;, { name: &quot;Decision review&quot; })).toBeVisible();
+  await expect(page.getByRole(&quot;button&quot;, { name: /worktree-only/ })).toBeVisible();
+  await expect(page.getByRole(&quot;button&quot;, { name: /feature-only/ })).toHaveCount(0);
+  await page.getByLabel(&quot;Review view&quot;).selectOption(&quot;feat/x&quot;);
+  await expect(page.getByRole(&quot;button&quot;, { name: /feature-only/ })).toBeVisible();
+  await expect(page.getByRole(&quot;button&quot;, { name: /worktree-only/ })).toHaveCount(0);
+});
+</code></pre>
+<p>Run (build UI first, same as package <code>e2e</code> script):</p>
+<pre><code class="language-bash">bun run --cwd apps/review-ui build
+bunx playwright test tests/e2e/review-view-branch.spec.ts
+</code></pre>
+<p>Expected: FAIL until Task 5 is on the built UI.</p>
+<ul>
+<li>[ ] <strong>Step 2: Confirm the journey</strong></li>
+</ul>
+<p>No production code in this task unless the spec reveals a missing <code>name</code> on the explorer button; fix by matching the same accessible name pattern Explorer already uses (<code>path.split(&quot;/&quot;).at(-1)</code>).</p>
+<p>Run:</p>
+<pre><code class="language-bash">bun run e2e
+</code></pre>
+<p>Expected: PASS, including existing <code>review-flow</code> and <code>security-boundaries</code>.</p>
+<ul>
+<li>[ ] <strong>Step 3: Full regression</strong></li>
+</ul>
+<pre><code class="language-bash">bun run test
+bun run e2e
+</code></pre>
+<p>Expected: PASS. No plugin bundle rebuild. No <code>.ai-review/</code> committed.</p>
+
+</main>
+</body>
+</html>
