@@ -754,6 +754,8 @@ describe("source resolution", () => {
     const mainSha = await runGit(root, ["rev-parse", "HEAD"]);
     await runGit(root, ["branch", "feat/x"]);
     await runGit(root, ["tag", "v1"]);
+    // A tag with the same short name makes `refname:short` emit `heads/main`.
+    await runGit(root, ["tag", "main"]);
     await mkdir(join(root, ".git", "refs", "remotes", "origin"), { recursive: true });
     await writeFile(join(root, ".git", "refs", "remotes", "origin", "main"), `${mainSha}\n`, "utf8");
     await runGit(root, ["update-ref", "refs/heads/weird@name", mainSha]);
@@ -762,6 +764,7 @@ describe("source resolution", () => {
     expect(listed.branches.map((branch) => branch.name)).toEqual(["feat/x", "main"]);
     expect(listed.head_branch).toBe("main");
     expect(listed.branches.find((branch) => branch.name === "main")?.sha).toBe(mainSha);
+    await expect(new GitReader().resolveLocalBranch(root, "main")).resolves.toMatchObject({ name: "main", sha: mainSha });
     await expect(new GitReader().resolveLocalBranch(root, "feat/x")).resolves.toMatchObject({ name: "feat/x" });
     await expect(new GitReader().resolveLocalBranch(root, "origin/main")).rejects.toMatchObject({ code: "REVISION_NOT_FOUND" });
     await expect(new GitReader().resolveLocalBranch(root, "v1")).rejects.toMatchObject({ code: "REVISION_NOT_FOUND" });
