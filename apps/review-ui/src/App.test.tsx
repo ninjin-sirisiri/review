@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { App } from "./App";
+import { App, currentPathEvidence } from "./App";
+import type { JudgmentEntry } from "./components/JudgmentPanel";
 import { ReviewApi, type DecisionRecordDetail, type DecisionRecordSummary } from "./api";
 import type { SnapshotDiffResponse } from "../../../packages/contracts/src/index";
 
@@ -1093,5 +1094,83 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Decision review" })).toBeTruthy();
     expect(screen.queryByLabelText("Review view")).toBeNull();
     expect(fetchImpl).toHaveBeenCalledWith("/v1/repositories/repo-1/branches", expect.anything());
+  });
+
+  it("does not attach working-tree source content as fullText when the review view is a local branch", () => {
+    const entries: JudgmentEntry[] = [{ recordId: "rec-1", status: "ready", detail: detailFixture() }];
+
+    expect(currentPathEvidence(entries, "src/a.ts", "local-branch").fullText).toBeNull();
+    expect(currentPathEvidence(entries, "src/a.ts", "working-tree").fullText?.content).toBe("const value = input ?? {};");
+  });
+
+  it("discards a stale branch files response after the review view changes again", async () => {
+    let holdBranchFiles = false;
+    const fetchImpl = createFetch(
+      (url) => holdBranchFiles && url.includes("/v1/repositories/repo-1/files?") && url.includes("branch="),
+      undefined,
+      undefined,
+      (url) => {
+        if (!requestPath(url).endsWith("/v1/repositories/repo-1/files") || !url.includes("branch=")) return undefined;
+        if (url.includes("branch=feat%2Fx")) {
+          return json({
+            success: true,
+            data: {
+              repository_id: "repo-1",
+              view: { kind: "local-branch", name: "feat/x", sha: "1".repeat(40) },
+              paths: ["src/a.ts", "feat-only.ts"],
+            },
+          });
+        }
+        if (url.includes("branch=main")) {
+          return json({
+            success: true,
+            data: {
+              repository_id: "repo-1",
+              view: { kind: "local-branch", name: "main", sha: "2".repeat(40) },
+              paths: ["src/a.ts", "main-only.ts"],
+            },
+          });
+        }
+        return undefined;
+      },
+      twoBranchList,
+    );
+    await openWorkspace(fetchImpl);
+
+    fireEvent.click(screen.getByText("a.ts"));
+    await screen.findByRole("heading", { name: "Guard the empty input" });
+
+    holdBranchFiles = true;
+    fireEvent.change(await screen.findByLabelText("Review view"), { target: { value: "feat/x" } });
+    await waitFor(() => {
+      expect(fetchImpl).toHaveBeenCalledWith("/v1/repositories/repo-1/files?branch=feat%2Fx", expect.anything());
+    });
+
+    fireEvent.change(screen.getByLabelText("Review view"), { target: { value: "main" } });
+    await waitFor(() => {
+      expect(fetchImpl).toHaveBeenCalledWith("/v1/repositories/repo-1/files?branch=main", expect.anything());
+    });
+    expect(screen.getByLabelText("Review view")).toHaveProperty("value", "main");
+
+    // feat/x is still in flight when main starts. Releasing it first is the window where
+    // loadFiles can apply feat/x and openFile("feat/x") while the select already shows main.
+    fetchImpl.releaseOne();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    holdBranchFiles = false;
+    fetchImpl.releaseAll();
+    await waitFor(() => {
+      expect(screen.getByText("main-only.ts")).toBeTruthy();
+    });
+
+    expect(screen.getByLabelText("Review view")).toHaveProperty("value", "main");
+    expect(screen.queryByText("feat-only.ts")).toBeNull();
+    const lastDiff = fetchImpl.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes("/diff?"))
+      .at(-1);
+    expect(lastDiff).toContain("branch=main");
+    expect(lastDiff).not.toContain("feat");
   });
 });

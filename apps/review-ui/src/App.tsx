@@ -55,7 +55,7 @@ function assertSnapshotTransitionMatchesSelection(result: SnapshotDiff, recordId
   return result;
 }
 
-function currentPathEvidence(
+export function currentPathEvidence(
   entries: Iterable<JudgmentEntry>,
   path: string | null,
   reviewView: "working-tree" | "local-branch" = "working-tree",
@@ -75,7 +75,7 @@ function currentPathEvidence(
     const entryAnchors = decisionAnchors(detail, reviewView);
     anchors.push(...entryAnchors);
 
-    if (fullText === null) {
+    if (fullText === null && reviewView === "working-tree") {
       const source = sources.find((candidate) => candidate.state === "resolved" || candidate.state === "snapshot-resolved");
       if (source !== undefined && "content" in source) {
         fullText = { content: source.content, anchors: entryAnchors };
@@ -96,7 +96,8 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [branchList, setBranchList] = useState<BranchList | null>(null);
-  const [reviewBranch, setReviewBranch] = useState<string | null>(null);
+  const [reviewBranch, setReviewBranchState] = useState<string | null>(null);
+  const reviewBranchRef = useRef<string | null>(null);
 
   // Explorer state
   const [filePaths, setFilePaths] = useState<string[]>([]);
@@ -116,11 +117,16 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
   const [snapshotDiffLoading, setSnapshotDiffLoading] = useState(false);
   const [snapshotDiffError, setSnapshotDiffError] = useState<ReviewApiError | Error | null>(null);
   const [recordStates, setRecordStates] = useState<Record<string, JudgmentEntry>>({});
-  // M31: openFileが進める単調トークン。後発のファイル選択は先行ロードの非同期完了を無効化し、
-  // 遅れて着いた応答が新しい選択の状態を上書きしないようにする。
+  // M31: openFile と loadFiles が進める単調トークン。後発のファイル選択や review view 変更は
+  // 先行ロードの非同期完了を無効化し、遅れて着いた応答が新しい選択の状態を上書きしないようにする。
   const requestTokenRef = useRef(0);
   const sessionGenerationRef = useRef(0);
   const snapshotRequestTokenRef = useRef(0);
+
+  function assignReviewBranch(next: string | null) {
+    reviewBranchRef.current = next;
+    setReviewBranchState(next);
+  }
 
   const decisionIndex = useMemo(() => buildDecisionIndex(decisions), [decisions]);
   const tree = useMemo(() => {
@@ -221,9 +227,11 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     sessionGeneration: number,
     branch: string | null,
   ): Promise<RepositoryFiles | undefined> {
-    const fileToken = requestTokenRef.current;
+    const fileToken = ++requestTokenRef.current;
     const isCurrent = () =>
-      sessionGenerationRef.current === sessionGeneration && requestTokenRef.current === fileToken;
+      sessionGenerationRef.current === sessionGeneration
+      && requestTokenRef.current === fileToken
+      && reviewBranchRef.current === branch;
     if (!isCurrent()) return undefined;
     setExplorerIsLoading(true);
     setExplorerError(null);
@@ -235,7 +243,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     } catch (requestError) {
       if (!isCurrent()) return undefined;
       if (branch !== null && requestError instanceof ReviewApiError && requestError.code === "REVISION_NOT_FOUND") {
-        setReviewBranch(null);
+        assignReviewBranch(null);
         setError(apiMessage(requestError));
         await loadFiles(client, repository, sessionGeneration, null);
         return undefined;
@@ -249,11 +257,12 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
   async function handleReviewViewChange(event: ChangeEvent<HTMLSelectElement>) {
     const next = event.target.value === "" ? null : event.target.value;
-    setReviewBranch(next);
+    assignReviewBranch(next);
     if (api === null || repositoryId === null) return;
     const sessionGeneration = sessionGenerationRef.current;
     const data = await loadFiles(api, repositoryId, sessionGeneration, next);
     if (sessionGenerationRef.current !== sessionGeneration) return;
+    if (reviewBranchRef.current !== next) return;
     if (data === undefined) return;
     if (selectedPath === null) return;
     const known = new Set(data.paths);
@@ -301,6 +310,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
 
     // トークンが進んでいれば、この完了は後発のファイル選択に負けている。何も状態を触らず破棄する。
     if (requestTokenRef.current !== token) return;
+    if (branch !== reviewBranchRef.current) return;
 
     if (diffResult.ok) {
       setDiff(diffResult.value);
@@ -309,7 +319,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
       diffResult.error instanceof ReviewApiError &&
       diffResult.error.code === "REVISION_NOT_FOUND"
     ) {
-      setReviewBranch(null);
+      assignReviewBranch(null);
       setError(apiMessage(diffResult.error));
       void loadFiles(api, repositoryId, sessionGenerationRef.current, null);
     } else if (
@@ -427,7 +437,7 @@ export function App({ apiFactory = (token) => new ReviewApi(token) }: AppProps) 
     setDecisions([]);
     setFilePaths([]);
     setBranchList(null);
-    setReviewBranch(null);
+    assignReviewBranch(null);
     setIsLoading(false);
     setExplorerIsLoading(false);
     setExplorerError(null);
