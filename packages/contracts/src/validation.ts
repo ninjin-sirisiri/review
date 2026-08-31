@@ -1,8 +1,11 @@
 import type {
   ApiFailure,
   ApiSuccess,
+  BranchList,
   DiffHunk,
   DiffLine,
+  RepositoryFiles,
+  ReviewView,
   SnapshotDiff,
   SnapshotDiffResponse,
   SnapshotEndpoint,
@@ -597,6 +600,100 @@ export function validateSnapshotDiffResponse(value: unknown): ValidationResult<S
   if (value.state === "legacy-fallback") return validateLegacyFallback(value);
   if (value.state === "source-unavailable" || value.state === "revision-not-found") return validateSnapshotFailure(value);
   return invalid("snapshot diff response state is invalid", "state");
+}
+
+const COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+function commitSha(value: unknown, field: string): ApiFailure | null {
+  if (typeof value !== "string" || !COMMIT_SHA_PATTERN.test(value)) {
+    return invalid(`${field} must be a lowercase 40-character commit SHA`, field);
+  }
+  return null;
+}
+
+function validateLocalBranch(value: unknown, field: string): ValidationResult<BranchList["branches"][number]> {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["name", "sha"])) {
+    return invalid(`${field} has an unsupported field`, field);
+  }
+  const error = firstError(nonEmptyString(value.name, `${field}.name`), commitSha(value.sha, `${field}.sha`));
+  if (error) return error;
+  return success({ name: value.name as string, sha: value.sha as string });
+}
+
+export function validateReviewView(value: unknown): ValidationResult<ReviewView> {
+  if (!isRecord(value) || typeof value.kind !== "string") {
+    return invalid("review view must be a working-tree or local-branch reference", "view");
+  }
+  if (value.kind === "working-tree") {
+    if (!hasOnlyKeys(value, ["kind"])) {
+      return invalid("working-tree review view must contain only kind", "view");
+    }
+    return success({ kind: "working-tree" });
+  }
+  if (value.kind === "local-branch") {
+    if (!hasOnlyKeys(value, ["kind", "name", "sha"])) {
+      return invalid("local-branch review view must contain only kind, name, and sha", "view");
+    }
+    const error = firstError(nonEmptyString(value.name, "view.name"), commitSha(value.sha, "view.sha"));
+    if (error) return error;
+    return success({ kind: "local-branch", name: value.name as string, sha: value.sha as string });
+  }
+  return invalid("view.kind must be working-tree or local-branch", "view.kind");
+}
+
+export function validateBranchList(value: unknown): ValidationResult<BranchList> {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["repository_id", "head_branch", "branches"])) {
+    return invalid("branch list has an unsupported field");
+  }
+  const repositoryError = nonEmptyString(value.repository_id, "repository_id");
+  if (repositoryError) return repositoryError;
+  if (!Array.isArray(value.branches)) return invalid("branches must be an array", "branches");
+
+  const branches: BranchList["branches"] = [];
+  for (let index = 0; index < value.branches.length; index += 1) {
+    const result = validateLocalBranch(value.branches[index], `branches[${index}]`);
+    if (!result.success) return result;
+    branches.push(result.data);
+  }
+
+  if (value.head_branch === null) {
+    return success({
+      repository_id: value.repository_id as string,
+      head_branch: null,
+      branches,
+    });
+  }
+  if (typeof value.head_branch !== "string" || !branches.some((branch) => branch.name === value.head_branch)) {
+    return invalid("head_branch must match a listed branch name", "head_branch");
+  }
+  return success({
+    repository_id: value.repository_id as string,
+    head_branch: value.head_branch,
+    branches,
+  });
+}
+
+export function validateRepositoryFiles(value: unknown): ValidationResult<RepositoryFiles> {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["repository_id", "view", "paths"])) {
+    return invalid("repository files has an unsupported field");
+  }
+  const repositoryError = nonEmptyString(value.repository_id, "repository_id");
+  if (repositoryError) return repositoryError;
+  const viewResult = validateReviewView(value.view);
+  if (!viewResult.success) return viewResult;
+  if (!Array.isArray(value.paths)) return invalid("paths must be an array", "paths");
+
+  const paths: string[] = [];
+  for (let index = 0; index < value.paths.length; index += 1) {
+    const error = nonEmptyString(value.paths[index], `paths[${index}]`, MAX_PATH_LENGTH);
+    if (error) return error;
+    paths.push(value.paths[index] as string);
+  }
+  return success({
+    repository_id: value.repository_id as string,
+    view: viewResult.data,
+    paths,
+  });
 }
 
 export class ContractValidationError extends Error {
