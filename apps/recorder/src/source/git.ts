@@ -200,15 +200,17 @@ export class GitReader {
 
   async listLocalBranches(root: string): Promise<{ head_branch: string | null; branches: LocalBranch[] }> {
     await this.verifyRepository(root);
-    const result = await this.execute(root, ["for-each-ref", "--format=%(refname:short)%00%(objectname)%00%(HEAD)", "refs/heads"]);
+    const result = await this.execute(root, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(HEAD)", "refs/heads"]);
     if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git metadata exceeds the configured source limit");
     if (result.exitCode !== 0) throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git local branches cannot be listed");
     const branches: LocalBranch[] = [];
     let head_branch: string | null = null;
     for (const record of result.stdout.split("\n")) {
       if (record.length === 0) continue;
-      const [name, objectname, head] = record.split("\0");
-      if (name === undefined || !isSafeRevision(name) || objectname === undefined || !/^[0-9a-f]{40}$/.test(objectname)) continue;
+      const [refname, objectname, head] = record.split("\0");
+      if (refname === undefined || !refname.startsWith("refs/heads/")) continue;
+      const name = refname.slice("refs/heads/".length);
+      if (name.length === 0 || !isSafeRevision(name) || objectname === undefined || !/^[0-9a-f]{40}$/.test(objectname)) continue;
       branches.push({ name, sha: objectname });
       if (head === "*") head_branch = name;
     }
