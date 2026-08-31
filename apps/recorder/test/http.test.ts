@@ -467,14 +467,75 @@ describe("authenticated local Recorder HTTP API", () => {
 
     const response = await request("/v1/repositories/repo-1/files");
     expect(response.status).toBe(200);
-    expect(await json<{ success: true; data: { repository_id: string; paths: string[] } }>(response)).toEqual({
+    expect(await json<{ success: true; data: { repository_id: string; view: { kind: string }; paths: string[] } }>(response)).toEqual({
       success: true,
-      data: { repository_id: "repo-1", paths: ["src/example.ts", "src/other.ts"] },
+      data: { repository_id: "repo-1", view: { kind: "working-tree" }, paths: ["src/example.ts", "src/other.ts"] },
     });
 
     const unregistered = await request("/v1/repositories/repo-missing/files");
     expect(unregistered.status).toBe(404);
     expect(await json<{ success: false; error: { code: string } }>(unregistered)).toMatchObject({ success: false, error: { code: "REPOSITORY_NOT_REGISTERED" } });
+  });
+
+  test("lists local branches and serves files and diff for a named branch", async () => {
+    await runGit(["init", "-b", "main", "--quiet"]);
+    await runGit(["config", "user.email", "fixture@example.test"]);
+    await runGit(["config", "user.name", "Fixture"]);
+    await runGit(["add", "--", "src/example.ts"]);
+    await runGit(["commit", "--quiet", "-m", "main"]);
+    await runGit(["switch", "-c", "feat/x", "--quiet"]);
+    await writeFile(join(root, "src", "feature-only.ts"), "feature\n", "utf8");
+    await runGit(["add", "--", "src/feature-only.ts"]);
+    await runGit(["commit", "--quiet", "-m", "feature"]);
+    await runGit(["switch", "--quiet", "main"]);
+    await writeFile(join(root, "src", "worktree-only.ts"), "dirty\n", "utf8");
+    await runGit(["add", "--", "src/worktree-only.ts"]);
+    await request("/v1/repositories", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root, repository_id: "repo-1" }) });
+
+    const unauthorized = await fetch(`${app.server.url}/v1/repositories/repo-1/branches`);
+    expect(unauthorized.status).toBe(401);
+
+    const missing = await request("/v1/repositories/repo-missing/branches");
+    expect(missing.status).toBe(404);
+
+    const listed = await request("/v1/repositories/repo-1/branches");
+    expect(listed.status).toBe(200);
+    const listBody = await json<{ success: true; data: { head_branch: string | null; branches: Array<{ name: string; sha: string }> } }>(listed);
+    expect(listBody.data.head_branch).toBe("main");
+    expect(listBody.data.branches.map((branch) => branch.name)).toEqual(["feat/x", "main"]);
+
+    const defaultFiles = await request("/v1/repositories/repo-1/files");
+    const defaultBody = await json<{ success: true; data: { view: { kind: string }; paths: string[] } }>(defaultFiles);
+    expect(defaultBody.data.view).toEqual({ kind: "working-tree" });
+    expect(defaultBody.data.paths).toContain("src/worktree-only.ts");
+    expect(defaultBody.data.paths).not.toContain("src/feature-only.ts");
+
+    const emptyBranch = await request("/v1/repositories/repo-1/files?branch=");
+    expect(emptyBranch.status).toBe(422);
+    expect(await json<{ success: false; error: { code: string; field?: string } }>(emptyBranch)).toMatchObject({
+      success: false,
+      error: { code: "INVALID_RECORD", field: "branch" },
+    });
+
+    const unknown = await request("/v1/repositories/repo-1/files?branch=origin/main");
+    expect(unknown.status).toBe(404);
+    expect(await json<{ success: false; error: { code: string } }>(unknown)).toMatchObject({
+      success: false,
+      error: { code: "REVISION_NOT_FOUND" },
+    });
+
+    const branchFiles = await request("/v1/repositories/repo-1/files?branch=feat%2Fx");
+    expect(branchFiles.status).toBe(200);
+    const branchBody = await json<{ success: true; data: { view: { kind: string; name?: string }; paths: string[] } }>(branchFiles);
+    expect(branchBody.data.view).toMatchObject({ kind: "local-branch", name: "feat/x" });
+    expect(branchBody.data.paths).toContain("src/feature-only.ts");
+    expect(branchBody.data.paths).not.toContain("src/worktree-only.ts");
+
+    const branchDiff = await request(`/v1/repositories/repo-1/diff?path=src%2Fexample.ts&branch=feat%2Fx`);
+    expect(branchDiff.status).toBe(200);
+    const diffBody = await json<{ success: true; data: { base_sha: string; new_missing: boolean } }>(branchDiff);
+    const featureSha = listBody.data.branches.find((branch) => branch.name === "feat/x")!.sha;
+    expect(diffBody.data.base_sha).toBe(featureSha);
   });
 
   test("creates an automatic snapshot only for the current target state", async () => {

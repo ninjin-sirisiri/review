@@ -387,6 +387,13 @@ function parseDisposition(value: unknown): UserDisposition {
   return value;
 }
 
+function parseBranchQuery(url: URL): { ok: "omitted" } | { ok: "empty" } | { ok: "name"; name: string } {
+  if (!url.searchParams.has("branch")) return { ok: "omitted" };
+  const name = url.searchParams.get("branch") ?? "";
+  if (name.trim().length === 0) return { ok: "empty" };
+  return { ok: "name", name: name.trim() };
+}
+
 async function handleRequest(
   request: Request,
   token: string,
@@ -468,12 +475,35 @@ async function handleRequest(
       return success(await registry.list());
     }
 
+    if (request.method === "GET" && parts.length === 3 && parts[0] === "repositories" && parts[2] === "branches") {
+      const repository = await registry.get(parts[1] ?? "");
+      if (repository === null) return failure(ERROR_CODES.REPOSITORY_NOT_REGISTERED, "repository is not registered", 404);
+      const listed = await resolver.git.listLocalBranches(repository.root);
+      return success({
+        repository_id: repository.repository_id,
+        head_branch: listed.head_branch,
+        branches: listed.branches,
+      });
+    }
+
     if (request.method === "GET" && parts.length === 3 && parts[0] === "repositories" && parts[2] === "files") {
       const repository = await registry.get(parts[1] ?? "");
       if (repository === null) return failure(ERROR_CODES.REPOSITORY_NOT_REGISTERED, "repository is not registered", 404);
-      const paths = await resolver.git.listWorktreeFiles(repository.root);
+      const branchQuery = parseBranchQuery(url);
+      if (branchQuery.ok === "empty") return failure(ERROR_CODES.INVALID_RECORD, "branch query parameter must be a local branch name", 422, "branch");
+      if (branchQuery.ok === "omitted") {
+        const paths = await resolver.git.listWorktreeFiles(repository.root);
+        paths.sort();
+        return success({ repository_id: repository.repository_id, view: { kind: "working-tree" }, paths });
+      }
+      const branch = await resolver.git.resolveLocalBranch(repository.root, branchQuery.name);
+      const paths = await resolver.git.listCommitFiles(repository.root, branch.sha);
       paths.sort();
-      return success({ repository_id: repository.repository_id, paths });
+      return success({
+        repository_id: repository.repository_id,
+        view: { kind: "local-branch", name: branch.name, sha: branch.sha },
+        paths,
+      });
     }
 
     if (request.method === "GET" && parts.length === 3 && parts[0] === "repositories" && parts[2] === "diff") {
@@ -482,9 +512,22 @@ async function handleRequest(
       const pathParam = url.searchParams.get("path");
       if (pathParam === null || pathParam.trim().length === 0) return failure(ERROR_CODES.INVALID_RECORD, "path query parameter is required", 422, "path");
       await registry.assertTarget(repository.repository_id, pathParam);
-      const base = url.searchParams.get("base") ?? "HEAD";
-      const baseSha = await resolver.git.resolveRevision(repository.root, base);
-      return success(await resolver.git.readPathDiff(repository.root, baseSha, pathParam));
+      const branchQuery = parseBranchQuery(url);
+      if (branchQuery.ok === "empty") return failure(ERROR_CODES.INVALID_RECORD, "branch query parameter must be a local branch name", 422, "branch");
+      if (branchQuery.ok === "omitted") {
+        const base = url.searchParams.get("base") ?? "HEAD";
+        const baseSha = await resolver.git.resolveRevision(repository.root, base);
+        return success(await resolver.git.readPathDiff(repository.root, baseSha, pathParam));
+      }
+      const branch = await resolver.git.resolveLocalBranch(repository.root, branchQuery.name);
+      const rawBase = url.searchParams.get("base");
+      const baseInput = rawBase === null || rawBase === "HEAD" ? branch.sha : rawBase;
+      return success(await resolver.git.readPathDiff(
+        repository.root,
+        await resolver.git.resolveRevision(repository.root, baseInput),
+        pathParam,
+        { kind: "commit", sha: branch.sha },
+      ));
     }
 
     if (request.method === "PATCH" && parts.length === 3 && parts[0] === "decision-records" && parts[2] === "disposition") {
