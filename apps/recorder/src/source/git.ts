@@ -85,6 +85,8 @@ function buildTextDiff(path: string, previous: string, current: string, maxWork:
   return formatUnifiedDiff(path, result.hunks);
 }
 
+type DiffCurrent = { kind: "working-tree" } | { kind: "commit"; sha: string };
+
 export class GitReader {
   readonly maxBytes: number;
   readonly maxDiffWork: number;
@@ -258,7 +260,12 @@ export class GitReader {
     return result.stdout.trim();
   }
 
-  async readPathDiff(root: string, sha: string, relativePath: string): Promise<FileDiff> {
+  async readPathDiff(
+    root: string,
+    sha: string,
+    relativePath: string,
+    current: DiffCurrent = { kind: "working-tree" },
+  ): Promise<FileDiff> {
     const normalizedPath = normalizeSourcePath(relativePath);
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
@@ -270,17 +277,29 @@ export class GitReader {
       previous = await this.readCommitBlob(root, sha, normalizedPath);
       oldMissing = false;
     }
-    let current = "";
+    let currentContent = "";
     let newMissing = true;
-    try {
-      current = (await new WorkingTreeReader(this.maxBytes).readEnumeratedFile(root, normalizedPath)).content;
-      newMissing = false;
-    } catch (error) {
-      if (!(error instanceof WorkingTreePathMissingError)) throw error;
-      // Same convention: a missing working-tree side stays "" and becomes ZERO lines below.
-      current = "";
+    if (current.kind === "commit") {
+      await this.verifyRevision(root, current.sha);
+      const currentPaths = new Set(await this.listCommitFiles(root, current.sha));
+      if (currentPaths.has(normalizedPath)) {
+        currentContent = await this.readCommitBlob(root, current.sha, normalizedPath);
+        newMissing = false;
+      } else {
+        currentContent = "";
+        newMissing = true;
+      }
+    } else {
+      try {
+        currentContent = (await new WorkingTreeReader(this.maxBytes).readEnumeratedFile(root, normalizedPath)).content;
+        newMissing = false;
+      } catch (error) {
+        if (!(error instanceof WorkingTreePathMissingError)) throw error;
+        // Same convention: a missing working-tree side stays "" and becomes ZERO lines below.
+        currentContent = "";
+      }
     }
-    const result = diffForGit(normalizedPath, previous, current, this.maxDiffWork, { maxOutputBytes: this.maxBytes });
+    const result = diffForGit(normalizedPath, previous, currentContent, this.maxDiffWork, { maxOutputBytes: this.maxBytes });
     return { path: normalizedPath, base_sha: sha, hunks: result.hunks, old_missing: oldMissing, new_missing: newMissing, binary: result.binary };
   }
 
