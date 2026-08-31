@@ -804,4 +804,44 @@ describe("source resolution", () => {
     expect(worktreePaths).toContain("src/only-worktree.ts");
     context.store.close();
   });
+
+  test("readPathDiff can use a commit tree as the new side instead of the working tree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ai-review-diff-current-"));
+    temporaryDirectories.push(root);
+    await runGit(root, ["init", "-b", "main", "--quiet"]);
+    await runGit(root, ["config", "user.email", "fixture@example.test"]);
+    await runGit(root, ["config", "user.name", "Fixture"]);
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/file.ts"), "main-version\n", "utf8");
+    await runGit(root, ["add", "--", "src/file.ts"]);
+    await runGit(root, ["commit", "--quiet", "-m", "main"]);
+    const mainSha = await runGit(root, ["rev-parse", "HEAD"]);
+    await runGit(root, ["switch", "-c", "feat/x", "--quiet"]);
+    await writeFile(join(root, "src/file.ts"), "feature-version\n", "utf8");
+    await writeFile(join(root, "src/only-on-feature.ts"), "feature-only\n", "utf8");
+    await runGit(root, ["add", "--", "src/file.ts", "src/only-on-feature.ts"]);
+    await runGit(root, ["commit", "--quiet", "-m", "feature"]);
+    const featureSha = await runGit(root, ["rev-parse", "HEAD"]);
+    await runGit(root, ["switch", "--quiet", "main"]);
+    await writeFile(join(root, "src/file.ts"), "dirty-worktree\n", "utf8");
+
+    const git = new GitReader();
+    const vsFeature = await git.readPathDiff(root, mainSha, "src/file.ts", { kind: "commit", sha: featureSha });
+    expect(vsFeature.base_sha).toBe(mainSha);
+    expect(vsFeature.old_missing).toBe(false);
+    expect(vsFeature.new_missing).toBe(false);
+    expect(vsFeature.hunks.some((hunk) => hunk.lines.some((line) => line.type === "add" && line.content === "feature-version"))).toBe(true);
+    expect(vsFeature.hunks.some((hunk) => hunk.lines.some((line) => line.content === "dirty-worktree"))).toBe(false);
+
+    const missingOnMain = await git.readPathDiff(root, mainSha, "src/only-on-feature.ts", { kind: "commit", sha: featureSha });
+    expect(missingOnMain.old_missing).toBe(true);
+    expect(missingOnMain.new_missing).toBe(false);
+
+    const missingOnFeature = await git.readPathDiff(root, featureSha, "src/only-on-feature.ts", { kind: "commit", sha: mainSha });
+    expect(missingOnFeature.old_missing).toBe(false);
+    expect(missingOnFeature.new_missing).toBe(true);
+
+    const worktree = await git.readPathDiff(root, mainSha, "src/file.ts");
+    expect(worktree.hunks.some((hunk) => hunk.lines.some((line) => line.content === "dirty-worktree"))).toBe(true);
+  });
 });
