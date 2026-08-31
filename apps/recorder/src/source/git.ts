@@ -3,7 +3,7 @@ import {
   ERROR_CODES,
   type ErrorCode,
 } from "../../../../packages/contracts/src/index";
-import type { FileDiff, DiffHunk } from "../../../../packages/contracts/src/index";
+import type { FileDiff, DiffHunk, LocalBranch } from "../../../../packages/contracts/src/index";
 import { normalizeSourcePath, SourceResolutionError } from "../repositories/registry";
 import {
   WorkingTreePathMissingError,
@@ -174,7 +174,9 @@ export class GitReader {
     }
   }
 
-  private async listTreePaths(root: string, sha: string): Promise<string[]> {
+  async listCommitFiles(root: string, sha: string): Promise<string[]> {
+    await this.verifyRepository(root);
+    await this.verifyRevision(root, sha);
     const result = await this.execute(root, ["ls-tree", "-r", "--name-only", "-z", sha]);
     if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git tree metadata exceeds the configured source limit");
     if (result.exitCode !== 0) throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git tree cannot be read");
@@ -192,6 +194,31 @@ export class GitReader {
       .split("\0")
       .filter((path) => path.length > 0)
       .map((path) => validateEnumeratedPath(root, path));
+  }
+
+  async listLocalBranches(root: string): Promise<{ head_branch: string | null; branches: LocalBranch[] }> {
+    await this.verifyRepository(root);
+    const result = await this.execute(root, ["for-each-ref", "--format=%(refname:short)%00%(objectname)%00%(HEAD)", "refs/heads"]);
+    if (result.oversized) throw new GitReaderError(ERROR_CODES.PAYLOAD_TOO_LARGE, "Git metadata exceeds the configured source limit");
+    if (result.exitCode !== 0) throw new GitReaderError(ERROR_CODES.SOURCE_UNAVAILABLE, "Git local branches cannot be listed");
+    const branches: LocalBranch[] = [];
+    let head_branch: string | null = null;
+    for (const record of result.stdout.split("\n")) {
+      if (record.length === 0) continue;
+      const [name, objectname, head] = record.split("\0");
+      if (name === undefined || !isSafeRevision(name) || objectname === undefined || !/^[0-9a-f]{40}$/.test(objectname)) continue;
+      branches.push({ name, sha: objectname });
+      if (head === "*") head_branch = name;
+    }
+    branches.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return { head_branch, branches };
+  }
+
+  async resolveLocalBranch(root: string, name: string): Promise<LocalBranch> {
+    const listed = await this.listLocalBranches(root);
+    const found = listed.branches.find((branch) => branch.name === name);
+    if (!found) throw new GitReaderError(ERROR_CODES.REVISION_NOT_FOUND, "revision was not found");
+    return found;
   }
 
   private async readCommitBlob(root: string, sha: string, path: string, strictUtf8 = false): Promise<string> {
@@ -235,7 +262,7 @@ export class GitReader {
     const normalizedPath = normalizeSourcePath(relativePath);
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
-    const treePaths = new Set(await this.listTreePaths(root, sha));
+    const treePaths = new Set(await this.listCommitFiles(root, sha));
     // A missing base side stays "" here; the guarded split below maps it to ZERO lines on purpose.
     let previous = "";
     let oldMissing = true;
@@ -260,7 +287,7 @@ export class GitReader {
   async readDiff(root: string, sha: string): Promise<string> {
     await this.verifyRepository(root);
     await this.verifyRevision(root, sha);
-    const [treePaths, worktreePaths] = await Promise.all([this.listTreePaths(root, sha), this.listWorktreeFiles(root)]);
+    const [treePaths, worktreePaths] = await Promise.all([this.listCommitFiles(root, sha), this.listWorktreeFiles(root)]);
     const treePathSet = new Set(treePaths);
     const worktreePathSet = new Set(worktreePaths);
     const paths = new Set([...treePaths, ...worktreePaths]);

@@ -741,4 +741,64 @@ describe("source resolution", () => {
     expect(paths.every((path) => !path.startsWith("/"))).toBe(true);
     context.store.close();
   });
+
+  test("listLocalBranches returns only refs/heads, sorted, with head_branch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ai-review-branches-"));
+    temporaryDirectories.push(root);
+    await runGit(root, ["init", "-b", "main", "--quiet"]);
+    await runGit(root, ["config", "user.email", "fixture@example.test"]);
+    await runGit(root, ["config", "user.name", "Fixture"]);
+    await writeFile(join(root, "README.md"), "main\n", "utf8");
+    await runGit(root, ["add", "--", "README.md"]);
+    await runGit(root, ["commit", "--quiet", "-m", "main"]);
+    const mainSha = await runGit(root, ["rev-parse", "HEAD"]);
+    await runGit(root, ["branch", "feat/x"]);
+    await runGit(root, ["tag", "v1"]);
+    await mkdir(join(root, ".git", "refs", "remotes", "origin"), { recursive: true });
+    await writeFile(join(root, ".git", "refs", "remotes", "origin", "main"), `${mainSha}\n`, "utf8");
+    await runGit(root, ["update-ref", "refs/heads/weird@name", mainSha]);
+
+    const listed = await new GitReader().listLocalBranches(root);
+    expect(listed.branches.map((branch) => branch.name)).toEqual(["feat/x", "main"]);
+    expect(listed.head_branch).toBe("main");
+    expect(listed.branches.find((branch) => branch.name === "main")?.sha).toBe(mainSha);
+    await expect(new GitReader().resolveLocalBranch(root, "feat/x")).resolves.toMatchObject({ name: "feat/x" });
+    await expect(new GitReader().resolveLocalBranch(root, "origin/main")).rejects.toMatchObject({ code: "REVISION_NOT_FOUND" });
+    await expect(new GitReader().resolveLocalBranch(root, "v1")).rejects.toMatchObject({ code: "REVISION_NOT_FOUND" });
+    await expect(new GitReader().resolveLocalBranch(root, "weird@name")).rejects.toMatchObject({ code: "REVISION_NOT_FOUND" });
+  });
+
+  test("listLocalBranches is empty for an unborn repository and has null head_branch when detached", async () => {
+    const unborn = await mkdtemp(join(tmpdir(), "ai-review-unborn-"));
+    temporaryDirectories.push(unborn);
+    await runGit(unborn, ["init", "-b", "main", "--quiet"]);
+    expect(await new GitReader().listLocalBranches(unborn)).toEqual({ head_branch: null, branches: [] });
+
+    const detached = await mkdtemp(join(tmpdir(), "ai-review-detached-"));
+    temporaryDirectories.push(detached);
+    await runGit(detached, ["init", "-b", "main", "--quiet"]);
+    await runGit(detached, ["config", "user.email", "fixture@example.test"]);
+    await runGit(detached, ["config", "user.name", "Fixture"]);
+    await writeFile(join(detached, "README.md"), "x\n", "utf8");
+    await runGit(detached, ["add", "--", "README.md"]);
+    await runGit(detached, ["commit", "--quiet", "-m", "main"]);
+    await runGit(detached, ["branch", "other"]);
+    await runGit(detached, ["switch", "--detach", "--quiet", "HEAD"]);
+    const listed = await new GitReader().listLocalBranches(detached);
+    expect(listed.head_branch).toBe(null);
+    expect(listed.branches.map((branch) => branch.name).sort()).toEqual(["main", "other"]);
+  });
+
+  test("listCommitFiles lists the tree at a commit, not the working tree", async () => {
+    const context = await createResolverFixture();
+    await writeFile(join(context.fixture.root, "src/only-worktree.ts"), "x\n", "utf8");
+    await runGit(context.fixture.root, ["add", "--", "src/only-worktree.ts"]);
+    const git = new GitReader();
+    const commitPaths = await git.listCommitFiles(context.fixture.root, context.fixture.commitSha);
+    const worktreePaths = await git.listWorktreeFiles(context.fixture.root);
+    expect(commitPaths).toContain(context.fixture.path);
+    expect(commitPaths).not.toContain("src/only-worktree.ts");
+    expect(worktreePaths).toContain("src/only-worktree.ts");
+    context.store.close();
+  });
 });
